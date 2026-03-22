@@ -1,0 +1,20 @@
+[package]
+name = "zsh-ios"
+version = "0.1.0"
+edition = "2024"
+description = "Command abbreviation engine for Zsh inspired by Cisco IOS"
+license = "AGPL-3.0-only"
+readme = "README.md"
+keywords = ["zsh", "cli", "abbreviation", "ios", "shell"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+dirs = "6"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
