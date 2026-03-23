@@ -285,25 +285,18 @@ fn resolve_from_node(
         return Ok(());
     }
 
-    // Exact match handling: if the word is an exact child, use it --
-    // UNLESS the exact node is a childless leaf that's also a strict prefix
-    // of a longer sibling (ghost from history like "reb" alongside "rebuild").
+    // Exact match always wins -- if the word is an exact child, use it.
+    // Ghost prevention (e.g. "reb" alongside "rebuild") is handled upstream
+    // by the prefix guard in history learning, so ghosts never enter the trie.
     if let Some(exact_node) = start_node.get_child(word) {
-        let dominated = exact_node.children.is_empty()
-            && start_node
-                .children
-                .keys()
-                .any(|k| k != word && k.starts_with(word));
-        if !dominated {
-            result.push(word.to_string());
-            if !rest.is_empty() && !exact_node.children.is_empty() {
-                return resolve_from_node(rest, exact_node, result);
-            }
-            for w in rest {
-                result.push(w.to_string());
-            }
-            return Ok(());
+        result.push(word.to_string());
+        if !rest.is_empty() && !exact_node.children.is_empty() {
+            return resolve_from_node(rest, exact_node, result);
         }
+        for w in rest {
+            result.push(w.to_string());
+        }
+        return Ok(());
     }
 
     // For arguments (not the command itself): if this word matches a real

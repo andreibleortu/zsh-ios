@@ -45,7 +45,6 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 - **Pins** -- persistent user-defined abbreviation rules stored in a plain text file
 - **Interactive clarifier** -- ambiguous commands on Enter show a numbered menu with full command paths; selecting saves a pin
 - **Path disambiguation** -- when multiple directories match, shows a numbered picker with single-keypress selection
-- **Ghost resistance** -- abbreviations learned from typos are automatically deprioritized against real commands
 - **Toggle on/off** -- `zsh-ios toggle` to disable without uninstalling
 - **Fast** -- Rust binary with MessagePack-serialized trie; resolution takes < 10ms
 
