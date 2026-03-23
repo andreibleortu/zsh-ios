@@ -120,9 +120,12 @@ fn resolve_components(
                 let remaining = &components[i + 1..];
 
                 if remaining.is_empty() {
-                    if dirs_only {
-                        // For directory commands, surface the ambiguity so the
-                        // user gets a picker instead of silent passthrough.
+                    // Surface ambiguity for dirs-only commands and for explicit
+                    // pattern matching (* contains, ! suffix) — the user asked
+                    // for resolution, so give them a picker rather than giving up.
+                    let is_explicit_pattern = component.starts_with('*')
+                        || (component.starts_with('!') && !component.starts_with("\\!"));
+                    if dirs_only || is_explicit_pattern {
                         let all_paths: Vec<Vec<String>> = candidates
                             .iter()
                             .map(|c| {
@@ -133,7 +136,7 @@ fn resolve_components(
                             .collect();
                         return ComponentsResult::Ambiguous(all_paths);
                     }
-                    // Last component, no look-ahead possible -- give up
+                    // Plain prefix, last component, no look-ahead possible -- give up
                     resolved_parts.push(component.to_string());
                     return ComponentsResult::Unchanged(resolved_parts);
                 }

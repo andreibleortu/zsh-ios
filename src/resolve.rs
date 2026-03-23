@@ -669,14 +669,17 @@ enum ArgMode {
 /// Checks the auto-detected arg modes from Zsh completions first,
 /// then falls back to a hardcoded list for common commands.
 fn arg_mode(cmd: &str, modes: &ArgModeMap) -> ArgMode {
-    // Check auto-detected modes from Zsh completion files
+    // Check auto-detected modes from Zsh completion files.
+    // Only trust the basic three modes (1-3); Runtime types (4+) from Zsh
+    // completions are per-position specs, not command-level arg modes — fall
+    // through to the hardcoded list so ls/cat/nano still get ArgMode::Paths.
     if let Some(&mode) = modes.get(cmd) {
-        return match mode {
-            trie::ARG_MODE_DIRS_ONLY => ArgMode::DirsOnly,
-            trie::ARG_MODE_PATHS => ArgMode::Paths,
-            trie::ARG_MODE_EXECS_ONLY => ArgMode::ExecsOnly,
-            _ => ArgMode::Normal,
-        };
+        match mode {
+            trie::ARG_MODE_DIRS_ONLY => return ArgMode::DirsOnly,
+            trie::ARG_MODE_PATHS => return ArgMode::Paths,
+            trie::ARG_MODE_EXECS_ONLY => return ArgMode::ExecsOnly,
+            _ => {} // Runtime types (4+): fall through to hardcoded list below
+        }
     }
 
     // Hardcoded fallback for commands without Zsh completions
