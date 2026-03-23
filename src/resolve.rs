@@ -1,6 +1,6 @@
 use crate::path_resolve;
 use crate::pins::Pins;
-use crate::trie::{self, ArgModeMap, CommandTrie, TrieNode};
+use crate::trie::{self, ArgModeMap, ArgSpec, CommandTrie, TrieNode};
 
 /// Result of resolving an abbreviated command line.
 #[derive(Debug)]
@@ -144,20 +144,20 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
                 None => {
                     let mut result_words = expanded_prefix;
                     result_words.extend(remaining_words.iter().map(|s| s.to_string()));
-                    return finalize_with_paths(input, result_words, &trie.arg_modes);
+                    return finalize_with_paths(input, result_words, trie);
                 }
             }
         }
 
         let mut result_words = expanded_prefix;
         match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes) {
-            Ok(()) => finalize_with_paths(input, result_words, &trie.arg_modes),
+            Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     } else {
         let mut result_words: Vec<String> = Vec::new();
         match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes) {
-            Ok(()) => finalize_with_paths(input, result_words, &trie.arg_modes),
+            Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     }
@@ -218,9 +218,12 @@ fn split_on_operators(input: &str) -> Vec<LinePart> {
     parts
 }
 
-fn finalize_with_paths(input: &str, words: Vec<String>, modes: &ArgModeMap) -> ResolveResult {
-    let mode = words.first().map(|w| arg_mode(w, modes)).unwrap_or(ArgMode::Normal);
-    match resolve_paths_in_words(&words, mode) {
+fn finalize_with_paths(input: &str, words: Vec<String>, trie: &CommandTrie) -> ResolveResult {
+    // Look up per-position ArgSpec for this command path
+    let cmd_path = command_path_key(&words);
+    let spec = trie.arg_specs.get(&cmd_path);
+    let fallback_mode = words.first().map(|w| arg_mode(w, &trie.arg_modes)).unwrap_or(ArgMode::Normal);
+    match resolve_paths_in_words(&words, spec, fallback_mode) {
         PathsResult::Resolved(result) => {
             if result == input {
                 ResolveResult::Passthrough(input.to_string())
@@ -461,17 +464,87 @@ fn looks_like_path(word: &str) -> bool {
         || word.starts_with("\\*")
 }
 
-fn resolve_paths_in_words(words: &[String], mode: ArgMode) -> PathsResult {
+/// Build a lookup key for the arg_specs map from resolved words.
+/// Tries "cmd subcmd" first, then just "cmd".
+fn command_path_key(words: &[String]) -> String {
+    if words.len() >= 2 && !words[1].starts_with('-') {
+        format!("{} {}", words[0], words[1])
+    } else if !words.is_empty() {
+        words[0].clone()
+    } else {
+        String::new()
+    }
+}
+
+/// Determine the ArgMode for a specific argument word, given its position,
+/// the preceding word (for flag-value detection), the ArgSpec, and the
+/// fallback whole-command mode.
+fn arg_type_for_word(
+    arg_position: u32,
+    _word: &str,
+    prev_word: Option<&str>,
+    spec: Option<&ArgSpec>,
+    fallback: ArgMode,
+) -> ArgMode {
+    // Check if this word is the value of a flag from the previous word
+    if let Some(prev) = prev_word
+        && prev.starts_with('-')
+            && let Some(spec) = spec {
+                if let Some(&flag_type) = spec.flag_args.get(prev) {
+                    return u8_to_arg_mode(flag_type);
+                }
+                // Also check long flag with = stripped (--output= was stored as --output)
+                let stripped = prev.trim_end_matches('=');
+                if stripped != prev
+                    && let Some(&flag_type) = spec.flag_args.get(stripped) {
+                        return u8_to_arg_mode(flag_type);
+                    }
+            }
+
+    // Check per-position spec
+    if let Some(spec) = spec
+        && let Some(pos_type) = spec.type_at(arg_position) {
+            return u8_to_arg_mode(pos_type);
+        }
+
+    // Fall back to whole-command mode
+    fallback
+}
+
+fn u8_to_arg_mode(val: u8) -> ArgMode {
+    match val {
+        trie::ARG_MODE_PATHS => ArgMode::Paths,
+        trie::ARG_MODE_DIRS_ONLY => ArgMode::DirsOnly,
+        trie::ARG_MODE_EXECS_ONLY => ArgMode::ExecsOnly,
+        _ => ArgMode::Normal,
+    }
+}
+
+fn resolve_paths_in_words(words: &[String], spec: Option<&ArgSpec>, fallback_mode: ArgMode) -> PathsResult {
     let mut result: Vec<String> = Vec::new();
+    let mut arg_position: u32 = 0; // 1-indexed position of non-flag arguments
+
     for (i, word) in words.iter().enumerate() {
-        // Skip path resolution for exec-only commands (which, man, etc.)
-        // In Normal mode, only resolve words that look like explicit paths --
-        // bare words like "clau" should not be expanded to "CLAUDE.md".
-        // In Paths/DirsOnly mode, resolve everything (the user asked for a path command).
-        let should_resolve = i > 0
-            && !word.starts_with('-')
-            && mode != ArgMode::ExecsOnly
+        if i == 0 {
+            // Command word itself
+            result.push(word.clone());
+            continue;
+        }
+
+        if word.starts_with('-') {
+            // Flags pass through; but check if next word should be flag-value
+            result.push(word.clone());
+            continue;
+        }
+
+        arg_position += 1;
+        let prev_word = if i > 0 { Some(words[i - 1].as_str()) } else { None };
+        let mode = arg_type_for_word(arg_position, word, prev_word, spec, fallback_mode);
+
+        // Decide whether to resolve this word as a path
+        let should_resolve = mode != ArgMode::ExecsOnly
             && (mode == ArgMode::Paths || mode == ArgMode::DirsOnly || looks_like_path(word));
+
         if should_resolve {
             let path_result = match mode {
                 ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word),

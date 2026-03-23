@@ -72,23 +72,62 @@ impl TrieNode {
     }
 }
 
-/// Argument mode for a command, parsed from Zsh completion files.
-/// Stored as u8 for compact serialization.
-/// 0 = Normal, 1 = Paths, 2 = DirsOnly, 3 = ExecsOnly
-pub type ArgModeMap = HashMap<String, u8>;
-
+/// Argument type constants for positions and flags.
+/// 0 = Normal (trie), 1 = Paths, 2 = DirsOnly, 3 = ExecsOnly
 #[allow(dead_code)]
 pub const ARG_MODE_NORMAL: u8 = 0;
 pub const ARG_MODE_PATHS: u8 = 1;
 pub const ARG_MODE_DIRS_ONLY: u8 = 2;
 pub const ARG_MODE_EXECS_ONLY: u8 = 3;
 
+/// Per-command argument specification, parsed from Zsh completion files.
+/// Knows what type of argument each position and flag expects.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArgSpec {
+    /// Argument type for specific positions (1-indexed: 1 = first arg after command).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub positional: HashMap<u32, u8>,
+    /// Argument type for all remaining/unspecified positions (from `*:...:_files`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<u8>,
+    /// Flags that consume the next word as a typed argument.
+    /// e.g., "-o" → Paths means the word after -o is a file path.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flag_args: HashMap<String, u8>,
+}
+
+impl ArgSpec {
+    /// Get the argument type for a given position (1-indexed).
+    pub fn type_at(&self, position: u32) -> Option<u8> {
+        self.positional.get(&position).copied().or(self.rest)
+    }
+
+    /// Get the argument type expected after a flag.
+    #[allow(dead_code)]
+    pub fn type_after_flag(&self, flag: &str) -> Option<u8> {
+        self.flag_args.get(flag).copied()
+    }
+
+    /// Convenience: is this spec non-empty?
+    pub fn is_empty(&self) -> bool {
+        self.positional.is_empty() && self.rest.is_none() && self.flag_args.is_empty()
+    }
+}
+
+/// Maps command path (e.g., "git add", "cp") to its argument spec.
+pub type ArgSpecMap = HashMap<String, ArgSpec>;
+
+/// Legacy flat map kept for backward compat during deserialization.
+pub type ArgModeMap = HashMap<String, u8>;
+
 /// The full command trie with serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandTrie {
     pub root: TrieNode,
-    /// Argument modes learned from Zsh completion files.
-    /// Maps command name to argument mode (see ARG_MODE_* constants).
+    /// Per-position argument specs from Zsh completion files.
+    #[serde(default)]
+    pub arg_specs: ArgSpecMap,
+    /// Legacy flat arg modes (kept for backward compat with old tree files).
     #[serde(default)]
     pub arg_modes: ArgModeMap,
 }
@@ -107,8 +146,9 @@ impl CommandTrie {
     }
 
     /// Serialize to MessagePack and write to file.
+    /// Uses named (map) encoding so the format survives field additions.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let data = rmp_serde::to_vec(self)?;
+        let data = rmp_serde::to_vec_named(self)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
