@@ -250,20 +250,35 @@ fn resolve_from_node(
 
     // For path/dir/runtime commands, skip trie resolution for arguments --
     // they'll be resolved by the path resolver or runtime resolver later.
+    //
+    // Hardcoded file/dir commands (ls, cd, cat, nano, …) always skip, even if
+    // they have historical trie entries that would prefix-match the word.
+    //
+    // Commands whose Paths arg_mode comes from the completions parser (e.g. git,
+    // docker) may have real subcommands, so we only skip when there are no
+    // non-flag trie matches for this word.
+    let word = words[0];
     if !result.is_empty() {
         let mode = arg_mode(&result[0], modes);
         if matches!(
             mode,
             ArgMode::DirsOnly | ArgMode::Paths | ArgMode::Runtime(_)
         ) {
-            for w in words {
-                result.push(w.to_string());
+            let force_skip = is_hardcoded_path_command(&result[0]);
+            let has_subcmd_match = !force_skip
+                && !word.starts_with('-')
+                && start_node
+                    .prefix_search(word)
+                    .iter()
+                    .any(|(n, _)| !n.starts_with('-'));
+            if !has_subcmd_match {
+                for w in words {
+                    result.push(w.to_string());
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
-
-    let word = words[0];
     let rest = &words[1..];
 
     // Flags (start with -) are never prefix-expanded -- pass through as-is.
@@ -662,6 +677,59 @@ enum ArgMode {
     /// Runtime-resolved type (users, hosts, signals, git branches, etc.).
     /// The u8 is the original arg type constant from trie.rs.
     Runtime(u8),
+}
+
+/// Returns true for commands that are hardcoded as file/dir/exec-only —
+/// these always skip trie resolution for their arguments regardless of
+/// whether the trie node happens to have learned entries.
+fn is_hardcoded_path_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "cd" | "pushd"
+            | "ls"
+            | "rm"
+            | "rmdir"
+            | "mkdir"
+            | "cp"
+            | "mv"
+            | "ln"
+            | "cat"
+            | "less"
+            | "more"
+            | "head"
+            | "tail"
+            | "wc"
+            | "touch"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "stat"
+            | "file"
+            | "readlink"
+            | "realpath"
+            | "basename"
+            | "dirname"
+            | "du"
+            | "find"
+            | "diff"
+            | "patch"
+            | "tar"
+            | "zip"
+            | "unzip"
+            | "gzip"
+            | "gunzip"
+            | "bzip2"
+            | "xz"
+            | "source"
+            | "open"
+            | "nano"
+            | "vim"
+            | "vi"
+            | "nvim"
+            | "emacs"
+            | "code"
+            | "bat"
+    )
 }
 
 /// Classify a command by how its arguments should be resolved.
