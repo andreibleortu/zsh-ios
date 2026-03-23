@@ -238,11 +238,13 @@ fn cmd_learn(command: &str) {
     };
 
     // Resolve the command first so we learn the expanded form,
-    // not abbreviated junk (e.g., learn "git checkout" not "gi ch")
+    // not abbreviated junk (e.g., learn "git checkout" not "gi ch").
+    // Only learn when resolution fully succeeds -- ambiguous or passthrough
+    // input has nothing valid to teach the trie.
     let pin_store = pins::Pins::load(&config::pins_path());
-    let to_learn = match resolve::resolve(command, &trie, &pin_store) {
+    let to_learn = match resolve::resolve_line(command, &trie, &pin_store) {
         resolve::ResolveResult::Resolved(r) => r,
-        _ => command.to_string(),
+        _ => return,
     };
 
     for segment in history::split_command_segments(&to_learn) {
