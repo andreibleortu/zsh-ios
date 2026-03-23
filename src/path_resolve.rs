@@ -18,6 +18,15 @@ pub enum PathResult {
 /// When ambiguous, looks ahead at subsequent components to disambiguate.
 /// If multiple candidates survive, returns all fully-resolved paths.
 pub fn resolve_path(abbreviated: &str) -> PathResult {
+    resolve_path_inner(abbreviated, false)
+}
+
+/// Like `resolve_path` but only matches directories (for cd, pushd, etc.).
+pub fn resolve_path_dirs_only(abbreviated: &str) -> PathResult {
+    resolve_path_inner(abbreviated, true)
+}
+
+fn resolve_path_inner(abbreviated: &str, dirs_only: bool) -> PathResult {
     if abbreviated.is_empty() {
         return PathResult::Unchanged;
     }
@@ -33,7 +42,7 @@ pub fn resolve_path(abbreviated: &str) -> PathResult {
         vec![prefix_str]
     };
 
-    match resolve_components(&base_dir, &components, init_parts) {
+    match resolve_components(&base_dir, &components, init_parts, dirs_only) {
         ComponentsResult::Resolved(parts) => {
             let mut result = join_path_parts(&parts);
             if trailing_slash && !result.ends_with('/') {
@@ -86,6 +95,7 @@ fn resolve_components(
     base_dir: &Path,
     components: &[String],
     prefix_parts: Vec<String>,
+    dirs_only: bool,
 ) -> ComponentsResult {
     let mut current_dir = base_dir.to_path_buf();
     let mut resolved_parts = prefix_parts;
@@ -101,7 +111,7 @@ fn resolve_components(
             continue;
         }
 
-        match resolve_component(&current_dir, component) {
+        match resolve_component(&current_dir, component, dirs_only) {
             ComponentMatch::Exact(name) | ComponentMatch::Unique(name) => {
                 current_dir = current_dir.join(&name);
                 resolved_parts.push(name);
@@ -110,13 +120,26 @@ fn resolve_components(
                 let remaining = &components[i + 1..];
 
                 if remaining.is_empty() {
+                    if dirs_only {
+                        // For directory commands, surface the ambiguity so the
+                        // user gets a picker instead of silent passthrough.
+                        let all_paths: Vec<Vec<String>> = candidates
+                            .iter()
+                            .map(|c| {
+                                let mut parts = resolved_parts.clone();
+                                parts.push(c.clone());
+                                parts
+                            })
+                            .collect();
+                        return ComponentsResult::Ambiguous(all_paths);
+                    }
                     // Last component, no look-ahead possible -- give up
                     resolved_parts.push(component.to_string());
                     return ComponentsResult::Unchanged(resolved_parts);
                 }
 
                 // Find which candidates have children matching the next component
-                let winners = deep_filter(&current_dir, &candidates, remaining);
+                let winners = deep_filter(&current_dir, &candidates, remaining, dirs_only);
 
                 if winners.len() == 1 {
                     current_dir = current_dir.join(&winners[0]);
@@ -138,7 +161,7 @@ fn resolve_components(
                     let child_dir = current_dir.join(winner);
                     let mut fork_parts = resolved_parts.clone();
                     fork_parts.push(winner.clone());
-                    match resolve_components(&child_dir, remaining, fork_parts) {
+                    match resolve_components(&child_dir, remaining, fork_parts, dirs_only) {
                         ComponentsResult::Resolved(parts)
                         | ComponentsResult::Unchanged(parts) => {
                             all_paths.push(parts);
@@ -185,6 +208,7 @@ fn parse_path_parts(abbreviated: &str) -> (PathBuf, Vec<String>, String) {
     }
 }
 
+#[derive(Debug)]
 enum ComponentMatch {
     Exact(String),
     Unique(String),
@@ -192,21 +216,47 @@ enum ComponentMatch {
     None,
 }
 
-fn resolve_component(dir: &Path, prefix: &str) -> ComponentMatch {
-    let entries = list_dir(dir);
+fn resolve_component(dir: &Path, pattern: &str, dirs_only: bool) -> ComponentMatch {
+    let entries = list_dir(dir, dirs_only);
 
-    if entries.iter().any(|e| e == prefix) {
-        return ComponentMatch::Exact(prefix.to_string());
+    // Suffix match: !suffix matches entries that END with suffix.
+    if let Some(suffix) = pattern.strip_prefix('!') {
+        if suffix.is_empty() {
+            return ComponentMatch::None;
+        }
+        // Case-sensitive suffix
+        let cs: Vec<&String> = entries.iter().filter(|e| e.ends_with(suffix)).collect();
+        match cs.len() {
+            1 => return ComponentMatch::Unique(cs[0].clone()),
+            2.. => return ComponentMatch::Ambiguous(cs.into_iter().cloned().collect()),
+            _ => {}
+        }
+        // Case-insensitive suffix
+        let lower = suffix.to_lowercase();
+        let ci: Vec<&String> = entries
+            .iter()
+            .filter(|e| e.to_lowercase().ends_with(&lower))
+            .collect();
+        return match ci.len() {
+            1 => ComponentMatch::Unique(ci[0].clone()),
+            2.. => ComponentMatch::Ambiguous(ci.into_iter().cloned().collect()),
+            _ => ComponentMatch::None,
+        };
     }
 
-    let cs_matches: Vec<&String> = entries.iter().filter(|e| e.starts_with(prefix)).collect();
+    // Prefix match (existing logic).
+    if entries.iter().any(|e| e == pattern) {
+        return ComponentMatch::Exact(pattern.to_string());
+    }
+
+    let cs_matches: Vec<&String> = entries.iter().filter(|e| e.starts_with(pattern)).collect();
     match cs_matches.len() {
         1 => return ComponentMatch::Unique(cs_matches[0].clone()),
         0 => {}
         _ => return ComponentMatch::Ambiguous(cs_matches.into_iter().cloned().collect()),
     }
 
-    let lower_prefix = prefix.to_lowercase();
+    let lower_prefix = pattern.to_lowercase();
     let ci_matches: Vec<&String> = entries
         .iter()
         .filter(|e| e.to_lowercase().starts_with(&lower_prefix))
@@ -219,7 +269,7 @@ fn resolve_component(dir: &Path, prefix: &str) -> ComponentMatch {
 }
 
 /// Filter ambiguous candidates by which ones have children matching the next component.
-fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String]) -> Vec<String> {
+fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_only: bool) -> Vec<String> {
     if remaining.is_empty() {
         return candidates.to_vec();
     }
@@ -229,11 +279,29 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String]) -> Ve
     }
     let lower_next = next.to_lowercase();
 
+    // Suffix pattern: !suffix matches entries ending with suffix.
+    if let Some(suffix) = next.strip_prefix('!')
+        && !suffix.is_empty()
+    {
+        let lower_suffix = suffix.to_lowercase();
+        return candidates
+            .iter()
+            .filter(|cand| {
+                let child_dir = parent.join(cand);
+                let entries = list_dir(&child_dir, dirs_only);
+                entries.iter().any(|e| {
+                    e.ends_with(suffix) || e.to_lowercase().ends_with(&lower_suffix)
+                })
+            })
+            .cloned()
+            .collect();
+    }
+
     candidates
         .iter()
         .filter(|cand| {
             let child_dir = parent.join(cand);
-            let entries = list_dir(&child_dir);
+            let entries = list_dir(&child_dir, dirs_only);
             entries.iter().any(|e| {
                 e == next
                     || e.starts_with(next.as_str())
@@ -244,10 +312,11 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String]) -> Ve
         .collect()
 }
 
-fn list_dir(dir: &Path) -> Vec<String> {
+fn list_dir(dir: &Path, dirs_only: bool) -> Vec<String> {
     match fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
+            .filter(|e| !dirs_only || e.path().is_dir())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect(),
         Err(_) => vec![],
@@ -308,10 +377,42 @@ mod tests {
         let _ = fs::create_dir_all(dir.join("foobar"));
 
         std::env::set_current_dir(&dir).ok();
-        let result = resolve_component(&dir, "foo");
+        let result = resolve_component(&dir, "foo", false);
         match result {
             ComponentMatch::Exact(name) => assert_eq!(name, "foo"),
             _ => panic!("Expected Exact match"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_suffix_match() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-suffix");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(dir.join("test-1"));
+        let _ = fs::create_dir_all(dir.join("test-2"));
+        let _ = fs::create_dir_all(dir.join("test-3"));
+
+        // !3 matches the entry ending with "3"
+        let result = resolve_component(&dir, "!3", false);
+        match result {
+            ComponentMatch::Unique(name) => assert_eq!(name, "test-3"),
+            other => panic!("Expected Unique suffix match, got {:?}", other),
+        }
+
+        // !test is ambiguous (all three end with a digit, not "test")
+        let result = resolve_component(&dir, "!test", false);
+        match result {
+            ComponentMatch::None => {}
+            other => panic!("Expected None for !test, got {:?}", other),
+        }
+
+        // bare ! should not match anything
+        let result = resolve_component(&dir, "!", false);
+        match result {
+            ComponentMatch::None => {}
+            other => panic!("Expected None for bare !, got {:?}", other),
         }
 
         let _ = fs::remove_dir_all(&dir);

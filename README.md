@@ -6,6 +6,7 @@ Command abbreviation engine for Zsh inspired by Cisco IOS. Type abbreviated comm
 $ ter ap         →  terraform apply
 $ gi ch main     →  git checkout main
 $ cd ~/Lib/App/zsh-  →  cd ~/Library/Application\ Support/zsh-ios
+$ cd te/!5       →  cd tests/test-5
 ```
 
 If an abbreviation is ambiguous, you're told -- just like IOS. Pick a number and the mapping is saved for next time:
@@ -33,6 +34,8 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 
 - **Command abbreviation** -- prefix-match any command or subcommand in your trie
 - **Path abbreviation** -- `cd Des/Fo` -> `cd Desktop/Folder`, with deep disambiguation across path components
+- **Suffix matching** -- `!` prefix matches by suffix: `cd te/!5` -> `cd tests/test-5` (matches entries ending with `5`)
+- **Context-aware argument resolution** -- commands like `cd` and `ls` resolve arguments against the filesystem (not the trie); commands like `which` and `man` resolve against executables only
 - **Deep disambiguation** -- subsequent words narrow ambiguous prefixes automatically
 - **Tab expansion** -- Tab expands to the longest common prefix, then falls through to native Zsh completion for cycling
 - **`?` key** -- show all available completions for the current prefix (IOS-style help)
@@ -127,8 +130,29 @@ Given input `ter ap --auto-approve`:
 1. **Pin check** -- longest-prefix match against saved pins
 2. **Trie walk** -- `ter` prefix-matches `terraform` (unique), then `ap` prefix-matches `apply` (unique)
 3. **Flags** -- `--auto-approve` starts with `-`, passed through as-is (flags are never expanded)
-4. **Path check** -- any word containing `/` or starting with `~`/`.` is resolved against the filesystem
+4. **Path resolution** -- arguments are checked against the real filesystem; if a matching file or directory exists, the abbreviation is expanded
 5. **Result**: `terraform apply --auto-approve`
+
+The engine is context-aware about what kind of arguments a command takes:
+
+| Mode | Commands | Behavior |
+|------|----------|----------|
+| **Dirs only** | `cd`, `pushd` | Arguments resolve against directories only |
+| **Paths** | `ls`, `rm`, `cat`, `vim`, `cp`, `mv`, ... | Arguments resolve against all filesystem entries |
+| **Execs only** | `which`, `type`, `man`, `command`, ... | Arguments resolve against the command trie only |
+| **Normal** | everything else | Trie first, then filesystem fallback |
+
+### Suffix matching
+
+Prefix `!` on a path component to match by **suffix** instead of prefix:
+
+```
+$ cd te/!5        →  cd tests/test-5       (ends with "5")
+$ cat !results    →  cat parse_results.py  (ends with "results")
+$ ls !.md         →  ls README.md          (ends with ".md")
+```
+
+Suffix matching works anywhere in a path and combines freely with prefix matching. Case-insensitive fallback applies just like prefix matching.
 
 ### Self-abbreviation
 

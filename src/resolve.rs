@@ -87,7 +87,8 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
 }
 
 fn finalize_with_paths(input: &str, words: Vec<String>) -> ResolveResult {
-    match resolve_paths_in_words(&words) {
+    let mode = words.first().map(|w| arg_mode(w)).unwrap_or(ArgMode::Normal);
+    match resolve_paths_in_words(&words, mode) {
         PathsResult::Resolved(result) => {
             if result == input {
                 ResolveResult::Passthrough(input.to_string())
@@ -108,6 +109,18 @@ fn resolve_from_node(
 ) -> Result<(), Box<AmbiguityInfo>> {
     if words.is_empty() {
         return Ok(());
+    }
+
+    // For path/dir commands, skip trie resolution for arguments --
+    // they'll be resolved against the filesystem later.
+    if !result.is_empty() {
+        let mode = arg_mode(&result[0]);
+        if mode == ArgMode::DirsOnly || mode == ArgMode::Paths {
+            for w in words {
+                result.push(w.to_string());
+            }
+            return Ok(());
+        }
     }
 
     let word = words[0];
@@ -131,8 +144,8 @@ fn resolve_from_node(
         return Ok(());
     }
 
-    // If this word looks like a filesystem path, skip trie matching.
-    if looks_like_path(word) {
+    // Words with explicit path syntax (/, ~, .) always skip trie matching.
+    if word.contains('/') || word.starts_with('~') || word.starts_with('.') {
         result.push(word.to_string());
         for w in rest {
             result.push(w.to_string());
@@ -159,6 +172,24 @@ fn resolve_from_node(
             }
             return Ok(());
         }
+    }
+
+    // For arguments (not the command itself): if this word matches a real
+    // file or directory, skip trie prefix-matching and let the path resolver
+    // handle it later.  This avoids expanding `te` to `terraform` when
+    // there is a `tests/` directory right here.
+    // Skip this for exec-only commands (which, man) -- their args are commands.
+    let mode = if result.is_empty() {
+        ArgMode::Normal
+    } else {
+        arg_mode(&result[0])
+    };
+    if !result.is_empty() && mode != ArgMode::ExecsOnly && has_filesystem_prefix_match(word) {
+        result.push(word.to_string());
+        for w in rest {
+            result.push(w.to_string());
+        }
+        return Ok(());
     }
 
     let matches = start_node.prefix_search(word);
@@ -290,12 +321,17 @@ enum PathsResult {
     Ambiguous(Vec<String>),
 }
 
-/// After command resolution, resolve any path-like arguments.
-fn resolve_paths_in_words(words: &[String]) -> PathsResult {
+/// After command resolution, resolve any path arguments against the filesystem.
+fn resolve_paths_in_words(words: &[String], mode: ArgMode) -> PathsResult {
     let mut result: Vec<String> = Vec::new();
     for (i, word) in words.iter().enumerate() {
-        if i > 0 && looks_like_path(word) {
-            match path_resolve::resolve_path(word) {
+        // Skip path resolution for exec-only commands (which, man, etc.)
+        if i > 0 && !word.starts_with('-') && mode != ArgMode::ExecsOnly {
+            let path_result = match mode {
+                ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word),
+                _ => path_resolve::resolve_path(word),
+            };
+            match path_result {
                 path_resolve::PathResult::Resolved(resolved) => {
                     result.push(shell_escape_path(&resolved));
                 }
@@ -334,14 +370,64 @@ fn shell_escape_path(path: &str) -> String {
         .replace(')', "\\)")
 }
 
-/// Heuristic: does this word look like a filesystem path?
-fn looks_like_path(word: &str) -> bool {
-    if word.starts_with('-') {
+/// How a command's arguments should be resolved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArgMode {
+    /// Trie resolution + filesystem path resolution (default).
+    Normal,
+    /// Arguments are filesystem paths (files and directories).
+    /// Skips trie, resolves against the filesystem.
+    Paths,
+    /// Arguments are directory paths only (e.g. cd, pushd).
+    /// Skips trie, resolves against directories on the filesystem.
+    DirsOnly,
+    /// Arguments are command / executable names (e.g. which, man).
+    /// Keeps trie resolution, skips filesystem path resolution.
+    ExecsOnly,
+}
+
+/// Classify a command by how its arguments should be resolved.
+/// Add new entries here to teach zsh-ios about more commands.
+fn arg_mode(cmd: &str) -> ArgMode {
+    match cmd {
+        // Directory-only arguments
+        "cd" | "pushd" => ArgMode::DirsOnly,
+
+        // Filesystem path arguments
+        "ls" | "rm" | "rmdir" | "mkdir" | "cp" | "mv" | "ln"
+        | "cat" | "less" | "more" | "head" | "tail" | "wc"
+        | "touch" | "chmod" | "chown" | "chgrp" | "stat" | "file"
+        | "readlink" | "realpath" | "basename" | "dirname"
+        | "du" | "find" | "diff" | "patch"
+        | "tar" | "zip" | "unzip" | "gzip" | "gunzip" | "bzip2" | "xz"
+        | "source" | "open"
+        | "nano" | "vim" | "vi" | "nvim" | "emacs" | "code" | "bat"
+        => ArgMode::Paths,
+
+        // Executable / command-name arguments
+        "which" | "type" | "whence" | "where" | "command" | "man" | "rehash"
+        => ArgMode::ExecsOnly,
+
+        _ => ArgMode::Normal,
+    }
+}
+
+/// Check the actual filesystem: does any entry in cwd start with this word?
+fn has_filesystem_prefix_match(word: &str) -> bool {
+    if word.is_empty() {
         return false;
     }
-    word.contains('/')
-        || word.starts_with('~')
-        || word.starts_with('.')
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    match std::fs::read_dir(&cwd) {
+        Ok(entries) => entries.flatten().any(|e| {
+            let name = e.file_name();
+            name.to_string_lossy().starts_with(word)
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Generate completions for the `?` command.
@@ -600,6 +686,80 @@ mod tests {
         match resolve("ter ap --auto-approve", &trie, &pins) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform apply --auto-approve"),
             other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cd_skips_trie() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("cd");
+        trie.insert(&["cd", "terraform"]);
+        trie.insert(&["cd", "tests"]);
+        trie.insert_command("terraform");
+        let pins = Pins::default();
+
+        // "cd te" should NOT return trie-level Ambiguous with executables
+        match resolve("cd te", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                panic!(
+                    "cd args should skip trie resolution, got ambiguous: {:?}",
+                    info.candidates
+                );
+            }
+            _ => {} // Passthrough, Resolved, or PathAmbiguous are all acceptable
+        }
+    }
+
+    #[test]
+    fn test_pushd_skips_trie() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("pushd");
+        trie.insert(&["pushd", "projects"]);
+        trie.insert(&["pushd", "pictures"]);
+        let pins = Pins::default();
+
+        match resolve("pushd pro", &trie, &pins) {
+            ResolveResult::Ambiguous(_) => {
+                panic!("pushd args should skip trie resolution");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_ls_skips_trie() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("ls");
+        trie.insert(&["ls", "terraform"]);
+        trie.insert(&["ls", "tests"]);
+        trie.insert_command("terraform");
+        let pins = Pins::default();
+
+        // "ls te" should NOT produce trie-level Ambiguous
+        match resolve("ls te", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                panic!(
+                    "ls args should skip trie, got ambiguous: {:?}",
+                    info.candidates
+                );
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_which_keeps_trie() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("which");
+        trie.insert(&["which", "terraform"]);
+        trie.insert(&["which", "git"]);
+        let pins = Pins::default();
+
+        // "which ter" should resolve via the trie to "which terraform"
+        match resolve("which ter", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "which terraform"),
+            ResolveResult::Passthrough(s) => assert_eq!(s, "which terraform"),
+            other => panic!("Expected which to resolve via trie, got {:?}", other),
         }
     }
 
