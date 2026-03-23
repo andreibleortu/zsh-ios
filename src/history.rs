@@ -54,8 +54,7 @@ pub fn parse_history(path: &Path, trie: &mut CommandTrie) -> Result<u32, Box<dyn
             if words[0].contains('=') && !words[0].starts_with('-') {
                 if words.len() > 1 {
                     let cmd = words[1];
-                    // Don't learn abbreviated prefixes (e.g. "terr" when "terraform" exists)
-                    if !trie.root.is_prefix_of_existing(cmd) {
+                    if !should_skip_command(cmd, trie) {
                         trie.insert(&words[1..]);
                         count += 1;
                     }
@@ -63,8 +62,7 @@ pub fn parse_history(path: &Path, trie: &mut CommandTrie) -> Result<u32, Box<dyn
                 continue;
             }
 
-            // Don't learn abbreviated prefixes (e.g. "terr" when "terraform" exists)
-            if trie.root.is_prefix_of_existing(words[0]) {
+            if should_skip_command(words[0], trie) {
                 continue;
             }
 
@@ -74,6 +72,22 @@ pub fn parse_history(path: &Path, trie: &mut CommandTrie) -> Result<u32, Box<dyn
     }
 
     Ok(count)
+}
+
+/// Check whether a command word from history should be skipped.
+///
+/// Returns true if:
+/// - It's a strict prefix of an existing trie entry (abbreviated junk like "terr")
+/// - It doesn't exist as a known command in the trie (not on PATH, not a builtin,
+///   not an alias). This prevents learning garbage like typos or one-off scripts
+///   that no longer exist.
+fn should_skip_command(cmd: &str, trie: &CommandTrie) -> bool {
+    if trie.root.is_prefix_of_existing(cmd) {
+        return true;
+    }
+    // If the trie already has this command (from PATH scan, builtins, or aliases),
+    // it's real. If not, it's probably a typo or gone executable — skip it.
+    trie.root.get_child(cmd).is_none()
 }
 
 /// Strip the Zsh extended history prefix (`: timestamp:duration;`) if present.
@@ -179,6 +193,12 @@ mod tests {
         .unwrap();
 
         let mut trie = CommandTrie::new();
+        // Pre-populate with known commands (mirrors real build where PATH is scanned first)
+        trie.insert_command("git");
+        trie.insert_command("terraform");
+        trie.insert_command("echo");
+        trie.insert_command("grep");
+
         let count = parse_history(&path, &mut trie).unwrap();
 
         assert_eq!(count, 4); // git checkout main, terraform apply, echo hello, grep h
@@ -188,6 +208,27 @@ mod tests {
 
         let git = trie.root.get_child("git").unwrap();
         assert!(git.get_child("checkout").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unknown_command_not_learned() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-unknown-skip");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(&path, "xyzzy foo bar\ngit status\n").unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+
+        let count = parse_history(&path, &mut trie).unwrap();
+        assert_eq!(count, 1); // only "git status", not "xyzzy foo bar"
+        assert!(
+            trie.root.get_child("xyzzy").is_none(),
+            "unknown command should not be learned from history"
+        );
+        assert!(trie.root.get_child("git").unwrap().get_child("status").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
