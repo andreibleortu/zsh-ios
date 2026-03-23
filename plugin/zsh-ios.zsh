@@ -359,6 +359,16 @@ _zsh_ios_handle_ambiguity() {
     local display_path="${_zio_pins_path/#$HOME/~}"
     echo "  Saved: \"$abbrev_str\" → \"$pin_expanded\""
     echo "  In $display_path"
+    echo -n "  (U to undo) "
+    local undo_key
+    read -r -k 1 -t 4 undo_key </dev/tty
+    echo ""
+    if [[ "$undo_key" == "u" || "$undo_key" == "U" ]]; then
+        "$ZSH_IOS_BIN" unpin "$abbrev_str" 2>/dev/null
+        echo "  Unpinned: \"$abbrev_str\""
+        zle reset-prompt
+        return
+    fi
 
     # Build the full command to execute
     local full_cmd="$selected_display"

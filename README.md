@@ -4,7 +4,7 @@ Command abbreviation engine for Zsh inspired by Cisco IOS. Type abbreviated comm
 
 ```
 $ ter ap         →  terraform apply
-$ gi ch main     →  git checkout main
+$ gi br          →  git branch
 $ cd ~/Lib/App/zsh-  →  cd ~/Library/Application\ Support/zsh-ios
 $ cd te/!5       →  cd tests/test-5
 ```
@@ -26,7 +26,7 @@ If an abbreviation is ambiguous, you're told -- just like IOS. Pick a number and
 
 zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, and Zsh completion definitions. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
 
-**Deep disambiguation** looks ahead at subsequent words to narrow things down. `gi ch main` resolves to `git checkout main` because `git` is the only `gi*` command with a `ch*` subcommand. The same technique works for filesystem paths -- `cd ~/Lib/Applic/zsh-` resolves through `Application Support` (not `Application Scripts`) because only `Application Support` has a `zsh-*` child.
+**Deep disambiguation** looks ahead at subsequent words to narrow things down. `gi pu orig main` resolves to `git push origin main` because `git` is the only `gi*` command with a `pu*` subcommand. The same technique works for filesystem paths -- `cd ~/Lib/Applic/zsh-` resolves through `Application Support` (not `Application Scripts`) because only `Application Support` has a `zsh-*` child.
 
 **Pins** are saved abbreviation rules. When you disambiguate interactively, the resolution is saved to a plain text file so the same abbreviation resolves instantly next time. Pins use longest-prefix matching: `gi ch` -> `git checkout` won't interfere with `gi` alone being ambiguous.
 
@@ -201,7 +201,7 @@ Flags (words starting with `-`) are never prefix-expanded. `-H` stays `-H`, it w
 
 When you run a command, `zsh-ios` waits for it to finish. If it exits successfully (exit code 0), the command is learned into the trie. Failed commands are silently ignored, so typos and `command not found` errors won't pollute your trie.
 
-Before learning, abbreviations are resolved to their full form -- typing `gi ch main` and having it resolve to `git checkout main` means the trie learns `git checkout`, not `gi ch`. If resolution is ambiguous, nothing is learned at all.
+Before learning, abbreviations are resolved to their full form -- typing `gi br` and having it resolve to `git branch` means the trie learns `git branch`, not `gi br`. If resolution is ambiguous, nothing is learned at all.
 
 The trie is further protected from junk:
 - **Prefix guard** -- abbreviated prefixes like `terr` are never learned when `terraform` already exists
