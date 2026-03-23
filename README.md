@@ -138,10 +138,10 @@ The engine is context-aware about what kind of arguments a command takes:
 
 | Mode | Commands | Behavior |
 |------|----------|----------|
-| **Dirs only** | `cd`, `pushd` | Arguments resolve against directories only |
-| **Paths** | `ls`, `rm`, `cat`, `vim`, `cp`, `mv`, ... | Arguments resolve against all filesystem entries |
-| **Execs only** | `which`, `type`, `man`, `command`, ... | Arguments resolve against the command trie only |
-| **Normal** | everything else | Trie first, then filesystem fallback |
+| **Dirs only** | `cd`, `pushd` | All arguments resolve against directories only |
+| **Paths** | `ls`, `rm`, `cat`, `vim`, `cp`, `mv`, ... | All arguments resolve against filesystem entries |
+| **Execs only** | `which`, `type`, `man`, `command`, ... | Arguments resolve against the command trie only, no filesystem |
+| **Normal** | everything else | Trie first; only path-like arguments (`./foo`, `~/bar`, `src/`) resolve against the filesystem. Bare words are not filesystem-expanded. |
 
 ### Suffix matching
 
