@@ -40,7 +40,84 @@ pub struct DeepCandidate {
     pub subcommand_matches: Vec<String>,
 }
 
-/// Resolve an abbreviated command line against the trie and pins.
+/// Resolve a full command line, splitting on pipes and chain operators.
+///
+/// Handles `|`, `||`, `&&`, and `;`.  Each segment is resolved independently;
+/// the first ambiguity encountered is returned so the caller can prompt.
+pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
+    let parts = split_on_operators(input);
+
+    // Fast path: no operators → resolve as a single command.
+    let has_op = parts.iter().any(|p| matches!(p, LinePart::Operator(_)));
+    if !has_op {
+        return resolve(input, trie, pins);
+    }
+
+    let mut resolved: Vec<String> = Vec::new();
+    let mut any_changed = false;
+    let mut word_offset: usize = 0;
+
+    for part in &parts {
+        match part {
+            LinePart::Operator(op) => {
+                resolved.push(op.clone());
+                word_offset += 1; // operators are one word in zsh's (z) split
+            }
+            LinePart::Command(cmd) => {
+                let trimmed = cmd.trim();
+                if trimmed.is_empty() {
+                    resolved.push(String::new());
+                    continue;
+                }
+
+                match resolve(trimmed, trie, pins) {
+                    ResolveResult::Resolved(r) => {
+                        word_offset += r.split_whitespace().count();
+                        resolved.push(r);
+                        any_changed = true;
+                    }
+                    ResolveResult::Passthrough(p) => {
+                        word_offset += p.split_whitespace().count();
+                        resolved.push(p);
+                    }
+                    ResolveResult::Ambiguous(mut info) => {
+                        info.position += word_offset;
+                        let prefix_so_far = resolved.join(" ");
+                        if !prefix_so_far.trim().is_empty() {
+                            let mut full_prefix: Vec<String> = prefix_so_far
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect();
+                            full_prefix.extend(info.resolved_prefix);
+                            info.resolved_prefix = full_prefix;
+                        }
+                        return ResolveResult::Ambiguous(info);
+                    }
+                    ResolveResult::PathAmbiguous(candidates) => {
+                        let prefix_so_far = resolved.join(" ");
+                        if prefix_so_far.trim().is_empty() {
+                            return ResolveResult::PathAmbiguous(candidates);
+                        }
+                        let adjusted: Vec<String> = candidates
+                            .into_iter()
+                            .map(|c| format!("{} {}", prefix_so_far.trim(), c))
+                            .collect();
+                        return ResolveResult::PathAmbiguous(adjusted);
+                    }
+                }
+            }
+        }
+    }
+
+    let result = resolved.join(" ");
+    if any_changed && result != input {
+        ResolveResult::Resolved(result)
+    } else {
+        ResolveResult::Passthrough(input.to_string())
+    }
+}
+
+/// Resolve a single command segment (no pipes/chains) against the trie and pins.
 pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
     let words: Vec<&str> = input.split_whitespace().collect();
     if words.is_empty() {
@@ -84,6 +161,61 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     }
+}
+
+// --- Pipe / chain splitting ---
+
+enum LinePart {
+    Command(String),
+    Operator(String),
+}
+
+/// Split a command line on `|`, `||`, `&&`, `;` while respecting quotes.
+fn split_on_operators(input: &str) -> Vec<LinePart> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_dq => in_sq = !in_sq,
+            b'"' if !in_sq => in_dq = !in_dq,
+            b'\\' if !in_sq => {
+                i += 1; // skip escaped char
+            }
+            b'|' if !in_sq && !in_dq => {
+                parts.push(LinePart::Command(input[start..i].to_string()));
+                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                    parts.push(LinePart::Operator("||".to_string()));
+                    i += 1;
+                } else {
+                    parts.push(LinePart::Operator("|".to_string()));
+                }
+                start = i + 1;
+            }
+            b'&' if !in_sq && !in_dq => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    parts.push(LinePart::Command(input[start..i].to_string()));
+                    parts.push(LinePart::Operator("&&".to_string()));
+                    i += 1;
+                    start = i + 1;
+                }
+            }
+            b';' if !in_sq && !in_dq => {
+                parts.push(LinePart::Command(input[start..i].to_string()));
+                parts.push(LinePart::Operator(";".to_string()));
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    parts.push(LinePart::Command(input[start..].to_string()));
+    parts
 }
 
 fn finalize_with_paths(input: &str, words: Vec<String>) -> ResolveResult {
@@ -432,7 +564,23 @@ fn has_filesystem_prefix_match(word: &str) -> bool {
 
 /// Generate completions for the `?` command.
 /// Returns a formatted list of matching commands/subcommands.
+/// Splits on pipe/chain operators and completes only the last segment.
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
+    // Use only the last segment after any pipe/chain operator.
+    let parts = split_on_operators(input);
+    let last_cmd = parts
+        .iter()
+        .rev()
+        .find_map(|p| match p {
+            LinePart::Command(c) => Some(c.trim()),
+            _ => None,
+        })
+        .unwrap_or(input.trim());
+
+    complete_segment(last_cmd, trie, pins)
+}
+
+fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     let words: Vec<&str> = input.split_whitespace().collect();
     let mut output = String::new();
 
@@ -453,6 +601,22 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         return output;
     }
 
+    // Resolve first word to determine arg mode.
+    let resolved_cmd = resolve_first_word(words[0], trie);
+    let mode = arg_mode(&resolved_cmd);
+
+    // For dir/path commands, show filesystem completions.
+    if matches!(mode, ArgMode::DirsOnly | ArgMode::Paths) {
+        let last_word = if words.len() > 1 {
+            *words.last().unwrap()
+        } else {
+            ""
+        };
+        return complete_filesystem(last_word, mode == ArgMode::DirsOnly);
+    }
+
+    // --- Trie-based completion (ExecsOnly / Normal) ---
+
     // Check pins first
     let pin_result = pins.longest_match(&words);
     let (pin_consumed, expanded_prefix) = match pin_result {
@@ -461,7 +625,6 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     };
 
     if pin_consumed >= words.len() {
-        // All words consumed by pin -- show subcommands of the expanded command
         let mut node = &trie.root;
         for w in &expanded_prefix {
             match node.get_child(w) {
@@ -483,11 +646,9 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         return output;
     }
 
-    // Walk the trie to the current position
     let resolve_start = if pin_consumed > 0 { pin_consumed } else { 0 };
     let mut node = &trie.root;
 
-    // If pin matched, walk the trie to the expanded prefix position
     if pin_consumed > 0 {
         for w in &expanded_prefix {
             match node.get_child(w) {
@@ -499,9 +660,7 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         }
     }
 
-    // Resolve words before the last one, drilling into the trie
     for word in &words[resolve_start..words.len().saturating_sub(1)] {
-        // Prefer exact match, then unique prefix match
         if let Some(child) = node.get_child(word) {
             node = child;
             continue;
@@ -526,7 +685,6 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         }
     }
 
-    // Show matches for the last word (or all if the last word is the query)
     let last_word = words.last().unwrap_or(&"");
     let matches = node.prefix_search(last_word);
 
@@ -539,7 +697,6 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
             } else {
                 output.push_str(&format!("  {}\n", name));
             }
-            // Show subcommands if available
             if !child.children.is_empty() {
                 let subs: Vec<&str> = child.children.keys().map(|s| s.as_str()).collect();
                 if subs.len() <= 8 {
@@ -556,6 +713,93 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         }
     }
 
+    output
+}
+
+/// Resolve just the first word of a command against the trie root.
+fn resolve_first_word(word: &str, trie: &CommandTrie) -> String {
+    if trie.root.get_child(word).is_some() {
+        return word.to_string();
+    }
+    let matches = trie.root.prefix_search(word);
+    if matches.len() == 1 {
+        return matches[0].0.to_string();
+    }
+    word.to_string()
+}
+
+/// List filesystem entries for `?` completion in dir/path commands.
+fn complete_filesystem(word: &str, dirs_only: bool) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let (search_dir, pattern) = if let Some((dir_part, comp)) = word.rsplit_once('/') {
+        let dir = if let Some(rest) = dir_part.strip_prefix('~') {
+            let home = dirs::home_dir().unwrap_or_default();
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            if rest.is_empty() { home } else { home.join(rest) }
+        } else if dir_part.is_empty() {
+            std::path::PathBuf::from("/")
+        } else {
+            cwd.join(dir_part)
+        };
+        (dir, comp)
+    } else {
+        (cwd, word)
+    };
+
+    let mut entries: Vec<String> = match std::fs::read_dir(&search_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| !dirs_only || e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => return "  (cannot read directory)\n".to_string(),
+    };
+    entries.sort();
+
+    let filtered: Vec<&String> = if pattern.is_empty() {
+        entries.iter().collect()
+    } else if let Some(suffix) = pattern.strip_prefix('!') {
+        if suffix.is_empty() {
+            entries.iter().collect()
+        } else {
+            let lower = suffix.to_lowercase();
+            entries
+                .iter()
+                .filter(|e| e.ends_with(suffix) || e.to_lowercase().ends_with(&lower))
+                .collect()
+        }
+    } else if let Some(sub) = pattern.strip_prefix('*') {
+        if sub.is_empty() {
+            entries.iter().collect()
+        } else {
+            let lower = sub.to_lowercase();
+            entries
+                .iter()
+                .filter(|e| e.contains(sub) || e.to_lowercase().contains(&lower))
+                .collect()
+        }
+    } else {
+        let lower = pattern.to_lowercase();
+        entries
+            .iter()
+            .filter(|e| e.starts_with(pattern) || e.to_lowercase().starts_with(&lower))
+            .collect()
+    };
+
+    let mut output = String::new();
+    if filtered.is_empty() {
+        output.push_str(&format!("  No matches for \"{}\"\n", word));
+    } else {
+        for name in &filtered {
+            let trailing = if search_dir.join(name).is_dir() {
+                "/"
+            } else {
+                ""
+            };
+            output.push_str(&format!("  {}{}\n", name, trailing));
+        }
+    }
     output
 }
 
@@ -760,6 +1004,61 @@ mod tests {
             ResolveResult::Resolved(s) => assert_eq!(s, "which terraform"),
             ResolveResult::Passthrough(s) => assert_eq!(s, "which terraform"),
             other => panic!("Expected which to resolve via trie, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pipe_resolution() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        // Both sides of a pipe should resolve
+        match resolve_line("gi push | gr -r pattern", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "git push | grep -r pattern"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_chain_resolution() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve_line("ter init && ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "terraform init && terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_semicolon_resolution() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve_line("ter init; ter pl", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "terraform init ; terraform plan"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pipe_ambiguity_in_second_segment() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        // First segment resolves; second is ambiguous (bare "g")
+        match resolve_line("ter ap | g", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                assert_eq!(info.word, "g");
+                // Position should be offset by first segment (2 words) + operator (1)
+                assert_eq!(info.position, 3);
+                // Resolved prefix should include the first segment + operator
+                assert_eq!(
+                    info.resolved_prefix,
+                    vec!["terraform", "apply", "|"]
+                );
+            }
+            other => panic!("Expected Ambiguous, got {:?}", other),
         }
     }
 

@@ -219,52 +219,63 @@ enum ComponentMatch {
 fn resolve_component(dir: &Path, pattern: &str, dirs_only: bool) -> ComponentMatch {
     let entries = list_dir(dir, dirs_only);
 
-    // Suffix match: !suffix matches entries that END with suffix.
-    if let Some(suffix) = pattern.strip_prefix('!') {
-        if suffix.is_empty() {
-            return ComponentMatch::None;
-        }
-        // Case-sensitive suffix
-        let cs: Vec<&String> = entries.iter().filter(|e| e.ends_with(suffix)).collect();
-        match cs.len() {
-            1 => return ComponentMatch::Unique(cs[0].clone()),
-            2.. => return ComponentMatch::Ambiguous(cs.into_iter().cloned().collect()),
-            _ => {}
-        }
-        // Case-insensitive suffix
-        let lower = suffix.to_lowercase();
-        let ci: Vec<&String> = entries
-            .iter()
-            .filter(|e| e.to_lowercase().ends_with(&lower))
-            .collect();
-        return match ci.len() {
-            1 => ComponentMatch::Unique(ci[0].clone()),
-            2.. => ComponentMatch::Ambiguous(ci.into_iter().cloned().collect()),
-            _ => ComponentMatch::None,
-        };
+    // Backslash escapes: \! → literal !, \* → literal *
+    if let Some(rest) = pattern.strip_prefix("\\!") {
+        let literal = format!("!{rest}");
+        return prefix_match(&literal, &entries);
+    }
+    if let Some(rest) = pattern.strip_prefix("\\*") {
+        let literal = format!("*{rest}");
+        return prefix_match(&literal, &entries);
     }
 
-    // Prefix match (existing logic).
+    // Suffix match: !suffix
+    if let Some(suffix) = pattern.strip_prefix('!')
+        && !suffix.is_empty()
+    {
+        return match_with(suffix, &entries, |e, s| e.ends_with(s));
+    }
+
+    // Contains match: *substring
+    if let Some(sub) = pattern.strip_prefix('*')
+        && !sub.is_empty()
+    {
+        return match_with(sub, &entries, |e, s| e.contains(s));
+    }
+
+    // Default: prefix match.
+    prefix_match(pattern, &entries)
+}
+
+fn prefix_match(pattern: &str, entries: &[String]) -> ComponentMatch {
     if entries.iter().any(|e| e == pattern) {
         return ComponentMatch::Exact(pattern.to_string());
     }
+    match_with(pattern, entries, |e, s| e.starts_with(s))
+}
 
-    let cs_matches: Vec<&String> = entries.iter().filter(|e| e.starts_with(pattern)).collect();
-    match cs_matches.len() {
-        1 => return ComponentMatch::Unique(cs_matches[0].clone()),
-        0 => {}
-        _ => return ComponentMatch::Ambiguous(cs_matches.into_iter().cloned().collect()),
+/// Generic case-sensitive then case-insensitive matching.
+fn match_with<F>(needle: &str, entries: &[String], predicate: F) -> ComponentMatch
+where
+    F: Fn(&str, &str) -> bool,
+{
+    // Case-sensitive
+    let cs: Vec<&String> = entries.iter().filter(|e| predicate(e, needle)).collect();
+    match cs.len() {
+        1 => return ComponentMatch::Unique(cs[0].clone()),
+        2.. => return ComponentMatch::Ambiguous(cs.into_iter().cloned().collect()),
+        _ => {}
     }
-
-    let lower_prefix = pattern.to_lowercase();
-    let ci_matches: Vec<&String> = entries
+    // Case-insensitive
+    let lower = needle.to_lowercase();
+    let ci: Vec<&String> = entries
         .iter()
-        .filter(|e| e.to_lowercase().starts_with(&lower_prefix))
+        .filter(|e| predicate(&e.to_lowercase(), &lower))
         .collect();
-    match ci_matches.len() {
-        1 => ComponentMatch::Unique(ci_matches[0].clone()),
-        0 => ComponentMatch::None,
-        _ => ComponentMatch::Ambiguous(ci_matches.into_iter().cloned().collect()),
+    match ci.len() {
+        1 => ComponentMatch::Unique(ci[0].clone()),
+        2.. => ComponentMatch::Ambiguous(ci.into_iter().cloned().collect()),
+        _ => ComponentMatch::None,
     }
 }
 
@@ -277,25 +288,26 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_
     if next.is_empty() {
         return candidates.to_vec();
     }
-    let lower_next = next.to_lowercase();
 
-    // Suffix pattern: !suffix matches entries ending with suffix.
-    if let Some(suffix) = next.strip_prefix('!')
-        && !suffix.is_empty()
-    {
-        let lower_suffix = suffix.to_lowercase();
-        return candidates
-            .iter()
-            .filter(|cand| {
-                let child_dir = parent.join(cand);
-                let entries = list_dir(&child_dir, dirs_only);
-                entries.iter().any(|e| {
-                    e.ends_with(suffix) || e.to_lowercase().ends_with(&lower_suffix)
-                })
-            })
-            .cloned()
-            .collect();
-    }
+    // Determine match predicate from the next component's mode.
+    let (needle, pred): (&str, fn(&str, &str) -> bool) =
+        if let Some(s) = next.strip_prefix('!') {
+            if !s.is_empty() {
+                (s, |e, n| e.ends_with(n))
+            } else {
+                (next.as_str(), |e, n| e.starts_with(n))
+            }
+        } else if let Some(s) = next.strip_prefix('*') {
+            if !s.is_empty() {
+                (s, |e, n| e.contains(n))
+            } else {
+                (next.as_str(), |e, n| e.starts_with(n))
+            }
+        } else {
+            (next.as_str(), |e, n| e.starts_with(n))
+        };
+
+    let lower_needle = needle.to_lowercase();
 
     candidates
         .iter()
@@ -303,9 +315,9 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_
             let child_dir = parent.join(cand);
             let entries = list_dir(&child_dir, dirs_only);
             entries.iter().any(|e| {
-                e == next
-                    || e.starts_with(next.as_str())
-                    || e.to_lowercase().starts_with(&lower_next)
+                e == next.as_str()
+                    || pred(e, needle)
+                    || pred(&e.to_lowercase(), &lower_needle)
             })
         })
         .cloned()
@@ -413,6 +425,62 @@ mod tests {
         match result {
             ComponentMatch::None => {}
             other => panic!("Expected None for bare !, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_contains_match() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-contains");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(dir.join("app-config-prod"));
+        let _ = fs::create_dir_all(dir.join("app-config-staging"));
+        let _ = fs::create_dir_all(dir.join("unrelated"));
+
+        // *poll matches only app-config-prod
+        let result = resolve_component(&dir, "*poll", false);
+        match result {
+            ComponentMatch::Unique(name) => assert_eq!(name, "app-config-prod"),
+            other => panic!("Expected Unique contains match, got {:?}", other),
+        }
+
+        // *cq matches two entries
+        let result = resolve_component(&dir, "*cq", false);
+        match result {
+            ComponentMatch::Ambiguous(names) => assert_eq!(names.len(), 2),
+            other => panic!("Expected Ambiguous for *cq, got {:?}", other),
+        }
+
+        // *zzz matches nothing
+        let result = resolve_component(&dir, "*zzz", false);
+        match result {
+            ComponentMatch::None => {}
+            other => panic!("Expected None for *zzz, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_backslash_escape() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-escape");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(dir.join("!important"));
+        let _ = fs::create_dir_all(dir.join("*starred"));
+
+        // \! should match literally as prefix, not as suffix mode
+        let result = resolve_component(&dir, "\\!imp", false);
+        match result {
+            ComponentMatch::Unique(name) => assert_eq!(name, "!important"),
+            other => panic!("Expected Unique for escaped !, got {:?}", other),
+        }
+
+        // \* should match literally as prefix, not as contains mode
+        let result = resolve_component(&dir, "\\*star", false);
+        match result {
+            ComponentMatch::Unique(name) => assert_eq!(name, "*starred"),
+            other => panic!("Expected Unique for escaped *, got {:?}", other),
         }
 
         let _ = fs::remove_dir_all(&dir);

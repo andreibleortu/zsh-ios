@@ -149,7 +149,7 @@ fn cmd_resolve(line: &str) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
 
-    match resolve::resolve(line, &trie, &pin_store) {
+    match resolve::resolve_line(line, &trie, &pin_store) {
         resolve::ResolveResult::Resolved(expanded) => {
             println!("{}", expanded);
             process::exit(0);
