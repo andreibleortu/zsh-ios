@@ -122,6 +122,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 5. Scan Zsh completion files for subcommand definitions
     let comp_count = completions::scan_completions(&mut ct);
     eprintln!("Learned {} subcommands from Zsh completions", comp_count);
+    eprintln!("Detected arg modes for {} commands", ct.arg_modes.len());
 
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
@@ -370,6 +371,9 @@ fn cmd_status() {
         }
         if let Ok(trie) = trie::CommandTrie::load(&tree_path) {
             println!("  Commands:    {} top-level", trie.root.len());
+            if !trie.arg_modes.is_empty() {
+                println!("  Arg modes:   {} commands auto-detected", trie.arg_modes.len());
+            }
         }
     } else {
         println!("  Tree:        not built yet (run `zsh-ios rebuild`)");

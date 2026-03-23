@@ -1,6 +1,6 @@
 use crate::path_resolve;
 use crate::pins::Pins;
-use crate::trie::{CommandTrie, TrieNode};
+use crate::trie::{self, ArgModeMap, CommandTrie, TrieNode};
 
 /// Result of resolving an abbreviated command line.
 #[derive(Debug)]
@@ -144,20 +144,20 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
                 None => {
                     let mut result_words = expanded_prefix;
                     result_words.extend(remaining_words.iter().map(|s| s.to_string()));
-                    return finalize_with_paths(input, result_words);
+                    return finalize_with_paths(input, result_words, &trie.arg_modes);
                 }
             }
         }
 
         let mut result_words = expanded_prefix;
-        match resolve_from_node(remaining_words, node, &mut result_words) {
-            Ok(()) => finalize_with_paths(input, result_words),
+        match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes) {
+            Ok(()) => finalize_with_paths(input, result_words, &trie.arg_modes),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     } else {
         let mut result_words: Vec<String> = Vec::new();
-        match resolve_from_node(&words, &trie.root, &mut result_words) {
-            Ok(()) => finalize_with_paths(input, result_words),
+        match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes) {
+            Ok(()) => finalize_with_paths(input, result_words, &trie.arg_modes),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     }
@@ -218,8 +218,8 @@ fn split_on_operators(input: &str) -> Vec<LinePart> {
     parts
 }
 
-fn finalize_with_paths(input: &str, words: Vec<String>) -> ResolveResult {
-    let mode = words.first().map(|w| arg_mode(w)).unwrap_or(ArgMode::Normal);
+fn finalize_with_paths(input: &str, words: Vec<String>, modes: &ArgModeMap) -> ResolveResult {
+    let mode = words.first().map(|w| arg_mode(w, modes)).unwrap_or(ArgMode::Normal);
     match resolve_paths_in_words(&words, mode) {
         PathsResult::Resolved(result) => {
             if result == input {
@@ -238,6 +238,7 @@ fn resolve_from_node(
     words: &[&str],
     start_node: &TrieNode,
     result: &mut Vec<String>,
+    modes: &ArgModeMap,
 ) -> Result<(), Box<AmbiguityInfo>> {
     if words.is_empty() {
         return Ok(());
@@ -246,7 +247,7 @@ fn resolve_from_node(
     // For path/dir commands, skip trie resolution for arguments --
     // they'll be resolved against the filesystem later.
     if !result.is_empty() {
-        let mode = arg_mode(&result[0]);
+        let mode = arg_mode(&result[0], modes);
         if mode == ArgMode::DirsOnly || mode == ArgMode::Paths {
             for w in words {
                 result.push(w.to_string());
@@ -265,7 +266,7 @@ fn resolve_from_node(
         if let Some(exact_node) = start_node.get_child(word) {
             result.push(word.to_string());
             if !rest.is_empty() && !exact_node.children.is_empty() {
-                return resolve_from_node(rest, exact_node, result);
+                return resolve_from_node(rest, exact_node, result, modes);
             }
         } else {
             result.push(word.to_string());
@@ -291,7 +292,7 @@ fn resolve_from_node(
     if let Some(exact_node) = start_node.get_child(word) {
         result.push(word.to_string());
         if !rest.is_empty() && !exact_node.children.is_empty() {
-            return resolve_from_node(rest, exact_node, result);
+            return resolve_from_node(rest, exact_node, result, modes);
         }
         for w in rest {
             result.push(w.to_string());
@@ -307,7 +308,7 @@ fn resolve_from_node(
     let mode = if result.is_empty() {
         ArgMode::Normal
     } else {
-        arg_mode(&result[0])
+        arg_mode(&result[0], modes)
     };
     if !result.is_empty() && mode != ArgMode::ExecsOnly && has_filesystem_prefix_match(word) {
         result.push(word.to_string());
@@ -333,7 +334,7 @@ fn resolve_from_node(
             result.push(full_name.to_string());
 
             if !rest.is_empty() && !child_node.children.is_empty() {
-                resolve_from_node(rest, child_node, result)
+                resolve_from_node(rest, child_node, result, modes)
             } else {
                 for w in rest {
                     result.push(w.to_string());
@@ -352,7 +353,7 @@ fn resolve_from_node(
                     result.push(full_name.to_string());
 
                     if !child_node.children.is_empty() {
-                        return resolve_from_node(rest, child_node, result);
+                        return resolve_from_node(rest, child_node, result, modes);
                     } else {
                         for w in rest {
                             result.push(w.to_string());
@@ -532,13 +533,24 @@ enum ArgMode {
 }
 
 /// Classify a command by how its arguments should be resolved.
-/// Add new entries here to teach zsh-ios about more commands.
-fn arg_mode(cmd: &str) -> ArgMode {
+///
+/// Checks the auto-detected arg modes from Zsh completions first,
+/// then falls back to a hardcoded list for common commands.
+fn arg_mode(cmd: &str, modes: &ArgModeMap) -> ArgMode {
+    // Check auto-detected modes from Zsh completion files
+    if let Some(&mode) = modes.get(cmd) {
+        return match mode {
+            trie::ARG_MODE_DIRS_ONLY => ArgMode::DirsOnly,
+            trie::ARG_MODE_PATHS => ArgMode::Paths,
+            trie::ARG_MODE_EXECS_ONLY => ArgMode::ExecsOnly,
+            _ => ArgMode::Normal,
+        };
+    }
+
+    // Hardcoded fallback for commands without Zsh completions
     match cmd {
-        // Directory-only arguments
         "cd" | "pushd" => ArgMode::DirsOnly,
 
-        // Filesystem path arguments
         "ls" | "rm" | "rmdir" | "mkdir" | "cp" | "mv" | "ln"
         | "cat" | "less" | "more" | "head" | "tail" | "wc"
         | "touch" | "chmod" | "chown" | "chgrp" | "stat" | "file"
@@ -549,7 +561,6 @@ fn arg_mode(cmd: &str) -> ArgMode {
         | "nano" | "vim" | "vi" | "nvim" | "emacs" | "code" | "bat"
         => ArgMode::Paths,
 
-        // Executable / command-name arguments
         "which" | "type" | "whence" | "where" | "command" | "man" | "rehash"
         => ArgMode::ExecsOnly,
 
@@ -616,7 +627,7 @@ fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
 
     // Resolve first word to determine arg mode.
     let resolved_cmd = resolve_first_word(words[0], trie);
-    let mode = arg_mode(&resolved_cmd);
+    let mode = arg_mode(&resolved_cmd, &trie.arg_modes);
 
     // For dir/path commands, show filesystem completions.
     if matches!(mode, ArgMode::DirsOnly | ArgMode::Paths) {

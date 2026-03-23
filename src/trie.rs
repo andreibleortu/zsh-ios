@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -72,10 +72,25 @@ impl TrieNode {
     }
 }
 
+/// Argument mode for a command, parsed from Zsh completion files.
+/// Stored as u8 for compact serialization.
+/// 0 = Normal, 1 = Paths, 2 = DirsOnly, 3 = ExecsOnly
+pub type ArgModeMap = HashMap<String, u8>;
+
+#[allow(dead_code)]
+pub const ARG_MODE_NORMAL: u8 = 0;
+pub const ARG_MODE_PATHS: u8 = 1;
+pub const ARG_MODE_DIRS_ONLY: u8 = 2;
+pub const ARG_MODE_EXECS_ONLY: u8 = 3;
+
 /// The full command trie with serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandTrie {
     pub root: TrieNode,
+    /// Argument modes learned from Zsh completion files.
+    /// Maps command name to argument mode (see ARG_MODE_* constants).
+    #[serde(default)]
+    pub arg_modes: ArgModeMap,
 }
 
 impl CommandTrie {
