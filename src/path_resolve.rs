@@ -438,18 +438,18 @@ mod tests {
         let _ = fs::create_dir_all(dir.join("app-config-staging"));
         let _ = fs::create_dir_all(dir.join("unrelated"));
 
-        // *poll matches only app-config-prod
-        let result = resolve_component(&dir, "*poll", false);
+        // *prod matches only app-config-prod
+        let result = resolve_component(&dir, "*prod", false);
         match result {
             ComponentMatch::Unique(name) => assert_eq!(name, "app-config-prod"),
             other => panic!("Expected Unique contains match, got {:?}", other),
         }
 
-        // *cq matches two entries
-        let result = resolve_component(&dir, "*cq", false);
+        // *config matches two entries
+        let result = resolve_component(&dir, "*config", false);
         match result {
             ComponentMatch::Ambiguous(names) => assert_eq!(names.len(), 2),
-            other => panic!("Expected Ambiguous for *cq, got {:?}", other),
+            other => panic!("Expected Ambiguous for *config, got {:?}", other),
         }
 
         // *zzz matches nothing

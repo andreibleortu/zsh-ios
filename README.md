@@ -35,7 +35,7 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 - **Command abbreviation** -- prefix-match any command or subcommand in your trie
 - **Path abbreviation** -- `cd Des/Fo` -> `cd Desktop/Folder`, with deep disambiguation across path components
 - **Suffix matching** -- `!` prefix matches by suffix: `cd te/!5` -> `cd tests/test-5` (matches entries ending with `5`)
-- **Contains matching** -- `*` prefix matches by substring: `cd *poll` -> `cd app-config-prod` (matches entries containing `poll`)
+- **Contains matching** -- `*` prefix matches by substring: `cd *prod` -> `cd app-config-prod` (matches entries containing `prod`)
 - **Pipe/chain resolution** -- commands joined by `|`, `&&`, `||`, `;` are each resolved independently
 - **Context-aware argument resolution** -- commands like `cd` and `ls` resolve arguments against the filesystem (not the trie); commands like `which` and `man` resolve against executables only
 - **Deep disambiguation** -- subsequent words narrow ambiguous prefixes automatically
@@ -161,7 +161,7 @@ Suffix matching works anywhere in a path and combines freely with prefix matchin
 Prefix `*` on a path component to match by **substring**:
 
 ```
-$ cd *poll        →  cd app-config-prod  (contains "poll")
+$ cd *prod        →  cd app-config-prod    (contains "prod")
 $ ls *config      →  ls app-config.yaml    (contains "config")
 ```
 
