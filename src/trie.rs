@@ -12,7 +12,6 @@ pub struct TrieNode {
 }
 
 impl TrieNode {
-
     /// Insert a command sequence (e.g., ["git", "checkout", "main"]) into the trie.
     /// Each word becomes a level in the trie.
     pub fn insert(&mut self, words: &[&str]) {
@@ -67,10 +66,23 @@ impl TrieNode {
 }
 
 /// Argument type constants for positions and flags.
-/// 1 = Paths, 2 = DirsOnly, 3 = ExecsOnly (0 = Normal, implicit default)
+/// Values 1-3 are the original modes; 4+ are extended types from Zsh completions.
 pub const ARG_MODE_PATHS: u8 = 1;
 pub const ARG_MODE_DIRS_ONLY: u8 = 2;
 pub const ARG_MODE_EXECS_ONLY: u8 = 3;
+pub const ARG_MODE_USERS: u8 = 4;
+pub const ARG_MODE_HOSTS: u8 = 5;
+pub const ARG_MODE_PIDS: u8 = 6;
+pub const ARG_MODE_SIGNALS: u8 = 7;
+pub const ARG_MODE_PORTS: u8 = 8;
+pub const ARG_MODE_NET_IFACES: u8 = 9;
+pub const ARG_MODE_GIT_BRANCHES: u8 = 10;
+pub const ARG_MODE_GIT_TAGS: u8 = 11;
+pub const ARG_MODE_GIT_REMOTES: u8 = 12;
+pub const ARG_MODE_GIT_FILES: u8 = 13;
+pub const ARG_MODE_URLS: u8 = 14;
+pub const ARG_MODE_GROUPS: u8 = 15;
+pub const ARG_MODE_LOCALES: u8 = 16;
 
 /// Per-command argument specification, parsed from Zsh completion files.
 /// Knows what type of argument each position and flag expects.
@@ -225,8 +237,8 @@ mod tests {
         trie.insert_command("telnet");
 
         assert!(trie.root.is_prefix_of_existing("terr")); // prefix of "terraform"
-        assert!(trie.root.is_prefix_of_existing("te"));   // prefix of both
+        assert!(trie.root.is_prefix_of_existing("te")); // prefix of both
         assert!(!trie.root.is_prefix_of_existing("terraform")); // exact, not strict prefix
-        assert!(!trie.root.is_prefix_of_existing("xyz"));  // prefix of nothing
+        assert!(!trie.root.is_prefix_of_existing("xyz")); // prefix of nothing
     }
 }

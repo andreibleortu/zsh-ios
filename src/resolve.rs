@@ -1,5 +1,6 @@
 use crate::path_resolve;
 use crate::pins::Pins;
+use crate::runtime_complete;
 use crate::trie::{self, ArgModeMap, ArgSpec, CommandTrie, TrieNode};
 
 /// Result of resolving an abbreviated command line.
@@ -84,10 +85,8 @@ pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResu
                         info.position += word_offset;
                         let prefix_so_far = resolved.join(" ");
                         if !prefix_so_far.trim().is_empty() {
-                            let mut full_prefix: Vec<String> = prefix_so_far
-                                .split_whitespace()
-                                .map(String::from)
-                                .collect();
+                            let mut full_prefix: Vec<String> =
+                                prefix_so_far.split_whitespace().map(String::from).collect();
                             full_prefix.extend(info.resolved_prefix);
                             info.resolved_prefix = full_prefix;
                         }
@@ -219,11 +218,13 @@ fn split_on_operators(input: &str) -> Vec<LinePart> {
 }
 
 fn finalize_with_paths(input: &str, words: Vec<String>, trie: &CommandTrie) -> ResolveResult {
-    // Look up per-position ArgSpec for this command path
-    let cmd_path = command_path_key(&words);
-    let spec = trie.arg_specs.get(&cmd_path);
-    let fallback_mode = words.first().map(|w| arg_mode(w, &trie.arg_modes)).unwrap_or(ArgMode::Normal);
-    match resolve_paths_in_words(&words, spec, fallback_mode) {
+    // Look up per-position ArgSpec: try "cmd subcmd" first, then "cmd"
+    let (spec, cmd_words) = lookup_arg_spec(&words, &trie.arg_specs);
+    let fallback_mode = words
+        .first()
+        .map(|w| arg_mode(w, &trie.arg_modes))
+        .unwrap_or(ArgMode::Normal);
+    match resolve_paths_in_words(&words, spec, fallback_mode, cmd_words) {
         PathsResult::Resolved(result) => {
             if result == input {
                 ResolveResult::Passthrough(input.to_string())
@@ -247,11 +248,14 @@ fn resolve_from_node(
         return Ok(());
     }
 
-    // For path/dir commands, skip trie resolution for arguments --
-    // they'll be resolved against the filesystem later.
+    // For path/dir/runtime commands, skip trie resolution for arguments --
+    // they'll be resolved by the path resolver or runtime resolver later.
     if !result.is_empty() {
         let mode = arg_mode(&result[0], modes);
-        if mode == ArgMode::DirsOnly || mode == ArgMode::Paths {
+        if matches!(
+            mode,
+            ArgMode::DirsOnly | ArgMode::Paths | ArgMode::Runtime(_)
+        ) {
             for w in words {
                 result.push(w.to_string());
             }
@@ -464,16 +468,28 @@ fn looks_like_path(word: &str) -> bool {
         || word.starts_with("\\*")
 }
 
-/// Build a lookup key for the arg_specs map from resolved words.
-/// Tries "cmd subcmd" first, then just "cmd".
-fn command_path_key(words: &[String]) -> String {
+/// Look up an ArgSpec for the resolved command, trying the most specific
+/// key first: "cmd subcmd", then "cmd".
+/// Returns (spec, skip_words) where skip_words is how many words form the
+/// command prefix (1 for "cmd", 2 for "cmd subcmd").
+fn lookup_arg_spec<'a>(
+    words: &[String],
+    specs: &'a trie::ArgSpecMap,
+) -> (Option<&'a ArgSpec>, usize) {
+    // Try "cmd subcmd" (e.g., "git add")
     if words.len() >= 2 && !words[1].starts_with('-') {
-        format!("{} {}", words[0], words[1])
-    } else if !words.is_empty() {
-        words[0].clone()
-    } else {
-        String::new()
+        let key = format!("{} {}", words[0], words[1]);
+        if let Some(spec) = specs.get(&key) {
+            return (Some(spec), 2);
+        }
     }
+    // Fall back to "cmd"
+    if !words.is_empty()
+        && let Some(spec) = specs.get(&words[0])
+    {
+        return (Some(spec), 1);
+    }
+    (None, 1)
 }
 
 /// Determine the ArgMode for a specific argument word, given its position,
@@ -506,67 +522,117 @@ fn arg_type_for_word(
 
 fn u8_to_arg_mode(val: u8) -> ArgMode {
     match val {
+        0 => ArgMode::Normal,
         trie::ARG_MODE_PATHS => ArgMode::Paths,
         trie::ARG_MODE_DIRS_ONLY => ArgMode::DirsOnly,
         trie::ARG_MODE_EXECS_ONLY => ArgMode::ExecsOnly,
-        _ => ArgMode::Normal,
+        other => ArgMode::Runtime(other),
     }
 }
 
-fn resolve_paths_in_words(words: &[String], spec: Option<&ArgSpec>, fallback_mode: ArgMode) -> PathsResult {
+fn resolve_paths_in_words(
+    words: &[String],
+    spec: Option<&ArgSpec>,
+    fallback_mode: ArgMode,
+    cmd_words: usize,
+) -> PathsResult {
     let mut result: Vec<String> = Vec::new();
-    let mut arg_position: u32 = 0; // 1-indexed position of non-flag arguments
+    let mut arg_position: u32 = 0; // 1-indexed position of non-flag arguments after the command prefix
 
     for (i, word) in words.iter().enumerate() {
-        if i == 0 {
-            // Command word itself
+        // Skip command prefix words (e.g., "git" or "git add")
+        if i < cmd_words {
             result.push(word.clone());
             continue;
         }
 
         if word.starts_with('-') {
-            // Flags pass through; but check if next word should be flag-value
             result.push(word.clone());
             continue;
         }
 
         arg_position += 1;
-        let prev_word = if i > 0 { Some(words[i - 1].as_str()) } else { None };
+        let prev_word = if i > 0 {
+            Some(words[i - 1].as_str())
+        } else {
+            None
+        };
         let mode = arg_type_for_word(arg_position, prev_word, spec, fallback_mode);
 
-        // Decide whether to resolve this word as a path
-        let should_resolve = mode != ArgMode::ExecsOnly
-            && (mode == ArgMode::Paths || mode == ArgMode::DirsOnly || looks_like_path(word));
-
-        if should_resolve {
-            let path_result = match mode {
-                ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word),
-                _ => path_resolve::resolve_path(word),
-            };
-            match path_result {
-                path_resolve::PathResult::Resolved(resolved) => {
-                    result.push(shell_escape_path(&resolved));
-                }
-                path_resolve::PathResult::Ambiguous(candidates) => {
-                    let prefix: Vec<String> = result.clone();
-                    let suffix: Vec<String> = words[i + 1..].to_vec();
-                    let full_cmds: Vec<String> = candidates
-                        .into_iter()
-                        .map(|c| {
-                            let mut parts = prefix.clone();
-                            parts.push(shell_escape_path(&c));
-                            parts.extend(suffix.clone());
-                            parts.join(" ")
-                        })
-                        .collect();
-                    return PathsResult::Ambiguous(full_cmds);
-                }
-                path_resolve::PathResult::Unchanged => {
+        match mode {
+            // Runtime-resolved types: users, hosts, signals, git branches, etc.
+            ArgMode::Runtime(type_id) => {
+                if let Some(resolved) = runtime_complete::resolve_prefix(type_id, word) {
+                    result.push(resolved);
+                } else {
                     result.push(word.clone());
                 }
             }
-        } else {
-            result.push(word.clone());
+
+            // Filesystem path resolution
+            ArgMode::Paths | ArgMode::DirsOnly => {
+                let path_result = match mode {
+                    ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word),
+                    _ => path_resolve::resolve_path(word),
+                };
+                match path_result {
+                    path_resolve::PathResult::Resolved(resolved) => {
+                        result.push(shell_escape_path(&resolved));
+                    }
+                    path_resolve::PathResult::Ambiguous(candidates) => {
+                        let prefix: Vec<String> = result.clone();
+                        let suffix: Vec<String> = words[i + 1..].to_vec();
+                        let full_cmds: Vec<String> = candidates
+                            .into_iter()
+                            .map(|c| {
+                                let mut parts = prefix.clone();
+                                parts.push(shell_escape_path(&c));
+                                parts.extend(suffix.clone());
+                                parts.join(" ")
+                            })
+                            .collect();
+                        return PathsResult::Ambiguous(full_cmds);
+                    }
+                    path_resolve::PathResult::Unchanged => {
+                        result.push(word.clone());
+                    }
+                }
+            }
+
+            // ExecsOnly: no path resolution, already handled by trie walk
+            ArgMode::ExecsOnly => {
+                result.push(word.clone());
+            }
+
+            // Normal: only resolve path-like words against the filesystem
+            ArgMode::Normal => {
+                if looks_like_path(word) {
+                    match path_resolve::resolve_path(word) {
+                        path_resolve::PathResult::Resolved(resolved) => {
+                            result.push(shell_escape_path(&resolved));
+                        }
+                        path_resolve::PathResult::Ambiguous(candidates) => {
+                            let prefix: Vec<String> = result.clone();
+                            let suffix: Vec<String> = words[i + 1..].to_vec();
+                            let full_cmds: Vec<String> = candidates
+                                .into_iter()
+                                .map(|c| {
+                                    let mut parts = prefix.clone();
+                                    parts.push(shell_escape_path(&c));
+                                    parts.extend(suffix.clone());
+                                    parts.join(" ")
+                                })
+                                .collect();
+                            return PathsResult::Ambiguous(full_cmds);
+                        }
+                        path_resolve::PathResult::Unchanged => {
+                            result.push(word.clone());
+                        }
+                    }
+                } else {
+                    result.push(word.clone());
+                }
+            }
         }
     }
     PathsResult::Resolved(result.join(" "))
@@ -588,14 +654,14 @@ enum ArgMode {
     /// Trie resolution + filesystem path resolution (default).
     Normal,
     /// Arguments are filesystem paths (files and directories).
-    /// Skips trie, resolves against the filesystem.
     Paths,
     /// Arguments are directory paths only (e.g. cd, pushd).
-    /// Skips trie, resolves against directories on the filesystem.
     DirsOnly,
     /// Arguments are command / executable names (e.g. which, man).
-    /// Keeps trie resolution, skips filesystem path resolution.
     ExecsOnly,
+    /// Runtime-resolved type (users, hosts, signals, git branches, etc.).
+    /// The u8 is the original arg type constant from trie.rs.
+    Runtime(u8),
 }
 
 /// Classify a command by how its arguments should be resolved.
@@ -617,18 +683,13 @@ fn arg_mode(cmd: &str, modes: &ArgModeMap) -> ArgMode {
     match cmd {
         "cd" | "pushd" => ArgMode::DirsOnly,
 
-        "ls" | "rm" | "rmdir" | "mkdir" | "cp" | "mv" | "ln"
-        | "cat" | "less" | "more" | "head" | "tail" | "wc"
-        | "touch" | "chmod" | "chown" | "chgrp" | "stat" | "file"
-        | "readlink" | "realpath" | "basename" | "dirname"
-        | "du" | "find" | "diff" | "patch"
-        | "tar" | "zip" | "unzip" | "gzip" | "gunzip" | "bzip2" | "xz"
-        | "source" | "open"
-        | "nano" | "vim" | "vi" | "nvim" | "emacs" | "code" | "bat"
-        => ArgMode::Paths,
+        "ls" | "rm" | "rmdir" | "mkdir" | "cp" | "mv" | "ln" | "cat" | "less" | "more" | "head"
+        | "tail" | "wc" | "touch" | "chmod" | "chown" | "chgrp" | "stat" | "file" | "readlink"
+        | "realpath" | "basename" | "dirname" | "du" | "find" | "diff" | "patch" | "tar"
+        | "zip" | "unzip" | "gzip" | "gunzip" | "bzip2" | "xz" | "source" | "open" | "nano"
+        | "vim" | "vi" | "nvim" | "emacs" | "code" | "bat" => ArgMode::Paths,
 
-        "which" | "type" | "whence" | "where" | "command" | "man" | "rehash"
-        => ArgMode::ExecsOnly,
+        "which" | "type" | "whence" | "where" | "command" | "man" | "rehash" => ArgMode::ExecsOnly,
 
         _ => ArgMode::Normal,
     }
@@ -657,153 +718,446 @@ fn has_filesystem_prefix_match(word: &str) -> bool {
 /// Splits on pipe/chain operators and completes only the last segment.
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     // Use only the last segment after any pipe/chain operator.
+    // Preserve trailing whitespace — it tells complete_segment whether the user
+    // has finished the current word (trailing space) or is still typing it.
     let parts = split_on_operators(input);
     let last_cmd = parts
         .iter()
         .rev()
         .find_map(|p| match p {
-            LinePart::Command(c) => Some(c.trim()),
+            LinePart::Command(c) => Some(c.trim_start()),
             _ => None,
         })
-        .unwrap_or(input.trim());
+        .unwrap_or(input.trim_start());
 
     complete_segment(last_cmd, trie, pins)
 }
 
 fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     let words: Vec<&str> = input.split_whitespace().collect();
+    // Trailing whitespace means the user has finished the current word and is
+    // starting a new one — the completion prefix for the next word is empty.
+    let completing_next = input.ends_with(' ') || input.ends_with('\t');
     let mut output = String::new();
 
     if words.is_empty() {
         // Show top-level commands sorted by usage count
         let mut entries: Vec<(&str, &TrieNode)> = trie.root.prefix_search("");
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
-        for (name, node) in entries.iter().take(40) {
-            if node.count > 0 {
-                output.push_str(&format!("  {:<24} ({} uses)\n", name, node.count));
-            } else {
-                output.push_str(&format!("  {}\n", name));
-            }
-        }
-        if entries.len() > 40 {
-            output.push_str(&format!("  ... and {} more\n", entries.len() - 40));
+        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
+        let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
+        output.push_str(&format_columns(&names, 80));
+        return output;
+    }
+
+    // Determine which words are "completed" (fully typed) vs the prefix being completed.
+    // completed_words: words that are done (user has moved past them)
+    // prefix: the partial word being completed (empty if user is starting a fresh word)
+    let (completed_words, prefix): (Vec<&str>, &str) = if completing_next {
+        (words.clone(), "")
+    } else if words.len() == 1 {
+        // Single word, no trailing space → completing at root level
+        (vec![], words[0])
+    } else {
+        (words[..words.len() - 1].to_vec(), words[words.len() - 1])
+    };
+
+    // If no completed words, just search the root
+    if completed_words.is_empty() {
+        let mut matches = trie.root.prefix_search(prefix);
+        if matches.is_empty() {
+            output.push_str(&format!("  No commands matching \"{}\"\n", prefix));
+        } else {
+            matches.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
+            let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
+            output.push_str(&format_columns(&names, 80));
         }
         return output;
     }
 
-    // Resolve first word to determine arg mode.
-    let resolved_cmd = resolve_first_word(words[0], trie);
-    let mode = arg_mode(&resolved_cmd, &trie.arg_modes);
-
-    // For dir/path commands, show filesystem completions.
-    if matches!(mode, ArgMode::DirsOnly | ArgMode::Paths) {
-        let last_word = if words.len() > 1 {
-            *words.last().unwrap()
-        } else {
-            ""
-        };
-        return complete_filesystem(last_word, mode == ArgMode::DirsOnly);
-    }
-
-    // --- Trie-based completion (ExecsOnly / Normal) ---
+    // Resolve completed words to build the resolved command prefix and walk trie
+    let mut resolved_words: Vec<String> = Vec::new();
+    let resolved_cmd = resolve_first_word(completed_words[0], trie);
+    resolved_words.push(resolved_cmd.clone());
 
     // Check pins first
-    let pin_result = pins.longest_match(&words);
+    let pin_result = pins.longest_match(&completed_words);
     let (pin_consumed, expanded_prefix) = match pin_result {
         Some((consumed, expanded)) => (consumed, expanded),
         None => (0, vec![]),
     };
 
-    if pin_consumed >= words.len() {
-        let mut node = &trie.root;
-        for w in &expanded_prefix {
-            match node.get_child(w) {
-                Some(child) => node = child,
-                None => return format!("  {} (pin, no subcommands in tree)\n", expanded_prefix.join(" ")),
-            }
-        }
-        output.push_str(&format!("  {} (pinned)\n", expanded_prefix.join(" ")));
-        if !node.children.is_empty() {
-            output.push_str("  Subcommands:\n");
-            for (name, child) in &node.children {
-                if child.count > 0 {
-                    output.push_str(&format!("    {:<20} ({} uses)\n", name, child.count));
-                } else {
-                    output.push_str(&format!("    {}\n", name));
-                }
-            }
-        }
-        return output;
-    }
-
-    let resolve_start = if pin_consumed > 0 { pin_consumed } else { 0 };
+    // Walk the trie through completed words
     let mut node = &trie.root;
+    let resolve_start;
 
     if pin_consumed > 0 {
+        resolved_words = expanded_prefix.clone();
         for w in &expanded_prefix {
             match node.get_child(w) {
                 Some(child) => node = child,
-                None => {
-                    return format!("  {} (pin target not in tree)\n", expanded_prefix.join(" "));
-                }
+                None => break,
             }
         }
+        resolve_start = pin_consumed;
+    } else {
+        if let Some(child) = node.get_child(&resolved_cmd) {
+            node = child;
+        }
+        resolve_start = 1;
     }
 
-    for word in &words[resolve_start..words.len().saturating_sub(1)] {
+    // Walk remaining completed words
+    for word in &completed_words[resolve_start..] {
         if let Some(child) = node.get_child(word) {
+            resolved_words.push(word.to_string());
             node = child;
             continue;
         }
         let matches = node.prefix_search(word);
         match matches.len() {
-            1 => node = matches[0].1,
+            1 => {
+                resolved_words.push(matches[0].0.to_string());
+                node = matches[0].1;
+            }
             0 => {
-                output.push_str(&format!("  No commands matching \"{}\"\n", word));
-                return output;
+                resolved_words.push(word.to_string());
+                break;
             }
             _ => {
-                for (name, child) in &matches {
-                    if child.count > 0 {
-                        output.push_str(&format!("  {:<24} ({} uses)\n", name, child.count));
-                    } else {
-                        output.push_str(&format!("  {}\n", name));
-                    }
-                }
+                // Intermediate word is ambiguous — show its completions
+                let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
+                output.push_str(&format_columns(&names, 80));
                 return output;
             }
         }
     }
 
-    let last_word = words.last().unwrap_or(&"");
-    let matches = node.prefix_search(last_word);
+    // Determine the arg type at the current position
+    let (spec, cmd_words) = lookup_arg_spec(
+        &resolved_words.iter().map(String::from).collect::<Vec<_>>(),
+        &trie.arg_specs,
+    );
+    let fallback_mode = arg_mode(&resolved_cmd, &trie.arg_modes);
+    // Position of the word being completed (1-indexed)
+    let total_words = completed_words.len() + 1; // completed + the word being typed
+    let arg_position = total_words.saturating_sub(cmd_words).max(1) as u32;
+    let prev_word = completed_words.last().copied();
+    let current_mode = arg_type_for_word(arg_position, prev_word, spec, fallback_mode);
 
-    if matches.is_empty() {
-        output.push_str(&format!("  No commands matching \"{}\"\n", last_word));
+    // --- Flag completion mode ---
+    // When typing a flag prefix (starts with '-'), show known flags + their expected arg types.
+    if prefix.starts_with('-') {
+        return complete_flags(prefix, spec, node, output);
+    }
+
+    // --- Trie-based completion (subcommands) ---
+    let trie_matches = node.prefix_search(prefix);
+
+    if trie_matches.is_empty() {
+        // No trie matches — show type-aware completions based on arg spec
+        show_type_completions(&mut output, current_mode, prefix, spec, arg_position);
     } else {
-        for (name, child) in &matches {
-            if child.count > 0 {
-                output.push_str(&format!("  {:<24} ({} uses)\n", name, child.count));
-            } else {
-                output.push_str(&format!("  {}\n", name));
-            }
-            if !child.children.is_empty() {
-                let subs: Vec<&str> = child.children.keys().map(|s| s.as_str()).collect();
-                if subs.len() <= 8 {
-                    output.push_str(&format!("    -> {}\n", subs.join("  ")));
-                } else {
-                    let shown: Vec<&str> = subs.iter().take(8).copied().collect();
-                    output.push_str(&format!(
-                        "    -> {}  ... +{} more\n",
-                        shown.join("  "),
-                        subs.len() - 8
-                    ));
-                }
+        // Separate subcommands from flags (flags from history are trie children too)
+        let subcmds: Vec<(&str, &TrieNode)> = trie_matches
+            .iter()
+            .filter(|(n, _)| !n.starts_with('-'))
+            .copied()
+            .collect();
+        let flag_matches: Vec<(&str, &TrieNode)> = trie_matches
+            .iter()
+            .filter(|(n, _)| n.starts_with('-'))
+            .copied()
+            .collect();
+
+        if !subcmds.is_empty() {
+            let mut sorted = subcmds.clone();
+            sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
+            let names: Vec<&str> = sorted.iter().map(|(n, _)| *n).collect();
+            output.push_str(&format_columns(&names, 80));
+        }
+
+        if !flag_matches.is_empty() {
+            output.push_str(&format_flags_from_trie(&flag_matches, spec));
+        }
+
+        // Type hint when completing next (empty prefix) and type is known
+        if prefix.is_empty() && !matches!(current_mode, ArgMode::Normal | ArgMode::ExecsOnly) {
+            let type_hint = match current_mode {
+                ArgMode::DirsOnly => Some("<directory>"),
+                ArgMode::Paths => Some("<file>"),
+                ArgMode::Runtime(type_id) => Some(runtime_complete::type_hint(type_id)),
+                _ => None,
+            };
+            if let Some(hint) = type_hint {
+                output.push_str(&format!("  (also accepts: {})\n", hint));
             }
         }
     }
 
     output
+}
+
+/// Complete a flag prefix: show matching flags from spec and trie.
+/// If the prefix exactly matches a single flag that takes an argument, show what it expects.
+fn complete_flags(
+    prefix: &str,
+    spec: Option<&trie::ArgSpec>,
+    node: &TrieNode,
+    mut output: String,
+) -> String {
+    // Collect flags from ArgSpec (flags that take typed arguments)
+    let mut known_flags: Vec<(String, Option<u8>)> = Vec::new();
+    if let Some(spec) = spec {
+        for (flag, &arg_type) in &spec.flag_args {
+            if flag.starts_with(prefix) {
+                known_flags.push((flag.clone(), Some(arg_type)));
+            }
+        }
+    }
+
+    // Collect flags from trie children (flags learned from history — may be boolean)
+    let trie_flags: Vec<&str> = node
+        .prefix_search(prefix)
+        .into_iter()
+        .filter(|(n, _)| n.starts_with('-'))
+        .map(|(n, _)| n)
+        .collect();
+    for flag in &trie_flags {
+        if !known_flags.iter().any(|(f, _)| f == flag) {
+            known_flags.push((flag.to_string(), None));
+        }
+    }
+
+    known_flags.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if known_flags.is_empty() {
+        output.push_str(&format!("  No flags matching \"{}\"\n", prefix));
+        return output;
+    }
+
+    // If exactly one match and it IS the prefix: flag is complete — show what it expects
+    if known_flags.len() == 1 && known_flags[0].0 == prefix {
+        if let Some(arg_type) = known_flags[0].1 {
+            let hint = runtime_complete::type_hint(arg_type);
+            output.push_str(&format!("  {} expects: {}\n", prefix, hint));
+            let rt = runtime_complete::list_matches(arg_type, "");
+            let names: Vec<&str> = rt.iter().map(String::as_str).collect();
+            if !names.is_empty() {
+                output.push_str(&format_columns(&names, 80));
+            }
+        } else {
+            // Boolean flag, no argument
+            output.push_str(&format!("  {} (no argument)\n", prefix));
+        }
+        return output;
+    }
+
+    // Multiple matches or partial: show flag names with their expected arg type
+    let col_width = known_flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0) + 2;
+    for (flag, arg_type) in &known_flags {
+        if let Some(at) = arg_type {
+            let hint = runtime_complete::type_hint(*at);
+            output.push_str(&format!("  {:<width$}{}\n", flag, hint, width = col_width));
+        } else {
+            output.push_str(&format!("  {}\n", flag));
+        }
+    }
+    output
+}
+
+/// Format flags from trie (history-learned) with their spec-derived arg type hints.
+fn format_flags_from_trie(flags: &[(&str, &TrieNode)], spec: Option<&trie::ArgSpec>) -> String {
+    let col_width = flags.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 2;
+    let mut out = String::new();
+    for (name, _) in flags {
+        let hint = spec
+            .and_then(|s| s.type_after_flag(name))
+            .map(runtime_complete::type_hint);
+        if let Some(hint) = hint {
+            out.push_str(&format!("  {:<width$}{}\n", name, hint, width = col_width));
+        } else {
+            out.push_str(&format!("  {}\n", name));
+        }
+    }
+    out
+}
+
+/// Detect the current terminal width via ioctl(TIOCGWINSZ).
+/// Falls back to $COLUMNS, then 80.
+fn terminal_width() -> usize {
+    // Try ioctl on stderr (fd 2) — most likely to be a real tty even when
+    // stdout/stdin are redirected (e.g. in a pipeline).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::RawFd;
+
+        #[repr(C)]
+        struct Winsize {
+            ws_row: u16,
+            ws_col: u16,
+            _ws_xpixel: u16,
+            _ws_ypixel: u16,
+        }
+
+        // TIOCGWINSZ varies by platform
+        #[cfg(target_os = "macos")]
+        const TIOCGWINSZ: u64 = 0x4008_7468;
+        #[cfg(not(target_os = "macos"))]
+        const TIOCGWINSZ: u64 = 0x5413;
+
+        // Try stderr (2), then stdout (1), then stdin (0)
+        for fd in [2i32, 1, 0] as [RawFd; 3] {
+            let mut ws = Winsize {
+                ws_row: 0,
+                ws_col: 0,
+                _ws_xpixel: 0,
+                _ws_ypixel: 0,
+            };
+            let ret = unsafe { libc_ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize as *mut u8) };
+            if ret == 0 && ws.ws_col > 0 {
+                return ws.ws_col as usize;
+            }
+        }
+
+        // ioctl failed (not a tty) — try $COLUMNS
+        if let Some(w) = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+        {
+            return w.clamp(40, 500);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(w) = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+        {
+            return w.clamp(40, 500);
+        }
+    }
+    80
+}
+
+#[cfg(unix)]
+unsafe fn libc_ioctl(fd: i32, request: u64, arg: *mut u8) -> i32 {
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    unsafe { ioctl(fd, request, arg) }
+}
+
+/// Format a list of names into columns, capped at `max_items`.
+/// Uses terminal width from COLUMNS env (default 80). Short lists use a single column.
+fn format_columns(names: &[&str], max_items: usize) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+
+    let term_width = terminal_width();
+
+    let total = names.len();
+    let visible_count = total.min(max_items);
+    let shown = &names[..visible_count];
+
+    // Single-column for small lists (≤ 12 items)
+    if shown.len() <= 12 {
+        let mut out = String::new();
+        for name in shown {
+            out.push_str(&format!("  {}\n", name));
+        }
+        if total > max_items {
+            out.push_str(&format!("  ... and {} more\n", total - max_items));
+        }
+        return out;
+    }
+
+    // Multi-column for larger lists
+    let max_name_len = shown.iter().map(|s| s.len()).max().unwrap_or(0);
+    let col_width = max_name_len + 2; // 2-space gap between columns
+    // Account for the 2-space indent
+    let usable_width = term_width.saturating_sub(2);
+    let num_cols = (usable_width / col_width).clamp(1, 6);
+
+    let rows = shown.len().div_ceil(num_cols);
+    let mut out = String::new();
+
+    for row in 0..rows {
+        out.push_str("  ");
+        for col in 0..num_cols {
+            let idx = col * rows + row; // column-major (like `ls`)
+            if idx >= shown.len() {
+                break;
+            }
+            let is_last_in_row = col == num_cols - 1 || (col + 1) * rows + row >= shown.len();
+            if is_last_in_row {
+                out.push_str(shown[idx]);
+            } else {
+                out.push_str(&format!("{:<width$}", shown[idx], width = col_width));
+            }
+        }
+        out.push('\n');
+    }
+
+    if total > max_items {
+        out.push_str(&format!("  ... and {} more\n", total - max_items));
+    }
+
+    out
+}
+
+/// Show type-aware completions for a given arg mode and prefix.
+fn show_type_completions(
+    output: &mut String,
+    mode: ArgMode,
+    prefix: &str,
+    spec: Option<&trie::ArgSpec>,
+    arg_position: u32,
+) {
+    match mode {
+        ArgMode::DirsOnly => {
+            output.push_str("  Expects: <directory>\n");
+            output.push_str(&complete_filesystem(prefix, true));
+        }
+        ArgMode::Paths => {
+            output.push_str("  Expects: <file>\n");
+            output.push_str(&complete_filesystem(prefix, false));
+        }
+        ArgMode::Runtime(type_id) => {
+            let hint = runtime_complete::type_hint(type_id);
+            output.push_str(&format!("  Expects: {}\n", hint));
+            let rt = runtime_complete::list_matches(type_id, prefix);
+            let names: Vec<&str> = rt.iter().map(String::as_str).collect();
+            if names.is_empty() {
+                if !prefix.is_empty() {
+                    output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+                }
+            } else {
+                output.push_str(&format_columns(&names, 80));
+            }
+        }
+        _ => {
+            // Check spec for type hint even in Normal/ExecsOnly mode
+            if let Some(spec) = spec
+                && let Some(pos_type) = spec.type_at(arg_position)
+                && pos_type != 0
+            {
+                let hint = runtime_complete::type_hint(pos_type);
+                output.push_str(&format!("  Expects: {}\n", hint));
+                let rt = runtime_complete::list_matches(pos_type, prefix);
+                let names: Vec<&str> = rt.iter().map(String::as_str).collect();
+                if !names.is_empty() {
+                    output.push_str(&format_columns(&names, 80));
+                    return;
+                }
+            }
+            if prefix.is_empty() {
+                output.push_str("  <enter argument>\n");
+            } else {
+                output.push_str(&format!("  No commands matching \"{}\"\n", prefix));
+            }
+        }
+    }
 }
 
 /// Resolve just the first word of a command against the trie root.
@@ -826,7 +1180,11 @@ fn complete_filesystem(word: &str, dirs_only: bool) -> String {
         let dir = if let Some(rest) = dir_part.strip_prefix('~') {
             let home = dirs::home_dir().unwrap_or_default();
             let rest = rest.strip_prefix('/').unwrap_or(rest);
-            if rest.is_empty() { home } else { home.join(rest) }
+            if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            }
         } else if dir_part.is_empty() {
             std::path::PathBuf::from("/")
         } else {
@@ -983,12 +1341,10 @@ mod tests {
     fn test_pin_resolution() {
         let trie = build_test_trie();
         let pins = Pins {
-            entries: vec![
-                Pin {
-                    abbrev: vec!["g".into(), "ch".into()],
-                    expanded: vec!["git".into(), "checkout".into()],
-                },
-            ],
+            entries: vec![Pin {
+                abbrev: vec!["g".into(), "ch".into()],
+                expanded: vec!["git".into(), "checkout".into()],
+            }],
         };
 
         match resolve("g ch develop", &trie, &pins) {
@@ -1143,10 +1499,7 @@ mod tests {
                 // Position should be offset by first segment (2 words) + operator (1)
                 assert_eq!(info.position, 3);
                 // Resolved prefix should include the first segment + operator
-                assert_eq!(
-                    info.resolved_prefix,
-                    vec!["terraform", "apply", "|"]
-                );
+                assert_eq!(info.resolved_prefix, vec!["terraform", "apply", "|"]);
             }
             other => panic!("Expected Ambiguous, got {:?}", other),
         }

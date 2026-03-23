@@ -4,6 +4,7 @@ mod history;
 mod path_resolve;
 mod pins;
 mod resolve;
+mod runtime_complete;
 mod scanner;
 mod trie;
 
@@ -11,7 +12,10 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 #[derive(Parser)]
-#[command(name = "zsh-ios", about = "Cisco IOS-style command abbreviation for Zsh")]
+#[command(
+    name = "zsh-ios",
+    about = "Cisco IOS-style command abbreviation for Zsh"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -108,11 +112,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 4. Parse history
     let hist_path = std::env::var("HISTFILE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".zsh_history")
-        });
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".zsh_history"));
 
     match history::parse_history(&hist_path, &mut ct) {
         Ok(count) => eprintln!("Parsed {} commands from history", count),
@@ -125,13 +125,16 @@ fn cmd_build(aliases_stdin: bool) {
     eprintln!(
         "Detected arg specs for {} commands ({} with flag-level detail)",
         ct.arg_specs.len(),
-        ct.arg_specs.values().filter(|s| !s.flag_args.is_empty() || !s.positional.is_empty()).count()
+        ct.arg_specs
+            .values()
+            .filter(|s| !s.flag_args.is_empty() || !s.positional.is_empty())
+            .count()
     );
 
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
-        "build", "resolve", "complete", "learn", "pin", "unpin",
-        "pins", "toggle", "rebuild", "status",
+        "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
+        "status",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }
@@ -186,10 +189,7 @@ fn print_ambiguity_shell(info: &resolve::AmbiguityInfo) {
         "_zio_resolved_prefix={}",
         shell_quote(&info.resolved_prefix.join(" "))
     );
-    println!(
-        "_zio_remaining={}",
-        shell_quote(&info.remaining.join(" "))
-    );
+    println!("_zio_remaining={}", shell_quote(&info.remaining.join(" ")));
 
     // Candidates as a shell array
     let cands: Vec<String> = info.candidates.iter().map(|c| shell_quote(c)).collect();
@@ -376,11 +376,16 @@ fn cmd_status() {
         if let Ok(trie) = trie::CommandTrie::load(&tree_path) {
             println!("  Commands:    {} top-level", trie.root.len());
             if !trie.arg_specs.is_empty() {
-                let detailed = trie.arg_specs.values()
+                let detailed = trie
+                    .arg_specs
+                    .values()
                     .filter(|s| !s.flag_args.is_empty() || !s.positional.is_empty())
                     .count();
-                println!("  Arg specs:   {} commands ({} with per-position/flag detail)",
-                    trie.arg_specs.len(), detailed);
+                println!(
+                    "  Arg specs:   {} commands ({} with per-position/flag detail)",
+                    trie.arg_specs.len(),
+                    detailed
+                );
             }
         }
     } else {

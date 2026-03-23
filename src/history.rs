@@ -10,13 +10,15 @@ use crate::trie::CommandTrie;
 /// - Extended history: `: timestamp:duration;command`
 ///
 /// Multi-line commands (continuation with `\`) are joined.
-pub fn parse_history(path: &Path, trie: &mut CommandTrie) -> Result<u32, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)
-        .or_else(|_| {
-            // Try reading as bytes and lossy-converting (history can contain non-UTF8)
-            let bytes = fs::read(path)?;
-            Ok::<String, std::io::Error>(String::from_utf8_lossy(&bytes).into_owned())
-        })?;
+pub fn parse_history(
+    path: &Path,
+    trie: &mut CommandTrie,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path).or_else(|_| {
+        // Try reading as bytes and lossy-converting (history can contain non-UTF8)
+        let bytes = fs::read(path)?;
+        Ok::<String, std::io::Error>(String::from_utf8_lossy(&bytes).into_owned())
+    })?;
 
     let mut count = 0u32;
     let mut continuation = String::new();
@@ -161,7 +163,10 @@ mod tests {
 
     #[test]
     fn test_strip_history_prefix() {
-        assert_eq!(strip_history_prefix(": 1234567890:0;git status"), "git status");
+        assert_eq!(
+            strip_history_prefix(": 1234567890:0;git status"),
+            "git status"
+        );
         assert_eq!(strip_history_prefix("git status"), "git status");
         assert_eq!(strip_history_prefix("  ls -la  "), "ls -la");
     }
@@ -228,7 +233,13 @@ mod tests {
             trie.root.get_child("xyzzy").is_none(),
             "unknown command should not be learned from history"
         );
-        assert!(trie.root.get_child("git").unwrap().get_child("status").is_some());
+        assert!(
+            trie.root
+                .get_child("git")
+                .unwrap()
+                .get_child("status")
+                .is_some()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

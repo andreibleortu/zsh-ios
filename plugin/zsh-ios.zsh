@@ -235,24 +235,26 @@ _zsh_ios_handle_path_ambiguity() {
 }
 
 # --- ZLE Widget: ? key (show completions) ---
+# Cisco IOS behavior:
+#   "show ?" (space before ?) = what arguments/subcommands come after "show"
+#   "sh?"    (no space)       = what commands match the "sh" prefix
 _zsh_ios_help() {
     if _zsh_ios_is_disabled; then
         zle self-insert
         return
     fi
 
-    if (( CURSOR == 0 )) || [[ "${BUFFER[$CURSOR]}" == " " ]]; then
-        local prefix="${BUFFER[1,CURSOR]}"
-        prefix="${prefix%% }"
-        local output
-        output=$("$ZSH_IOS_BIN" complete -- "$prefix" 2>/dev/null)
-        if [[ -n "$output" ]]; then
-            zle -M "$output"
-        else
-            zle -M "  No commands found"
-        fi
+    local prefix="${BUFFER[1,CURSOR]}"
+    # If cursor is mid-word (not at start, not after space), we're completing
+    # that partial word — pass WITHOUT trailing space so engine prefix-searches.
+    # If cursor is after a space, pass WITH the space so engine shows next-arg.
+    # CURSOR==0 means empty buffer — show top-level commands.
+    local output
+    output=$("$ZSH_IOS_BIN" complete -- "$prefix" 2>/dev/null)
+    if [[ -n "$output" ]]; then
+        zle -M "$output"
     else
-        zle self-insert
+        zle -M "  No commands found"
     fi
 }
 

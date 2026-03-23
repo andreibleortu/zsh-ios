@@ -48,11 +48,7 @@ impl Pins {
             if pin_len > words.len() {
                 continue;
             }
-            let is_match = pin
-                .abbrev
-                .iter()
-                .zip(words.iter())
-                .all(|(a, w)| a == w);
+            let is_match = pin.abbrev.iter().zip(words.iter()).all(|(a, w)| a == w);
             if is_match && best.as_ref().is_none_or(|(len, _)| pin_len > *len) {
                 best = Some((pin_len, pin.expanded.clone()));
             }

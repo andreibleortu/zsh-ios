@@ -162,8 +162,7 @@ fn resolve_components(
                     let mut fork_parts = resolved_parts.clone();
                     fork_parts.push(winner.clone());
                     match resolve_components(&child_dir, remaining, fork_parts, dirs_only) {
-                        ComponentsResult::Resolved(parts)
-                        | ComponentsResult::Unchanged(parts) => {
+                        ComponentsResult::Resolved(parts) | ComponentsResult::Unchanged(parts) => {
                             all_paths.push(parts);
                         }
                         ComponentsResult::Ambiguous(mut nested) => {
@@ -280,7 +279,12 @@ where
 }
 
 /// Filter ambiguous candidates by which ones have children matching the next component.
-fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_only: bool) -> Vec<String> {
+fn deep_filter(
+    parent: &Path,
+    candidates: &[String],
+    remaining: &[String],
+    dirs_only: bool,
+) -> Vec<String> {
     if remaining.is_empty() {
         return candidates.to_vec();
     }
@@ -290,22 +294,21 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_
     }
 
     // Determine match predicate from the next component's mode.
-    let (needle, pred): (&str, fn(&str, &str) -> bool) =
-        if let Some(s) = next.strip_prefix('!') {
-            if !s.is_empty() {
-                (s, |e, n| e.ends_with(n))
-            } else {
-                (next.as_str(), |e, n| e.starts_with(n))
-            }
-        } else if let Some(s) = next.strip_prefix('*') {
-            if !s.is_empty() {
-                (s, |e, n| e.contains(n))
-            } else {
-                (next.as_str(), |e, n| e.starts_with(n))
-            }
+    let (needle, pred): (&str, fn(&str, &str) -> bool) = if let Some(s) = next.strip_prefix('!') {
+        if !s.is_empty() {
+            (s, |e, n| e.ends_with(n))
         } else {
             (next.as_str(), |e, n| e.starts_with(n))
-        };
+        }
+    } else if let Some(s) = next.strip_prefix('*') {
+        if !s.is_empty() {
+            (s, |e, n| e.contains(n))
+        } else {
+            (next.as_str(), |e, n| e.starts_with(n))
+        }
+    } else {
+        (next.as_str(), |e, n| e.starts_with(n))
+    };
 
     let lower_needle = needle.to_lowercase();
 
@@ -315,9 +318,7 @@ fn deep_filter(parent: &Path, candidates: &[String], remaining: &[String], dirs_
             let child_dir = parent.join(cand);
             let entries = list_dir(&child_dir, dirs_only);
             entries.iter().any(|e| {
-                e == next.as_str()
-                    || pred(e, needle)
-                    || pred(&e.to_lowercase(), &lower_needle)
+                e == next.as_str() || pred(e, needle) || pred(&e.to_lowercase(), &lower_needle)
             })
         })
         .cloned()

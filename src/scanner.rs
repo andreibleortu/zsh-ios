@@ -48,18 +48,92 @@ pub fn scan_path(trie: &mut CommandTrie) -> u32 {
 
 /// Known Zsh builtins to add to the trie.
 const ZSH_BUILTINS: &[&str] = &[
-    "alias", "autoload", "bg", "bindkey", "break", "builtin", "bye", "cd",
-    "chdir", "command", "compctl", "compadd", "compdef", "continue", "declare",
-    "dirs", "disable", "disown", "echo", "emulate", "enable", "eval", "exec",
-    "exit", "export", "false", "fc", "fg", "float", "functions", "getln",
-    "getopts", "hash", "history", "integer", "jobs", "kill", "let", "limit",
-    "local", "log", "logout", "noglob", "popd", "print", "printf", "pushd",
-    "pushln", "pwd", "read", "readonly", "rehash", "return", "sched", "set",
-    "setopt", "shift", "source", "suspend", "test", "times", "trap", "true",
-    "ttyctl", "type", "typeset", "ulimit", "umask", "unalias", "unfunction",
-    "unhash", "unlimit", "unset", "unsetopt", "vared", "wait", "whence",
-    "where", "which", "zcompile", "zformat", "zle", "zmodload", "zparseopts",
-    "zregexparse", "zstyle",
+    "alias",
+    "autoload",
+    "bg",
+    "bindkey",
+    "break",
+    "builtin",
+    "bye",
+    "cd",
+    "chdir",
+    "command",
+    "compctl",
+    "compadd",
+    "compdef",
+    "continue",
+    "declare",
+    "dirs",
+    "disable",
+    "disown",
+    "echo",
+    "emulate",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "float",
+    "functions",
+    "getln",
+    "getopts",
+    "hash",
+    "history",
+    "integer",
+    "jobs",
+    "kill",
+    "let",
+    "limit",
+    "local",
+    "log",
+    "logout",
+    "noglob",
+    "popd",
+    "print",
+    "printf",
+    "pushd",
+    "pushln",
+    "pwd",
+    "read",
+    "readonly",
+    "rehash",
+    "return",
+    "sched",
+    "set",
+    "setopt",
+    "shift",
+    "source",
+    "suspend",
+    "test",
+    "times",
+    "trap",
+    "true",
+    "ttyctl",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unfunction",
+    "unhash",
+    "unlimit",
+    "unset",
+    "unsetopt",
+    "vared",
+    "wait",
+    "whence",
+    "where",
+    "which",
+    "zcompile",
+    "zformat",
+    "zle",
+    "zmodload",
+    "zparseopts",
+    "zregexparse",
+    "zstyle",
 ];
 
 /// Add Zsh builtins to the trie.
@@ -130,18 +204,33 @@ mod tests {
         assert!(trie.root.get_child("tfa").is_some());
 
         // Alias values are learned as command sequences
-        let terraform = trie.root.get_child("terraform").expect("terraform should be learned from tfa alias");
+        let terraform = trie
+            .root
+            .get_child("terraform")
+            .expect("terraform should be learned from tfa alias");
         assert!(terraform.get_child("apply").is_some());
 
         // Semicolon-separated commands in alias values are split properly
-        let sudo = trie.root.get_child("sudo").expect("sudo should be learned from dns alias");
-        assert!(sudo.get_child("dscacheutil").is_some(), "first segment: sudo dscacheutil");
-        assert!(sudo.get_child("killall").is_some(), "second segment: sudo killall");
+        let sudo = trie
+            .root
+            .get_child("sudo")
+            .expect("sudo should be learned from dns alias");
+        assert!(
+            sudo.get_child("dscacheutil").is_some(),
+            "first segment: sudo dscacheutil"
+        );
+        assert!(
+            sudo.get_child("killall").is_some(),
+            "second segment: sudo killall"
+        );
 
         // dscacheutil's subcommand should NOT have a trailing semicolon
         let dscacheutil = sudo.get_child("dscacheutil").unwrap();
         assert!(dscacheutil.get_child("-flushcache").is_some());
-        assert!(dscacheutil.get_child("-flushcache;").is_none(), "semicolon should not be part of the flag");
+        assert!(
+            dscacheutil.get_child("-flushcache;").is_none(),
+            "semicolon should not be part of the flag"
+        );
     }
 
     #[test]

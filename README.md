@@ -56,7 +56,7 @@ The command trie is built from:
 2. **Zsh builtins** -- `cd`, `echo`, `source`, etc.
 3. **Aliases** -- both the alias name and the commands inside the alias value (e.g., `tfa='terraform apply'` teaches `terraform -> apply`)
 4. **Shell history** -- commands from `~/.zsh_history` that correspond to known executables (typos and gone scripts are filtered out)
-5. **Zsh completions** -- subcommand patterns from completion files (e.g., `_git-checkout` -> `git checkout`)
+5. **Zsh completions** -- subcommand patterns and per-position argument specs from completion files. Parses `_arguments` specs, `->state` resolution, `_alternative` blocks, and `_regex_arguments`. Recognizes completion action functions (`__git_branch_names`, `_users`, `_hosts`, `_signals`, etc.) to determine what type of argument each position expects.
 
 ## Installation
 
@@ -99,7 +99,23 @@ alias | zsh-ios build --aliases-stdin
 |-----|--------|
 | **Enter** | Resolve abbreviations and execute. If ambiguous, show interactive picker. |
 | **Tab** | Expand to longest common prefix. If already expanded, fall through to native Zsh completion. |
-| **?** | After a space, show all matching commands for the current prefix. |
+| **?** | IOS-style help. Show completions for the current position — subcommands, flags with expected argument type, or live argument values (branches, hosts, signals, users, tracked files, ...). |
+
+The `?` key is position and context-aware:
+
+```
+git ?              →  all git subcommands (multi-column, auto-sized to terminal width)
+git checkout ?     →  Expects: <branch>  /  main  feature-x  ...
+git checkout -?    →  -b <branch>   -B <branch>   --orphan <branch>  ...
+git checkout -b?   →  -b expects: <branch>  /  main  feature-x  ...
+git add ?          →  Expects: <tracked-file>  /  src/main.rs  Cargo.toml  ...
+git push ?         →  Expects: <remote>  /  origin
+kill -s ?          →  Expects: <signal>  /  HUP  INT  KILL  TERM  ...
+kill -?            →  -s <signal>
+chown ?            →  Expects: <user>  /  andrei  root  daemon  ...
+ping ?             →  Expects: <host>  /  (from /etc/hosts + ~/.ssh/known_hosts)
+ssh -?             →  -l <user>   -i <file>   -R   -o   ...
+```
 
 ### Commands
 
@@ -134,14 +150,28 @@ Given input `ter ap --auto-approve`:
 4. **Path resolution** -- arguments are checked against the real filesystem; if a matching file or directory exists, the abbreviation is expanded
 5. **Result**: `terraform apply --auto-approve`
 
-The engine is context-aware about what kind of arguments a command takes:
+The engine is context-aware about what kind of arguments each command and subcommand takes. Arg specs are extracted from Zsh completion files for 1400+ commands, supplemented by hardcoded overrides for commands with complex dynamic completions:
 
-| Mode | Commands | Behavior |
-|------|----------|----------|
-| **Dirs only** | `cd`, `pushd` | All arguments resolve against directories only |
-| **Paths** | `ls`, `rm`, `cat`, `vim`, `cp`, `mv`, ... | All arguments resolve against filesystem entries |
-| **Execs only** | `which`, `type`, `man`, `command`, ... | Arguments resolve against the command trie only, no filesystem |
-| **Normal** | everything else | Trie first; only path-like arguments (`./foo`, `~/bar`, `src/`) resolve against the filesystem. Bare words are not filesystem-expanded. |
+| Argument type | Examples | Resolved from |
+|---------------|----------|---------------|
+| **Directory** | `cd`, `pushd`, `mkdir` | Filesystem (dirs only) |
+| **File path** | `ls`, `rm`, `cat`, `vim`, `cp`, `mv` | Filesystem |
+| **Executable** | `which`, `type`, `man`, `sudo -u` | Command trie |
+| **Branch** | `git checkout`, `git merge`, `git rebase` | `git for-each-ref refs/heads` |
+| **Tag** | `git tag`, `git push <remote> <tag>` | `git for-each-ref refs/tags` |
+| **Remote** | `git push`, `git pull`, `git fetch` | `git remote` |
+| **Tracked file** | `git add`, `git rm`, `git restore` | `git ls-files` |
+| **Host** | `ssh`, `ping`, `dig`, `traceroute` | `/etc/hosts` + `~/.ssh/known_hosts` |
+| **User** | `chown`, `su`, `sudo -u` | `/etc/passwd` (or `dscl` on macOS) |
+| **Group** | `chgrp` | `/etc/group` |
+| **Signal** | `kill -s` | Hardcoded POSIX signal names |
+| **PID** | `kill` | Numeric (not resolved) |
+| **Network interface** | `ifconfig`, `ping -I` | `ifconfig -l` (or `/sys/class/net`) |
+| **Port** | port-related flags | `/etc/services` |
+| **Locale** | locale flags | `locale -a` |
+| **Normal** | everything else | Trie first; path-like args (`./foo`, `~/bar`) resolve against filesystem |
+
+Arg type detection is per-position and per-flag: `git push <remote> <branch>` knows position 1 is a remote and position 2 is a branch. `ssh -l <user>` knows `-l` expects a username.
 
 ### Suffix matching
 
@@ -220,19 +250,21 @@ Removes the binary, offers to delete config directories (with confirmation), and
 
 ```
 src/
-  main.rs          CLI entry point (clap subcommands)
-  trie.rs          Prefix trie with MessagePack serialization
-  resolve.rs       Core abbreviation resolution engine
-  path_resolve.rs  Filesystem path abbreviation with deep disambiguation
-  history.rs       Zsh history parser
-  scanner.rs       PATH scanner, builtins, alias parser
-  completions.rs   Zsh completion file parser
-  pins.rs          Pin storage (load/save/match)
-  config.rs        Config directory paths
+  main.rs               CLI entry point (clap subcommands)
+  trie.rs               Prefix trie with MessagePack serialization; 16 arg type constants
+  resolve.rs            Core abbreviation resolution engine; ? key completion
+  path_resolve.rs       Filesystem path abbreviation with deep disambiguation
+  runtime_complete.rs   Runtime resolvers: git branches/tags/remotes/files, users,
+                        groups, hosts, signals, ports, network interfaces, locales
+  history.rs            Zsh history parser
+  scanner.rs            PATH scanner, builtins, alias parser
+  completions.rs        Zsh completion file parser (→state, _alternative, _regex_arguments)
+  pins.rs               Pin storage (load/save/match)
+  config.rs             Config directory paths
 plugin/
-  zsh-ios.zsh      Zsh plugin (ZLE widgets, key bindings, preexec/precmd hooks)
-install.sh         Installer
-uninstall.sh       Uninstaller
+  zsh-ios.zsh           Zsh plugin (ZLE widgets, key bindings, preexec/precmd hooks)
+install.sh              Installer
+uninstall.sh            Uninstaller
 ```
 
 ## License
