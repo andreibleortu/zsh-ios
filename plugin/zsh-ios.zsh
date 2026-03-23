@@ -46,6 +46,7 @@ _zsh_ios_precmd() {
         ("$ZSH_IOS_BIN" learn -- "$_zsh_ios_pending_cmd" &>/dev/null &)
     fi
     unset _zsh_ios_pending_cmd
+    unset _zsh_ios_last_pin
 }
 
 autoload -Uz add-zsh-hook
@@ -61,6 +62,16 @@ _zsh_ios_is_disabled() {
 _zsh_ios_accept_line() {
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
         zle accept-line
+        return
+    fi
+
+    if [[ "${BUFFER// /}" == "unpin" && -n "$_zsh_ios_last_pin" ]]; then
+        zle -I
+        "$ZSH_IOS_BIN" unpin "$_zsh_ios_last_pin" 2>/dev/null
+        echo "  Unpinned: \"$_zsh_ios_last_pin\""
+        unset _zsh_ios_last_pin
+        BUFFER=""
+        zle reset-prompt
         return
     fi
 
@@ -359,16 +370,7 @@ _zsh_ios_handle_ambiguity() {
     local display_path="${_zio_pins_path/#$HOME/~}"
     echo "  Saved: \"$abbrev_str\" → \"$pin_expanded\""
     echo "  In $display_path"
-    echo -n "  (U to undo) "
-    local undo_key
-    read -r -k 1 -t 4 undo_key </dev/tty
-    echo ""
-    if [[ "$undo_key" == "u" || "$undo_key" == "U" ]]; then
-        "$ZSH_IOS_BIN" unpin "$abbrev_str" 2>/dev/null
-        echo "  Unpinned: \"$abbrev_str\""
-        zle reset-prompt
-        return
-    fi
+    _zsh_ios_last_pin="$abbrev_str"
 
     # Build the full command to execute
     local full_cmd="$selected_display"
