@@ -4,68 +4,6 @@
 #
 # Format: parent_command -> subcommand -> description
 
-git:
-  add: "Add file contents to the index"
-  bisect: "Find the change that introduced a bug"
-  blame: "Show what revision and author last modified each line"
-  branch: "List, create, or delete branches"
-  checkout: "Switch branches or restore working tree files"
-  cherry-pick: "Apply the changes introduced by some existing commits"
-  clean: "Remove untracked files from the working tree"
-  clone: "Clone a repository into a new directory"
-  commit: "Record changes to the repository"
-  config: "Get and set repository or global options"
-  diff: "Show changes between commits, commit and working tree, etc"
-  fetch: "Download objects and refs from another repository"
-  init: "Create an empty Git repository"
-  log: "Show commit logs"
-  merge: "Join two or more development histories together"
-  mv: "Move or rename a file, a directory, or a symlink"
-  pull: "Fetch from and integrate with another repository"
-  push: "Update remote refs along with associated objects"
-  rebase: "Reapply commits on top of another base tip"
-  reflog: "Manage reflog information"
-  remote: "Manage set of tracked repositories"
-  reset: "Reset current HEAD to the specified state"
-  restore: "Restore working tree files"
-  revert: "Revert some existing commits"
-  rm: "Remove files from the working tree and from the index"
-  show: "Show various types of objects"
-  stash: "Stash the changes in a dirty working directory away"
-  status: "Show the working tree status"
-  switch: "Switch branches"
-  tag: "Create, list, delete or verify a tag object"
-  worktree: "Manage multiple working trees"
-
-"git stash":
-  apply: "Apply a stash to the working directory"
-  branch: "Create and check out a new branch from a stash"
-  clear: "Remove all the stash entries"
-  drop: "Remove a single stash entry"
-  list: "List the stash entries"
-  pop: "Apply a stash and remove it from the stash list"
-  push: "Save your local modifications to a new stash entry"
-  show: "Show the changes recorded in the stash entry"
-
-"git remote":
-  add: "Add a remote named <name> for the repository at <url>"
-  get-url: "Retrieve the URLs for a remote"
-  prune: "Delete stale references associated with <name>"
-  remove: "Remove the remote named <name>"
-  rename: "Rename the remote named <old> to <new>"
-  set-url: "Change URLs for the remote"
-  show: "Give some information about the remote <name>"
-
-"git worktree":
-  add: "Create a worktree at <path> and checkout <commit-ish> into it"
-  list: "List details of each worktree"
-  lock: "Prevent a worktree from being pruned"
-  move: "Move a worktree to a new location"
-  prune: "Prune worktree information"
-  remove: "Remove a worktree"
-  repair: "Repair worktree administrative files"
-  unlock: "Allow a locked worktree to be pruned"
-
 "docker compose":
   build: "Build or rebuild services"
   config: "Parse, resolve and render compose file"

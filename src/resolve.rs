@@ -2013,15 +2013,6 @@ mod tests {
     }
 
     #[test]
-    fn test_descriptions_git() {
-        let descs = load_yaml_descriptions();
-        let git = descs.get("git").expect("git should have descriptions");
-        assert!(!git.is_empty());
-        assert_eq!(git.get("checkout").map(String::as_str), Some("Switch branches or restore working tree files"));
-        assert_eq!(git.get("commit").map(String::as_str), Some("Record changes to the repository"));
-    }
-
-    #[test]
     fn test_descriptions_unknown() {
         let descs = load_yaml_descriptions();
         assert!(descs.get("unknowncommand").is_none());
