@@ -36,6 +36,7 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 - **Path abbreviation** -- `cd Des/Fo` -> `cd Desktop/Folder`, with deep disambiguation across path components
 - **Suffix matching** -- `!` prefix matches by suffix: `cd te/!5` -> `cd tests/test-5` (matches entries ending with `5`)
 - **Contains matching** -- `*` prefix matches by substring: `cd *prod` -> `cd app-config-prod` (matches entries containing `prod`)
+- **Shell glob passthrough** -- `**` passes a literal `*` to the shell: `chmod +x **.py` -> `chmod +x *.py` (shell expands the glob)
 - **Pipe/chain resolution** -- commands joined by `|`, `&&`, `||`, `;` are each resolved independently
 - **Context-aware argument resolution** -- commands like `cd` and `ls` resolve arguments against the filesystem (not the trie); commands like `which` and `man` resolve against executables only
 - **Deep disambiguation** -- subsequent words narrow ambiguous prefixes automatically
@@ -193,6 +194,18 @@ Prefix `*` on a path component to match by **substring**:
 $ cd *prod        →  cd app-config-prod    (contains "prod")
 $ ls *config      →  ls app-config.yaml    (contains "config")
 ```
+
+### Shell glob passthrough
+
+Prefix `**` to pass a literal `*` through to the shell for glob expansion:
+
+```
+$ chmod +x **.py        →  chmod +x *.py         (shell expands to all .py files)
+$ chmod +x ./src/**.rs  →  chmod +x ./src/*.rs
+$ rm **.log             →  rm *.log
+```
+
+Without `**`, a bare `*` would be interpreted as contains-matching mode. Use `**` whenever you want the shell to expand the glob rather than zsh-ios resolving the path.
 
 ### Escaping `!` and `*`
 

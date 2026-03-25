@@ -52,7 +52,8 @@ cargo llvm-cov --no-cfg-coverage --summary-only   # Coverage report (needs gcc a
 - **Filesystem-based path detection**: Arguments are checked against the real filesystem rather than syntactic heuristics. If a file/dir matching the prefix exists, it's treated as a path.
 - **Suffix matching**: `!` prefix on path components matches by suffix (`!5` matches `test-5`). Handled in `resolve_component` in `path_resolve.rs`.
 - **Contains matching**: `*` prefix on path components matches by substring (`*prod` matches `app-config-prod`). Same location.
-- **Backslash escaping**: `\!` and `\*` treat `!`/`*` as literal prefix characters, not mode switches.
+- **Backslash escaping**: `\!` and `\*` treat `!`/`*` as literal prefix characters (for files actually named with those characters), not mode switches.
+- **Double-star glob passthrough**: `**` prefix passes a literal `*` to the shell (`**.py` → `*.py`). Use this when you want the shell to glob-expand the argument rather than having the resolver interpret `*` as contains-matching.
 - **Pipe/chain/background resolution**: `resolve_line()` in `resolve.rs` splits on `|`, `&&`, `||`, `;`, and `&` (background operator, respecting quotes) and resolves each segment independently.
 - **Deep disambiguation**: When prefix matching is ambiguous, the engine looks ahead at subsequent words to narrow candidates without prompting the user
 - **Exact match priority**: If a word exactly matches a trie entry it always wins immediately, no prefix search needed. Ghost prevention is handled at learning time (prefix guard + unknown command check) so abbreviations never enter the trie.

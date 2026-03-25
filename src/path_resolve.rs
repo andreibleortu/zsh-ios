@@ -232,6 +232,11 @@ fn resolve_component(dir: &Path, pattern: &str, dirs_only: bool) -> ComponentMat
         return prefix_match(&literal, &entries);
     }
 
+    // Double-star passthrough: **rest → *rest (literal shell glob, no resolution)
+    if let Some(rest) = pattern.strip_prefix("**") {
+        return ComponentMatch::Exact(format!("*{rest}"));
+    }
+
     // Suffix match: !suffix
     if let Some(suffix) = pattern.strip_prefix('!')
         && !suffix.is_empty()
@@ -294,6 +299,11 @@ fn deep_filter(
     }
     let next = &remaining[0];
     if next.is_empty() {
+        return candidates.to_vec();
+    }
+
+    // Double-star passthrough: can't filter by a shell glob, let all candidates through.
+    if next.starts_with("**") {
         return candidates.to_vec();
     }
 
@@ -462,6 +472,30 @@ mod tests {
         match result {
             ComponentMatch::None => {}
             other => panic!("Expected None for *zzz, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_double_star_passthrough() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-doublestar");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::write(dir.join("a.py"), "");
+        let _ = fs::write(dir.join("b.py"), "");
+
+        // **.py → *.py (literal glob, not a contains-match attempt)
+        let result = resolve_component(&dir, "**.py", false);
+        match result {
+            ComponentMatch::Exact(name) => assert_eq!(name, "*.py"),
+            other => panic!("Expected Exact passthrough for **.py, got {:?}", other),
+        }
+
+        // bare ** → *
+        let result = resolve_component(&dir, "**", false);
+        match result {
+            ComponentMatch::Exact(name) => assert_eq!(name, "*"),
+            other => panic!("Expected Exact passthrough for **, got {:?}", other),
         }
 
         let _ = fs::remove_dir_all(&dir);
