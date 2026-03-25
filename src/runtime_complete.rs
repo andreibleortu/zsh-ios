@@ -204,6 +204,36 @@ fn load_locales() -> Vec<String> {
     locales
 }
 
+// --- PIDs (never cached, always live) ---
+
+fn load_pids() -> Vec<(String, String)> {
+    // Returns (pid, command_name) pairs for the current user's processes
+    let mut pids = Vec::new();
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-u", &whoami(), "-o", "pid=,comm="])
+        .output()
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim();
+            if let Some((pid, cmd)) = trimmed.split_once(char::is_whitespace) {
+                let pid = pid.trim();
+                let cmd = cmd.trim();
+                if !pid.is_empty() && !cmd.is_empty() {
+                    pids.push((pid.to_string(), cmd.to_string()));
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| String::from("root"))
+}
+
 // --- Git queries (CWD-dependent, never cached) ---
 
 fn git_query(args: &[&str]) -> Vec<String> {
@@ -248,6 +278,24 @@ pub fn git_tracked_files() -> Vec<String> {
 /// Resolve a prefix against the completions for a given arg type.
 /// Returns the unique match if exactly one, or None if zero or ambiguous.
 pub fn resolve_prefix(arg_type: u8, prefix: &str) -> Option<String> {
+    use crate::trie;
+    // PIDs are special: list_matches returns "pid  cmd" for display,
+    // but resolution should yield just the PID number.
+    if arg_type == trie::ARG_MODE_PIDS {
+        let pids = load_pids();
+        let matches: Vec<&(String, String)> = pids
+            .iter()
+            .filter(|(pid, cmd)| {
+                pid.starts_with(prefix) || cmd.starts_with(prefix)
+                    || cmd.to_lowercase().starts_with(&prefix.to_lowercase())
+            })
+            .collect();
+        return if matches.len() == 1 {
+            Some(matches[0].0.clone())
+        } else {
+            None
+        };
+    }
     let matches = list_matches(arg_type, prefix);
     if matches.len() == 1 {
         Some(matches[0].clone())
@@ -320,6 +368,16 @@ pub fn list_matches(arg_type: u8, prefix: &str) -> Vec<String> {
             .into_iter()
             .filter(|f| f.starts_with(prefix) || f.to_lowercase().starts_with(&prefix_lower))
             .collect(),
+        trie::ARG_MODE_PIDS => {
+            let pids = load_pids();
+            pids.into_iter()
+                .filter(|(pid, cmd)| {
+                    pid.starts_with(prefix) || cmd.starts_with(prefix)
+                        || cmd.to_lowercase().starts_with(&prefix_lower)
+                })
+                .map(|(pid, cmd)| format!("{}  {}", pid, cmd))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }

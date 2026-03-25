@@ -267,7 +267,19 @@ _zsh_ios_help() {
         return
     fi
 
+    # If cursor is inside a quoted string, insert a literal '?'
     local prefix="${BUFFER[1,CURSOR]}"
+    local sq_count=${#prefix//[^\']/}
+    local dq_count=${#prefix//[^\"]/}
+    if (( sq_count % 2 != 0 || dq_count % 2 != 0 )); then
+        zle self-insert
+        return
+    fi
+    # Also pass through if the previous char is a backslash (literal \?)
+    if (( CURSOR > 0 )) && [[ "${BUFFER[CURSOR,CURSOR]}" == "\\" ]]; then
+        zle self-insert
+        return
+    fi
     # If cursor is mid-word (not at start, not after space), we're completing
     # that partial word — pass WITHOUT trailing space so engine prefix-searches.
     # If cursor is after a space, pass WITH the space so engine shows next-arg.

@@ -70,10 +70,14 @@ impl TrieNode {
 
     /// Check whether `name` is a strict prefix of any existing child.
     /// Used to prevent learning abbreviated junk like "terr" when "terraform" exists.
+    /// Uses BTreeMap range for O(log n) instead of O(n) full scan.
     pub fn is_prefix_of_existing(&self, name: &str) -> bool {
+        // Range from `name` onward; the first entry >= name is either `name` itself
+        // or something that starts with `name` (a longer command).
         self.children
-            .keys()
-            .any(|k| k != name && k.starts_with(name))
+            .range(name.to_string()..)
+            .take_while(|(k, _)| k.starts_with(name))
+            .any(|(k, _)| k.as_str() != name)
     }
 }
 
@@ -143,6 +147,10 @@ pub type ArgSpecMap = HashMap<String, ArgSpec>;
 /// Legacy flat map kept for backward compat during deserialization.
 pub type ArgModeMap = HashMap<String, u8>;
 
+/// Maps parent command (e.g., "git", "docker compose") to
+/// subcommand -> description pairs for IOS-style `?` help.
+pub type DescriptionMap = HashMap<String, HashMap<String, String>>;
+
 /// The full command trie with serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandTrie {
@@ -153,6 +161,10 @@ pub struct CommandTrie {
     /// Legacy flat arg modes (kept for backward compat with old tree files).
     #[serde(default)]
     pub arg_modes: ArgModeMap,
+    /// Subcommand descriptions for IOS-style `?` help.
+    /// Key = parent command (e.g. "git"), value = subcommand -> description.
+    #[serde(default)]
+    pub descriptions: DescriptionMap,
 }
 
 impl CommandTrie {

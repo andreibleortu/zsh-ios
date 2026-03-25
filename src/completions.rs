@@ -37,7 +37,321 @@ pub fn scan_completions(trie: &mut CommandTrie) -> u32 {
     // too dynamic to parse statically (runtime conditionals, _alternative, etc.)
     apply_well_known_specs(&mut trie.arg_specs);
 
+    // Seed well-known deep subcommand hierarchies (docker compose, git subcommands, etc.)
+    // These are commands where the Zsh completion files might not have _cmd-subcmd patterns.
+    total += seed_well_known_subcommands(trie);
+
+    // Load subcommand descriptions: YAML fallbacks first, then parsed overrides
+    load_descriptions(trie, &fpath_dirs);
+
     total
+}
+
+/// Load subcommand descriptions into the trie.
+/// 1. Load fallback descriptions from the bundled YAML file.
+/// 2. Parse `command:'description'` pairs from Zsh completion files.
+/// 3. Parsed descriptions override YAML fallbacks.
+fn load_descriptions(trie: &mut CommandTrie, fpath_dirs: &[String]) {
+    // Step 1: Load YAML fallback descriptions (bundled at compile time)
+    let yaml_str = include_str!("../data/descriptions.yaml");
+    let yaml_map: HashMap<String, HashMap<String, String>> =
+        serde_yaml::from_str(yaml_str).unwrap_or_default();
+
+    // Insert YAML descriptions as the base layer
+    for (parent, subs) in yaml_map {
+        let entry = trie.descriptions.entry(parent).or_default();
+        for (sub, desc) in subs {
+            entry.entry(sub).or_insert(desc);
+        }
+    }
+
+    // Step 2: Parse descriptions from Zsh completion files (override YAML)
+    let parsed = extract_descriptions_from_dirs(fpath_dirs);
+    for (parent, subs) in parsed {
+        let entry = trie.descriptions.entry(parent).or_default();
+        for (sub, desc) in subs {
+            // Parsed descriptions always win over YAML fallbacks
+            entry.insert(sub, desc);
+        }
+    }
+}
+
+/// Extract `command:'description'` pairs from Zsh completion files.
+///
+/// Looks for patterns like:
+///   `add:'add file contents to index'`
+/// inside array assignments (e.g. `main_porcelain_commands=(...)`)
+/// and `_describe` / `_arguments` subcommand lists.
+fn extract_descriptions_from_dirs(dirs: &[String]) -> HashMap<String, HashMap<String, String>> {
+    let mut all_descs: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let filename = entry.file_name().to_string_lossy().to_string();
+            // Only process completion files (start with _)
+            if !filename.starts_with('_') || filename.starts_with("_.") {
+                continue;
+            }
+
+            let cmd_name = &filename[1..]; // strip leading _
+            if cmd_name.is_empty() {
+                continue;
+            }
+
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let descs = extract_descriptions_from_content(&content, cmd_name);
+            for (parent, subs) in descs {
+                let entry = all_descs.entry(parent).or_default();
+                for (sub, desc) in subs {
+                    entry.insert(sub, desc);
+                }
+            }
+        }
+    }
+
+    all_descs
+}
+
+/// Parse subcommand descriptions from the content of a single Zsh completion file.
+///
+/// Recognizes the `command:'description'` pattern used in Zsh arrays like:
+/// ```
+/// commands=(
+///   add:'add file contents to index'
+///   commit:'record changes to repository'
+/// )
+/// ```
+fn extract_descriptions_from_content(
+    content: &str,
+    cmd_name: &str,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut in_array = false;
+    let mut current_parent = cmd_name.to_string();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Detect array assignment start: `varname=(`
+        if trimmed.contains("=(") && !trimmed.starts_with('#') {
+            in_array = true;
+            // Try to determine parent from variable name
+            // e.g., `main_porcelain_commands=(` → parent is the file's command
+            // For subcommand arrays like in _git-stash, derive parent
+            if cmd_name.contains('-') {
+                // e.g., _git-stash → parent = "git stash"
+                current_parent = cmd_name.replacen('-', " ", 1);
+            } else {
+                current_parent = cmd_name.to_string();
+            }
+
+            // Check if there are entries on the same line as =(
+            let after_paren = trimmed.split_once("=(").map(|(_, r)| r).unwrap_or("");
+            extract_desc_entries(after_paren, &current_parent, &mut result);
+            continue;
+        }
+
+        // Detect array end
+        if in_array && trimmed.contains(')') {
+            // There might be entries before the closing paren on this line
+            let before_paren = trimmed.split(')').next().unwrap_or("");
+            extract_desc_entries(before_paren, &current_parent, &mut result);
+            in_array = false;
+            continue;
+        }
+
+        // Inside an array: look for command:'description' entries
+        if in_array {
+            extract_desc_entries(trimmed, &current_parent, &mut result);
+        }
+    }
+
+    result
+}
+
+/// Extract `command:'description'` entries from a line of text.
+fn extract_desc_entries(
+    line: &str,
+    parent: &str,
+    result: &mut HashMap<String, HashMap<String, String>>,
+) {
+    // Match patterns like: word:'description text'
+    // The command part is a bare word (alphanumeric + hyphens),
+    // followed by :'...' (single-quoted description)
+    let mut i = 0;
+    let bytes = line.as_bytes();
+
+    while i < bytes.len() {
+        // Skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Try to find a word followed by :'
+        let word_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+
+        let word_end = i;
+        if word_end == word_start {
+            i += 1;
+            continue;
+        }
+
+        // Check for :' immediately after the word
+        if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b'\'' {
+            let cmd = &line[word_start..word_end];
+            i += 2; // skip :'
+
+            // Read until closing quote
+            let desc_start = i;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            let desc = &line[desc_start..i];
+            if i < bytes.len() {
+                i += 1; // skip closing '
+            }
+
+            if !cmd.is_empty() && !desc.is_empty() {
+                result
+                    .entry(parent.to_string())
+                    .or_default()
+                    .insert(cmd.to_string(), desc.to_string());
+            }
+        }
+    }
+}
+
+/// Seed the trie with well-known deep subcommand hierarchies that Zsh completion
+/// files may not expose via the standard `_cmd-subcmd` pattern.
+fn seed_well_known_subcommands(trie: &mut CommandTrie) -> u32 {
+    let hierarchies: &[(&[&str], &[&str])] = &[
+        // git deep subcommands
+        (&["git", "stash"], &[
+            "push", "pop", "list", "show", "apply", "drop", "clear", "branch",
+        ]),
+        (&["git", "remote"], &[
+            "add", "remove", "rename", "get-url", "set-url", "show", "prune",
+        ]),
+        (&["git", "worktree"], &[
+            "add", "list", "lock", "move", "prune", "remove", "repair", "unlock",
+        ]),
+        // docker compose subcommands
+        (&["docker", "compose"], &[
+            "build", "config", "create", "down", "events", "exec", "images",
+            "kill", "logs", "ls", "pause", "port", "ps", "pull", "push",
+            "restart", "rm", "run", "start", "stop", "top", "unpause", "up",
+            "version", "watch",
+        ]),
+        // kubectl resource types (commonly used with get/describe/delete)
+        (&["kubectl", "get"], &[
+            "pods", "services", "deployments", "nodes", "namespaces",
+            "configmaps", "secrets", "ingress", "jobs", "cronjobs",
+            "statefulsets", "daemonsets", "replicasets", "pv", "pvc",
+            "events", "endpoints", "serviceaccounts", "roles",
+            "rolebindings", "clusterroles", "clusterrolebindings",
+        ]),
+        (&["kubectl", "describe"], &[
+            "pods", "services", "deployments", "nodes", "namespaces",
+            "configmaps", "secrets", "ingress",
+        ]),
+        // systemctl subcommands
+        (&["systemctl"], &[
+            "start", "stop", "restart", "reload", "status", "enable", "disable",
+            "mask", "unmask", "daemon-reload", "is-active", "is-enabled", "is-failed",
+            "list-units", "list-unit-files", "show", "cat", "edit", "kill",
+        ]),
+        // tmux common subcommands
+        (&["tmux"], &[
+            "new-session", "attach-session", "list-sessions", "kill-session",
+            "new-window", "list-windows", "kill-window", "select-window",
+            "split-window", "select-pane", "kill-pane", "resize-pane",
+            "send-keys", "source-file", "set-option", "show-options",
+            "list-keys", "list-clients", "switch-client", "rename-session",
+            "rename-window", "detach-client", "display-message",
+        ]),
+        // helm subcommands
+        (&["helm"], &[
+            "completion", "create", "dependency", "env", "get", "history",
+            "install", "lint", "list", "package", "plugin", "pull", "push",
+            "registry", "repo", "rollback", "search", "show", "status",
+            "template", "test", "uninstall", "upgrade", "verify", "version",
+        ]),
+        // ip subcommands
+        (&["ip"], &[
+            "addr", "addrlabel", "link", "maddr", "monitor", "neighbour",
+            "netns", "route", "rule", "tunnel",
+        ]),
+        // journalctl is single-level (flags), no deep hierarchy needed
+        // podman subcommands (parallel to docker)
+        (&["podman"], &[
+            "build", "compose", "container", "cp", "create", "exec",
+            "image", "images", "inspect", "kill", "logs", "network",
+            "pod", "ps", "pull", "push", "rm", "rmi", "run", "start",
+            "stop", "volume",
+        ]),
+        // rustup subcommands
+        (&["rustup"], &[
+            "component", "default", "doc", "man", "override", "run",
+            "self", "set", "show", "target", "toolchain", "update", "which",
+        ]),
+        // apt subcommands
+        (&["apt"], &[
+            "autoremove", "clean", "depends", "download", "full-upgrade",
+            "install", "list", "purge", "rdepends", "reinstall", "remove",
+            "search", "show", "update", "upgrade",
+        ]),
+        // dnf subcommands
+        (&["dnf"], &[
+            "autoremove", "check-update", "clean", "distro-sync", "downgrade",
+            "group", "history", "info", "install", "list", "makecache",
+            "provides", "reinstall", "remove", "repolist", "search",
+            "update", "upgrade",
+        ]),
+        // yarn subcommands
+        (&["yarn"], &[
+            "add", "build", "cache", "config", "dedupe", "dlx", "info",
+            "init", "install", "link", "pack", "plugin", "rebuild", "remove",
+            "run", "search", "set", "start", "test", "up", "why", "workspace",
+        ]),
+        // pnpm subcommands
+        (&["pnpm"], &[
+            "add", "audit", "build", "create", "dedupe", "dlx", "exec",
+            "fetch", "install", "link", "list", "outdated", "publish",
+            "rebuild", "remove", "run", "start", "store", "test", "update", "why",
+        ]),
+    ];
+
+    let mut count = 0u32;
+    for (prefix, subcommands) in hierarchies {
+        for sub in *subcommands {
+            let mut words: Vec<&str> = prefix.to_vec();
+            words.push(sub);
+            trie.insert(&words);
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Hardcoded arg specs for commands where Zsh completions use runtime-conditional
@@ -143,6 +457,145 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>) {
         ("nslookup", &[(1, ARG_MODE_HOSTS)], None, &[]),
         ("ifconfig", &[(1, ARG_MODE_NET_IFACES)], None, &[]),
         ("ip", &[], None, &[]),
+        // --- Docker ---
+        ("docker build", &[], None, &[("-t", ARG_MODE_PATHS), ("-f", ARG_MODE_PATHS)]),
+        ("docker run", &[], None, &[
+            ("-v", ARG_MODE_PATHS), ("--volume", ARG_MODE_PATHS),
+            ("-w", ARG_MODE_PATHS), ("--workdir", ARG_MODE_PATHS),
+            ("--env-file", ARG_MODE_PATHS),
+            ("-u", ARG_MODE_USERS), ("--user", ARG_MODE_USERS),
+        ]),
+        ("docker exec", &[], None, &[("-u", ARG_MODE_USERS), ("--user", ARG_MODE_USERS)]),
+        ("docker cp", &[], Some(ARG_MODE_PATHS), &[]),
+        ("docker compose", &[], None, &[("-f", ARG_MODE_PATHS), ("--file", ARG_MODE_PATHS)]),
+        ("docker compose up", &[], None, &[]),
+        ("docker compose down", &[], None, &[]),
+        ("docker compose build", &[], None, &[]),
+        ("docker compose logs", &[], None, &[]),
+        ("docker compose exec", &[], None, &[]),
+        ("docker compose run", &[], None, &[]),
+        ("docker compose ps", &[], None, &[]),
+        // --- Kubernetes (kubectl) ---
+        ("kubectl apply", &[], None, &[
+            ("-f", ARG_MODE_PATHS), ("--filename", ARG_MODE_PATHS),
+        ]),
+        ("kubectl create", &[], None, &[("-f", ARG_MODE_PATHS), ("--filename", ARG_MODE_PATHS)]),
+        ("kubectl delete", &[], None, &[("-f", ARG_MODE_PATHS), ("--filename", ARG_MODE_PATHS)]),
+        ("kubectl logs", &[], None, &[]),
+        ("kubectl exec", &[], None, &[]),
+        ("kubectl get", &[], None, &[("-o", ARG_MODE_PATHS)]),
+        ("kubectl describe", &[], None, &[]),
+        ("kubectl edit", &[], None, &[]),
+        // --- systemctl ---
+        ("systemctl start", &[], None, &[]),
+        ("systemctl stop", &[], None, &[]),
+        ("systemctl restart", &[], None, &[]),
+        ("systemctl status", &[], None, &[]),
+        ("systemctl enable", &[], None, &[]),
+        ("systemctl disable", &[], None, &[]),
+        ("journalctl", &[], None, &[("-u", ARG_MODE_PATHS)]),
+        // --- Cargo (Rust) ---
+        ("cargo build", &[], None, &[("--manifest-path", ARG_MODE_PATHS)]),
+        ("cargo test", &[], None, &[("--manifest-path", ARG_MODE_PATHS)]),
+        ("cargo run", &[], None, &[("--manifest-path", ARG_MODE_PATHS)]),
+        ("cargo add", &[], None, &[]),
+        ("cargo install", &[], None, &[("--path", ARG_MODE_PATHS)]),
+        ("cargo clippy", &[], None, &[("--manifest-path", ARG_MODE_PATHS)]),
+        // --- Node / npm / yarn ---
+        ("npm install", &[], None, &[]),
+        ("npm run", &[], None, &[]),
+        ("npm test", &[], None, &[]),
+        ("npx", &[(1, ARG_MODE_EXECS_ONLY)], None, &[]),
+        ("yarn add", &[], None, &[]),
+        ("yarn run", &[], None, &[]),
+        // --- Python ---
+        ("pip install", &[], None, &[("-r", ARG_MODE_PATHS)]),
+        ("pip3 install", &[], None, &[("-r", ARG_MODE_PATHS)]),
+        ("python", &[(1, ARG_MODE_PATHS)], None, &[("-m", ARG_MODE_EXECS_ONLY)]),
+        ("python3", &[(1, ARG_MODE_PATHS)], None, &[("-m", ARG_MODE_EXECS_ONLY)]),
+        // --- Homebrew ---
+        ("brew install", &[], None, &[]),
+        ("brew uninstall", &[], None, &[]),
+        ("brew upgrade", &[], None, &[]),
+        ("brew info", &[], None, &[]),
+        ("brew search", &[], None, &[]),
+        // --- Package managers ---
+        ("apt install", &[], None, &[]),
+        ("apt remove", &[], None, &[]),
+        ("apt search", &[], None, &[]),
+        ("dnf install", &[], None, &[]),
+        ("dnf remove", &[], None, &[]),
+        ("pacman", &[], None, &[]),
+        // --- tmux ---
+        ("tmux", &[], None, &[("-f", ARG_MODE_PATHS)]),
+        // --- Make ---
+        ("make", &[], None, &[("-f", ARG_MODE_PATHS), ("-C", ARG_MODE_DIRS_ONLY)]),
+        // --- curl / wget ---
+        ("curl", &[(1, ARG_MODE_URLS)], None, &[
+            ("-o", ARG_MODE_PATHS), ("--output", ARG_MODE_PATHS),
+            ("-d", ARG_MODE_PATHS), ("--data", ARG_MODE_PATHS),
+            ("--cacert", ARG_MODE_PATHS), ("--cert", ARG_MODE_PATHS),
+            ("--key", ARG_MODE_PATHS),
+        ]),
+        ("wget", &[(1, ARG_MODE_URLS)], None, &[
+            ("-O", ARG_MODE_PATHS), ("--output-document", ARG_MODE_PATHS),
+            ("-P", ARG_MODE_DIRS_ONLY), ("--directory-prefix", ARG_MODE_DIRS_ONLY),
+        ]),
+        // --- rsync ---
+        ("rsync", &[], Some(ARG_MODE_PATHS), &[]),
+        // --- awk/sed on files ---
+        ("awk", &[], None, &[("-f", ARG_MODE_PATHS)]),
+        ("sed", &[], None, &[("-f", ARG_MODE_PATHS), ("-i", ARG_MODE_PATHS)]),
+        // --- Go ---
+        ("go build", &[], Some(ARG_MODE_PATHS), &[("-o", ARG_MODE_PATHS)]),
+        ("go test", &[], Some(ARG_MODE_PATHS), &[]),
+        ("go run", &[], Some(ARG_MODE_PATHS), &[]),
+        ("go install", &[], None, &[]),
+        ("go get", &[], None, &[]),
+        // --- Terraform ---
+        ("terraform apply", &[], None, &[("-var-file", ARG_MODE_PATHS)]),
+        ("terraform plan", &[], None, &[("-var-file", ARG_MODE_PATHS)]),
+        ("terraform import", &[], None, &[]),
+        ("terraform destroy", &[], None, &[("-var-file", ARG_MODE_PATHS)]),
+        // --- Ansible ---
+        ("ansible-playbook", &[(1, ARG_MODE_PATHS)], None, &[
+            ("-i", ARG_MODE_PATHS), ("--inventory", ARG_MODE_PATHS),
+            ("-e", ARG_MODE_PATHS), ("--extra-vars", ARG_MODE_PATHS),
+        ]),
+        ("ansible", &[(1, ARG_MODE_HOSTS)], None, &[
+            ("-i", ARG_MODE_PATHS), ("--inventory", ARG_MODE_PATHS),
+        ]),
+        // --- journalctl ---
+        ("journalctl", &[], None, &[
+            ("-u", ARG_MODE_EXECS_ONLY), ("--unit", ARG_MODE_EXECS_ONLY),
+        ]),
+        // --- kill/pkill/killall ---
+        ("kill", &[(1, ARG_MODE_PIDS)], Some(ARG_MODE_PIDS), &[
+            ("-s", ARG_MODE_SIGNALS),
+        ]),
+        ("pkill", &[], None, &[
+            ("-signal", ARG_MODE_SIGNALS), ("-U", ARG_MODE_USERS),
+        ]),
+        ("killall", &[(1, ARG_MODE_SIGNALS)], None, &[]),
+        // --- ssh/scp ---
+        ("ssh", &[(1, ARG_MODE_HOSTS)], None, &[
+            ("-i", ARG_MODE_PATHS), ("-F", ARG_MODE_PATHS),
+            ("-l", ARG_MODE_USERS), ("-p", ARG_MODE_PORTS),
+        ]),
+        ("scp", &[], Some(ARG_MODE_PATHS), &[
+            ("-i", ARG_MODE_PATHS), ("-F", ARG_MODE_PATHS), ("-P", ARG_MODE_PORTS),
+        ]),
+        // --- chown/chgrp ---
+        ("chown", &[(1, ARG_MODE_USERS)], Some(ARG_MODE_PATHS), &[]),
+        ("chgrp", &[(1, ARG_MODE_GROUPS)], Some(ARG_MODE_PATHS), &[]),
+        // --- helm ---
+        ("helm install", &[], None, &[("-f", ARG_MODE_PATHS), ("--values", ARG_MODE_PATHS)]),
+        ("helm upgrade", &[], None, &[("-f", ARG_MODE_PATHS), ("--values", ARG_MODE_PATHS)]),
+        // --- podman (mirrors docker specs) ---
+        ("podman build", &[], None, &[("-f", ARG_MODE_PATHS), ("--file", ARG_MODE_PATHS)]),
+        ("podman run", &[], None, &[("-v", ARG_MODE_PATHS), ("--volume", ARG_MODE_PATHS)]),
+        ("podman exec", &[], None, &[("-u", ARG_MODE_USERS)]),
+        ("podman cp", &[], Some(ARG_MODE_PATHS), &[]),
     ];
 
     for &(cmd, positional, rest, flags) in overrides {
@@ -847,15 +1300,9 @@ fn extract_argument_specs(line: &str) -> Vec<String> {
                 s.push(c);
                 chars.next();
             }
-            // Only include strings that look like argument specs (contain colons
-            // and an action we care about)
-            if s.contains(':')
-                && (s.contains("_files")
-                    || s.contains("_directories")
-                    || s.contains("_command")
-                    || s.contains("_path_files")
-                    || s.contains("_path_commands"))
-            {
+            // Include strings that look like argument specs (contain colons
+            // and a completion action we recognize)
+            if s.contains(':') && has_known_action(&s) {
                 specs.push(s);
             }
         } else {
@@ -914,6 +1361,39 @@ fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
     }
 }
 
+/// Check whether a string contains any known Zsh completion action function.
+fn has_known_action(s: &str) -> bool {
+    const KNOWN_ACTIONS: &[&str] = &[
+        "_files",
+        "_directories",
+        "_command",
+        "_path_files",
+        "_path_commands",
+        "_command_names",
+        "_users",
+        "_groups",
+        "_hosts",
+        "_ssh_hosts",
+        "_ssh_users",
+        "_pids",
+        "_signals",
+        "_ports",
+        "_net_interfaces",
+        "_urls",
+        "_locales",
+        "__git_branch",
+        "__git_heads",
+        "__git_tags",
+        "__git_remotes",
+        "__git_files",
+        "__git_cached_files",
+        "__git_modified_files",
+        "__git_other_files",
+        "__git_commit_tags",
+    ];
+    KNOWN_ACTIONS.iter().any(|a| s.contains(a))
+}
+
 /// Find the action (completion function) in a spec string.
 /// The action is after the last `:` that's part of the argument description,
 /// not inside brackets `[...]`.
@@ -945,12 +1425,7 @@ fn find_action_in_spec(spec: &str) -> Option<String> {
     // The action is the last part
     let last = parts.last()?;
     let last = last.trim();
-    if last.contains("_files")
-        || last.contains("_directories")
-        || last.contains("_command")
-        || last.contains("_path_files")
-        || last.contains("_path_commands")
-    {
+    if has_known_action(last) {
         Some(last.to_string())
     } else {
         None
@@ -1376,5 +1851,112 @@ esac
 "#;
         let types = extract_state_types(content);
         assert_eq!(types.get("dest"), Some(&trie::ARG_MODE_DIRS_ONLY));
+    }
+
+    #[test]
+    fn test_has_known_action_recognizes_runtime_types() {
+        assert!(has_known_action("_users"));
+        assert!(has_known_action("_hosts"));
+        assert!(has_known_action("_signals"));
+        assert!(has_known_action("_ports"));
+        assert!(has_known_action("_pids"));
+        assert!(has_known_action("_groups"));
+        assert!(has_known_action("_locales"));
+        assert!(has_known_action("_net_interfaces"));
+        assert!(has_known_action("_urls"));
+        assert!(has_known_action("__git_branch_names"));
+        assert!(has_known_action("__git_tags"));
+        assert!(has_known_action("__git_remotes"));
+        assert!(has_known_action("__git_files"));
+        assert!(!has_known_action("_something_random"));
+        assert!(!has_known_action("just text"));
+    }
+
+    #[test]
+    fn test_parse_arg_spec_users_hosts() {
+        let content = r#"#compdef ssh
+_arguments \
+  '1:host:_hosts' \
+  '-l+:login name:_users'
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(spec.positional.get(&1), Some(&trie::ARG_MODE_HOSTS));
+        assert_eq!(spec.flag_args.get("-l"), Some(&trie::ARG_MODE_USERS));
+    }
+
+    #[test]
+    fn test_parse_arg_spec_signals() {
+        let content = r#"#compdef kill
+_arguments \
+  '-s+:signal:_signals' \
+  '*:pid:_pids'
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(spec.flag_args.get("-s"), Some(&trie::ARG_MODE_SIGNALS));
+        assert_eq!(spec.rest, Some(trie::ARG_MODE_PIDS));
+    }
+
+    #[test]
+    fn test_well_known_specs_not_empty() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        // Should have added specs for git checkout, docker, kubectl, etc.
+        assert!(specs.contains_key("git checkout"));
+        assert!(specs.contains_key("git push"));
+        assert!(specs.contains_key("docker run"));
+        assert!(specs.contains_key("kubectl apply"));
+        assert!(specs.contains_key("cargo build"));
+        assert!(specs.contains_key("npm install"));
+        assert!(specs.contains_key("curl"));
+        assert!(specs.contains_key("ssh"));
+        assert!(specs.contains_key("kill"));
+    }
+
+    #[test]
+    fn test_well_known_docker_specs() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        let docker_run = specs.get("docker run").expect("docker run should have specs");
+        assert!(docker_run.flag_args.contains_key("-v"));
+        assert!(docker_run.flag_args.contains_key("-u"));
+    }
+
+    #[test]
+    fn test_well_known_curl_specs() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        let curl = specs.get("curl").expect("curl should have specs");
+        assert_eq!(curl.positional.get(&1), Some(&trie::ARG_MODE_URLS));
+        assert_eq!(curl.flag_args.get("-o"), Some(&trie::ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn test_well_known_kill_specs() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        let kill = specs.get("kill").expect("kill should have specs");
+        assert_eq!(kill.positional.get(&1), Some(&trie::ARG_MODE_PIDS));
+        assert_eq!(kill.rest, Some(trie::ARG_MODE_PIDS));
+        assert_eq!(kill.flag_args.get("-s"), Some(&trie::ARG_MODE_SIGNALS));
+    }
+
+    #[test]
+    fn test_well_known_ssh_specs() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        let ssh = specs.get("ssh").expect("ssh should have specs");
+        assert_eq!(ssh.positional.get(&1), Some(&trie::ARG_MODE_HOSTS));
+        assert_eq!(ssh.flag_args.get("-i"), Some(&trie::ARG_MODE_PATHS));
+        assert_eq!(ssh.flag_args.get("-l"), Some(&trie::ARG_MODE_USERS));
+        assert_eq!(ssh.flag_args.get("-p"), Some(&trie::ARG_MODE_PORTS));
+    }
+
+    #[test]
+    fn test_well_known_chown_specs() {
+        let mut specs = HashMap::new();
+        apply_well_known_specs(&mut specs);
+        let chown = specs.get("chown").expect("chown should have specs");
+        assert_eq!(chown.positional.get(&1), Some(&trie::ARG_MODE_USERS));
+        assert_eq!(chown.rest, Some(trie::ARG_MODE_PATHS));
     }
 }

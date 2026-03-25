@@ -136,6 +136,16 @@ const ZSH_BUILTINS: &[&str] = &[
     "zparseopts",
     "zregexparse",
     "zstyle",
+    // Additional builtins
+    "coproc",
+    "repeat",
+    "select",
+    "nocorrect",
+    "zpty",
+    "zstat",
+    "scalar",
+    "array",
+    "assoc",
 ];
 
 /// Add Zsh builtins to the trie.

@@ -118,11 +118,232 @@ pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResu
     }
 }
 
+/// Commands that wrap another command: we resolve their flags but then
+/// restart full resolution from the inner command onward.
+/// Returns the index of the first inner-command word, or None if not a wrapper.
+fn wrapper_inner_start(words: &[&str]) -> Option<usize> {
+    if words.is_empty() {
+        return None;
+    }
+    match words[0] {
+        // sudo [-u user] [-g group] [-flags...] <command>
+        "sudo" => {
+            let mut i = 1;
+            while i < words.len() {
+                let w = words[i];
+                if !w.starts_with('-') {
+                    // Check if previous flag consumes a value (-u, -g, -C, -D, etc.)
+                    if i > 1 && matches!(words[i - 1], "-u" | "-g" | "-C" | "-D" | "-p" | "-r" | "-t") {
+                        i += 1;
+                        continue;
+                    }
+                    return Some(i);
+                }
+                i += 1;
+            }
+            None
+        }
+        // env [-flags...] [VAR=val ...] <command>
+        "env" => {
+            let mut i = 1;
+            while i < words.len() {
+                let w = words[i];
+                if w.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                if w.contains('=') {
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            None
+        }
+        // xargs: [flags] [command] — first non-flag word is the inner command
+        "xargs" => {
+            let mut i = 1;
+            while i < words.len() {
+                let w = words[i];
+                if w.starts_with('-') {
+                    // Flags that consume a value: -I, -n, -P, -L, -E, -d, -s
+                    if matches!(w, "-I" | "-n" | "-P" | "-L" | "-E" | "-d" | "-s") && i + 1 < words.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            None
+        }
+        // doas (sudo alternative on BSDs / some Linux): [-flags] <command>
+        "doas" => {
+            let mut i = 1;
+            while i < words.len() {
+                let w = words[i];
+                if !w.starts_with('-') {
+                    // -u consumes the next word
+                    if i > 1 && words[i - 1] == "-u" {
+                        i += 1;
+                        continue;
+                    }
+                    return Some(i);
+                }
+                i += 1;
+            }
+            None
+        }
+        // Simple passthrough wrappers: first non-flag arg is the command
+        "command" | "exec" | "nice" | "nohup" | "time" | "strace" | "ltrace" | "watch" => {
+            let mut i = 1;
+            while i < words.len() {
+                if !words[i].starts_with('-') {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Split a command line into words, preserving quoted strings as single tokens.
+/// Returns (words, quoted_mask) where quoted_mask[i] is true if words[i] was quoted.
+fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
+    let mut words = Vec::new();
+    let mut quoted = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        let start = i;
+        let is_quoted;
+
+        match bytes[i] {
+            b'\'' => {
+                // Single-quoted string: find closing quote
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume closing quote
+                }
+                is_quoted = true;
+            }
+            b'"' => {
+                // Double-quoted string: find closing quote (respecting backslash)
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                is_quoted = true;
+            }
+            _ => {
+                // Unquoted word
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    // Handle inline quotes within a word (e.g., foo"bar baz"qux)
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'"' {
+                            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                // Mark as quoted if the word contains quotes
+                is_quoted = input[start..i].contains('\'') || input[start..i].contains('"');
+            }
+        }
+
+        let word = &input[start..i];
+        if !word.is_empty() {
+            words.push(word);
+            quoted.push(is_quoted);
+        }
+    }
+
+    (words, quoted)
+}
+
 /// Resolve a single command segment (no pipes/chains) against the trie and pins.
 pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
-    let words: Vec<&str> = input.split_whitespace().collect();
-    if words.is_empty() {
+    let (qwords, _quoted_mask) = split_words_quoted(input);
+    if qwords.is_empty() {
         return ResolveResult::Passthrough(input.to_string());
+    }
+
+    // For pin matching and wrapper detection, use the stripped words
+    let words: Vec<&str> = qwords.clone();
+
+    // Handle wrapper commands (sudo, env, etc.) by resolving the inner command
+    // separately and then prepending the wrapper prefix.
+    if let Some(inner_start) = wrapper_inner_start(&words) {
+        let wrapper_prefix: Vec<String> = words[..inner_start].iter().map(|s| s.to_string()).collect();
+        let inner_input: String = words[inner_start..].join(" ");
+
+        match resolve(&inner_input, trie, pins) {
+            ResolveResult::Resolved(inner) => {
+                let full = format!("{} {}", wrapper_prefix.join(" "), inner);
+                if full == input {
+                    return ResolveResult::Passthrough(input.to_string());
+                }
+                return ResolveResult::Resolved(full);
+            }
+            ResolveResult::Ambiguous(mut info) => {
+                info.position += inner_start;
+                let mut full_prefix = wrapper_prefix;
+                full_prefix.extend(info.resolved_prefix);
+                info.resolved_prefix = full_prefix;
+                return ResolveResult::Ambiguous(info);
+            }
+            ResolveResult::PathAmbiguous(candidates) => {
+                let prefix = wrapper_prefix.join(" ");
+                let adjusted: Vec<String> = candidates
+                    .into_iter()
+                    .map(|c| format!("{} {}", prefix, c))
+                    .collect();
+                return ResolveResult::PathAmbiguous(adjusted);
+            }
+            ResolveResult::Passthrough(inner) => {
+                let full = format!("{} {}", wrapper_prefix.join(" "), inner);
+                return ResolveResult::Passthrough(full);
+            }
+        }
     }
 
     // Check pins first (longest-prefix match)
@@ -250,6 +471,16 @@ fn resolve_from_node(
         return Ok(());
     }
 
+    // Quoted words are never expanded — pass through as-is.
+    // This prevents resolving "fix bug" in `git commit -m "fix bug"`.
+    let word = words[0];
+    if word.starts_with('\'') || word.starts_with('"') {
+        for w in words {
+            result.push(w.to_string());
+        }
+        return Ok(());
+    }
+
     // For path/dir/runtime commands, skip trie resolution for arguments --
     // they'll be resolved by the path resolver or runtime resolver later.
     //
@@ -259,7 +490,6 @@ fn resolve_from_node(
     // Commands whose Paths arg_mode comes from the completions parser (e.g. git,
     // docker) may have real subcommands, so we only skip when there are no
     // non-flag trie matches for this word.
-    let word = words[0];
     if !result.is_empty() {
         let mode = arg_mode(&result[0], modes);
         if matches!(
@@ -369,7 +599,7 @@ fn resolve_from_node(
         _ => {
             // Ambiguous -- but try deep disambiguation first
             if !rest.is_empty() && !rest[0].starts_with('-') {
-                let deep = deep_disambiguate(&matches, rest[0]);
+                let deep = deep_disambiguate(&matches, rest);
 
                 if deep.len() == 1 {
                     // Deep disambiguation resolved it
@@ -454,16 +684,62 @@ fn longest_common_prefix(strings: &[String]) -> String {
 }
 
 /// Given multiple matches for a word, check which ones have children matching
-/// the next word. Returns the filtered matches.
+/// the next words. Looks up to 3 words ahead for disambiguation.
+/// Returns the filtered matches.
 fn deep_disambiguate<'a>(
     matches: &[(&'a str, &'a TrieNode)],
-    next_word: &str,
+    rest: &[&str],
 ) -> Vec<(&'a str, &'a TrieNode)> {
-    matches
+    if rest.is_empty() {
+        return matches.to_vec();
+    }
+
+    // First pass: filter by immediate next word
+    let next_word = rest[0];
+    let filtered: Vec<(&'a str, &'a TrieNode)> = matches
         .iter()
         .filter(|(_, node)| !node.prefix_search(next_word).is_empty())
         .copied()
-        .collect()
+        .collect();
+
+    if filtered.len() <= 1 || rest.len() <= 1 {
+        return filtered;
+    }
+
+    // Second pass: look deeper — try rest[1] (and rest[2]) to further narrow
+    let mut deeper = filtered.clone();
+    for depth in 1..rest.len().min(3) {
+        let lookahead = rest[depth];
+        if lookahead.starts_with('-') {
+            // Flags can exist on many commands — not useful for disambiguation
+            continue;
+        }
+        let narrowed: Vec<(&'a str, &'a TrieNode)> = deeper
+            .iter()
+            .filter(|(_, node)| {
+                // Walk to the child that matches rest[0..depth], then check rest[depth]
+                let mut current = *node;
+                for &w in &rest[..depth] {
+                    let sub_matches = current.prefix_search(w);
+                    if sub_matches.len() == 1 {
+                        current = sub_matches[0].1;
+                    } else {
+                        return true; // Can't walk further, keep this candidate
+                    }
+                }
+                !current.prefix_search(lookahead).is_empty()
+            })
+            .copied()
+            .collect();
+        if !narrowed.is_empty() && narrowed.len() < deeper.len() {
+            deeper = narrowed;
+        }
+        if deeper.len() == 1 {
+            break;
+        }
+    }
+
+    deeper
 }
 
 enum PathsResult {
@@ -560,6 +836,12 @@ fn resolve_paths_in_words(
     for (i, word) in words.iter().enumerate() {
         // Skip command prefix words (e.g., "git" or "git add")
         if i < cmd_words {
+            result.push(word.clone());
+            continue;
+        }
+
+        // Quoted words are never path-resolved — pass through as-is
+        if word.starts_with('\'') || word.starts_with('"') {
             result.push(word.clone());
             continue;
         }
@@ -663,14 +945,26 @@ fn resolve_paths_in_words(
     PathsResult::Resolved(result.join(" "))
 }
 
-/// Escape spaces (and other shell-sensitive chars) in resolved paths.
+/// Escape shell metacharacters in resolved paths so they're safe to execute.
 fn shell_escape_path(path: &str) -> String {
-    if !path.contains(' ') && !path.contains('(') && !path.contains(')') {
+    if path
+        .bytes()
+        .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' | b':' | b',' | b'+' | b'@' | b'%'))
+    {
         return path.to_string();
     }
-    path.replace(' ', "\\ ")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
+    let mut out = String::with_capacity(path.len() + 8);
+    for ch in path.chars() {
+        match ch {
+            ' ' | '(' | ')' | '\'' | '"' | '$' | '`' | '!' | '&' | ';' | '|' | '{' | '}'
+            | '[' | ']' | '#' | '?' | '*' | '<' | '>' | '\\' | '=' | '^' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// How a command's arguments should be resolved.
@@ -698,6 +992,7 @@ const PATH_COMMANDS: &[&str] = &[
     "touch", "chmod", "chown", "chgrp", "stat", "file", "readlink", "realpath", "basename",
     "dirname", "du", "find", "diff", "patch", "tar", "zip", "unzip", "gzip", "gunzip", "bzip2",
     "xz", "source", "open", "nano", "vim", "vi", "nvim", "emacs", "code", "bat",
+    "rsync", "scp", "sftp", "rg", "fd", "exa", "eza",
 ];
 
 /// Commands whose arguments are executable / command names.
@@ -919,8 +1214,25 @@ fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
         if !subcmds.is_empty() {
             let mut sorted = subcmds.clone();
             sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
-            let names: Vec<&str> = sorted.iter().map(|(n, _)| *n).collect();
-            output.push_str(&format_columns(&names, 80));
+
+            // Try to show descriptions for subcommands (Cisco IOS style)
+            let cmd_key = resolved_words.join(" ");
+            let descs = trie.descriptions.get(&cmd_key);
+
+            if descs.is_some_and(|d| !d.is_empty()) && sorted.len() <= 40 {
+                let descs = descs.unwrap();
+                let col_width = sorted.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 2;
+                for (name, _) in &sorted {
+                    if let Some(desc) = descs.get(*name) {
+                        output.push_str(&format!("  {:<width$}{}\n", name, desc, width = col_width));
+                    } else {
+                        output.push_str(&format!("  {}\n", name));
+                    }
+                }
+            } else {
+                let names: Vec<&str> = sorted.iter().map(|(n, _)| *n).collect();
+                output.push_str(&format_columns(&names, 80));
+            }
         }
 
         if !flag_matches.is_empty() {
@@ -1286,17 +1598,23 @@ fn complete_filesystem(word: &str, dirs_only: bool) -> String {
     if filtered.is_empty() {
         output.push_str(&format!("  No matches for \"{}\"\n", word));
     } else {
-        for name in &filtered {
-            let trailing = if search_dir.join(name).is_dir() {
-                "/"
-            } else {
-                ""
-            };
-            output.push_str(&format!("  {}{}\n", name, trailing));
-        }
+        // Append directory marker and use multi-column display
+        let display_names: Vec<String> = filtered
+            .iter()
+            .map(|name| {
+                if search_dir.join(name.as_str()).is_dir() {
+                    format!("{}/", name)
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
+        output.push_str(&format_columns(&refs, 80));
     }
     output
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1585,5 +1903,371 @@ mod tests {
             }
             other => panic!("Expected Ambiguous, got {:?}", other),
         }
+    }
+
+    // --- Tests for sudo/env wrapper chaining ---
+
+    #[test]
+    fn test_sudo_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("sudo ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "sudo terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sudo_with_flags() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("sudo -u root ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "sudo -u root terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_env_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("env FOO=bar ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "env FOO=bar terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nice_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("nice ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "nice terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sudo_preserves_ambiguity() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        // sudo g → g is ambiguous; wrapper should propagate the ambiguity
+        match resolve("sudo g", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                assert_eq!(info.word, "g");
+                // Position should be offset by "sudo" (1)
+                assert_eq!(info.position, 1);
+                assert!(info.candidates.contains(&"git".to_string()));
+            }
+            other => panic!("Expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    // --- Tests for multi-level deep disambiguation ---
+
+    #[test]
+    fn test_deep_disambig_multi_level() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "commit", "-m"]);
+        trie.insert(&["git", "checkout", "main"]);
+        trie.insert(&["grep", "-r", "pattern"]);
+        trie.insert(&["go", "build"]);
+        // "g co" → both git and go have "co" matches (commit, checkout / ?),
+        // but with "g co main", only git checkout has "main" as a child.
+        let pins = Pins::default();
+
+        match resolve("g ch main", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "git checkout main"),
+            other => panic!("Expected deep disambig to resolve, got {:?}", other),
+        }
+    }
+
+    // --- Tests for shell_escape_path ---
+
+    #[test]
+    fn test_shell_escape_plain_path() {
+        assert_eq!(shell_escape_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(shell_escape_path("file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_shell_escape_special_chars() {
+        assert_eq!(shell_escape_path("my file.txt"), "my\\ file.txt");
+        assert_eq!(shell_escape_path("dir (1)"), "dir\\ \\(1\\)");
+        assert_eq!(shell_escape_path("$HOME/file"), "\\$HOME/file");
+        assert_eq!(shell_escape_path("file;rm -rf"), "file\\;rm\\ -rf");
+        assert_eq!(shell_escape_path("a&b"), "a\\&b");
+        assert_eq!(shell_escape_path("test'quote"), "test\\'quote");
+    }
+
+    // --- Tests for descriptions (loaded from YAML) ---
+
+    fn load_yaml_descriptions() -> trie::DescriptionMap {
+        let yaml_str = include_str!("../data/descriptions.yaml");
+        serde_yaml::from_str(yaml_str).unwrap()
+    }
+
+    #[test]
+    fn test_descriptions_git() {
+        let descs = load_yaml_descriptions();
+        let git = descs.get("git").expect("git should have descriptions");
+        assert!(!git.is_empty());
+        assert_eq!(git.get("checkout").map(String::as_str), Some("Switch branches or restore working tree files"));
+        assert_eq!(git.get("commit").map(String::as_str), Some("Record changes to the repository"));
+    }
+
+    #[test]
+    fn test_descriptions_unknown() {
+        let descs = load_yaml_descriptions();
+        assert!(descs.get("unknowncommand").is_none());
+    }
+
+    #[test]
+    fn test_descriptions_docker() {
+        let descs = load_yaml_descriptions();
+        let docker = descs.get("docker").expect("docker should have descriptions");
+        assert!(docker.get("run").is_some());
+        assert!(docker.get("build").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_cargo() {
+        let descs = load_yaml_descriptions();
+        let cargo = descs.get("cargo").expect("cargo should have descriptions");
+        assert_eq!(cargo.get("test").map(String::as_str), Some("Execute all unit and integration tests"));
+    }
+
+    #[test]
+    fn test_descriptions_zsh_ios() {
+        let descs = load_yaml_descriptions();
+        let zio = descs.get("zsh-ios").expect("zsh-ios should have descriptions");
+        assert!(zio.get("build").is_some());
+        assert!(zio.get("resolve").is_some());
+    }
+
+    // --- Tests for wrapper_inner_start ---
+
+    #[test]
+    fn test_wrapper_inner_start_sudo() {
+        assert_eq!(wrapper_inner_start(&["sudo", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["sudo", "-u", "root", "ls"]), Some(3));
+        assert_eq!(wrapper_inner_start(&["sudo", "-i"]), None); // no inner command
+    }
+
+    #[test]
+    fn test_wrapper_inner_start_env() {
+        assert_eq!(wrapper_inner_start(&["env", "FOO=bar", "ls"]), Some(2));
+        assert_eq!(wrapper_inner_start(&["env", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["env", "-i", "FOO=bar", "ls"]), Some(3));
+    }
+
+    #[test]
+    fn test_wrapper_inner_start_none() {
+        assert_eq!(wrapper_inner_start(&["ls", "-la"]), None);
+        assert_eq!(wrapper_inner_start(&["git", "push"]), None);
+    }
+
+    #[test]
+    fn test_wrapper_inner_start_doas() {
+        assert_eq!(wrapper_inner_start(&["doas", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["doas", "-u", "root", "ls"]), Some(3));
+        assert_eq!(wrapper_inner_start(&["doas", "-s"]), None);
+    }
+
+    #[test]
+    fn test_wrapper_inner_start_watch() {
+        assert_eq!(wrapper_inner_start(&["watch", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["watch", "-n", "2", "ls"]), Some(2));
+    }
+
+    #[test]
+    fn test_wrapper_inner_start_command() {
+        assert_eq!(wrapper_inner_start(&["command", "ls"]), Some(1));
+        // nice -n is a flag, 10 is the first non-flag = inner command start
+        // (not strictly correct for `nice -n 10 ls` since 10 is -n's arg, but
+        //  the wrapper heuristic picks the first non-flag word)
+        assert_eq!(wrapper_inner_start(&["nice", "-n", "10", "ls"]), Some(2));
+        assert_eq!(wrapper_inner_start(&["nice", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["nohup", "ls"]), Some(1));
+        assert_eq!(wrapper_inner_start(&["time", "ls"]), Some(1));
+    }
+
+    // --- Tests for quoted word passthrough ---
+
+    #[test]
+    fn test_quoted_words_passthrough() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        // Quoted words should not be expanded
+        match resolve("gi co -m \"some message\"", &trie, &pins) {
+            ResolveResult::Resolved(s) => {
+                assert!(s.contains("\"some message\""), "quoted string should be preserved: {}", s);
+            }
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_single_quoted_passthrough() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("gi co -m 'fix bug'", &trie, &pins) {
+            ResolveResult::Resolved(s) => {
+                assert!(s.contains("'fix bug'"), "single-quoted string should be preserved: {}", s);
+            }
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doas_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("doas ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "doas terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doas_with_user_flag() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("doas -u root ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "doas -u root terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_watch_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("watch ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "watch terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_descriptions_helm() {
+        let descs = load_yaml_descriptions();
+        let helm = descs.get("helm").expect("helm should have descriptions");
+        assert!(!helm.is_empty());
+        assert!(helm.get("install").is_some());
+        assert!(helm.get("upgrade").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_aws() {
+        let descs = load_yaml_descriptions();
+        let aws = descs.get("aws").expect("aws should have descriptions");
+        assert!(!aws.is_empty());
+        assert!(aws.get("s3").is_some());
+        assert!(aws.get("ec2").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_gcloud() {
+        let descs = load_yaml_descriptions();
+        let gcloud = descs.get("gcloud").expect("gcloud should have descriptions");
+        assert!(!gcloud.is_empty());
+        assert!(gcloud.get("compute").is_some());
+        assert!(gcloud.get("config").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_apt() {
+        let descs = load_yaml_descriptions();
+        let apt = descs.get("apt").expect("apt should have descriptions");
+        assert!(!apt.is_empty());
+        assert!(apt.get("install").is_some());
+        assert!(apt.get("update").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_yarn() {
+        let descs = load_yaml_descriptions();
+        let yarn = descs.get("yarn").expect("yarn should have descriptions");
+        assert!(!yarn.is_empty());
+        assert!(yarn.get("add").is_some());
+        assert!(yarn.get("install").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_podman() {
+        let descs = load_yaml_descriptions();
+        let podman = descs.get("podman").expect("podman should have descriptions");
+        assert!(!podman.is_empty());
+        assert!(podman.get("run").is_some());
+        assert!(podman.get("build").is_some());
+    }
+
+    #[test]
+    fn test_descriptions_rustup() {
+        let descs = load_yaml_descriptions();
+        let rustup = descs.get("rustup").expect("rustup should have descriptions");
+        assert!(!rustup.is_empty());
+        assert!(rustup.get("update").is_some());
+        assert!(rustup.get("toolchain").is_some());
+    }
+
+    #[test]
+    fn test_sudo_with_chain() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve_line("sudo ter in && sudo ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => {
+                assert_eq!(s, "sudo terraform init && sudo terraform apply");
+            }
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_xargs_resolves_inner_command() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("xargs ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "xargs terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_xargs_with_flags() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+
+        match resolve("xargs -I {} ter ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "xargs -I {} terraform apply"),
+            other => panic!("Expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_split_words_quoted() {
+        let (words, quoted) = split_words_quoted("git commit -m \"fix bug\"");
+        assert_eq!(words, vec!["git", "commit", "-m", "\"fix bug\""]);
+        assert_eq!(quoted, vec![false, false, false, true]);
+
+        let (words, quoted) = split_words_quoted("echo 'hello world' foo");
+        assert_eq!(words, vec!["echo", "'hello world'", "foo"]);
+        assert_eq!(quoted, vec![false, true, false]);
+
+        let (words, _) = split_words_quoted("simple words here");
+        assert_eq!(words, vec!["simple", "words", "here"]);
     }
 }

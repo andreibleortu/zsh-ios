@@ -64,6 +64,20 @@ pub fn parse_history(
                 continue;
             }
 
+            // Skip subshell / command-substitution artifacts like $(...) or `...`
+            if words[0].starts_with("$(") || words[0].starts_with('`') {
+                continue;
+            }
+
+            // Skip lines starting with shell control flow keywords
+            if matches!(
+                words[0],
+                "if" | "then" | "else" | "elif" | "fi" | "while" | "do" | "done" | "for" | "in"
+                    | "case" | "esac" | "{" | "}" | "[[" | "((" | "function"
+            ) {
+                continue;
+            }
+
             if should_skip_command(words[0], trie) {
                 continue;
             }
@@ -248,6 +262,55 @@ mod tests {
                 .unwrap()
                 .get_child("status")
                 .is_some()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_subshell_not_learned() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-subshell");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(&path, "$(git rev-parse HEAD)\ngit status\n").unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+
+        let count = parse_history(&path, &mut trie).unwrap();
+        assert_eq!(count, 1); // only "git status"
+        assert!(
+            trie.root.get_child("$(git").is_none(),
+            "subshell artifact should not be learned"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_control_flow_not_learned() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-control");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(&path, "if true; then echo hello; fi\n").unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("echo");
+
+        let _count = parse_history(&path, &mut trie).unwrap();
+        // All segments start with control flow keywords (if, then, fi),
+        // so none are learned as commands.
+        assert!(
+            trie.root.get_child("if").is_none(),
+            "control flow keyword 'if' should not be learned"
+        );
+        assert!(
+            trie.root.get_child("then").is_none(),
+            "control flow keyword 'then' should not be learned"
+        );
+        assert!(
+            trie.root.get_child("fi").is_none(),
+            "control flow keyword 'fi' should not be learned"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
