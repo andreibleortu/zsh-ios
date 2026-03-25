@@ -410,7 +410,6 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>) {
         ("git fetch", &[(1, ARG_MODE_GIT_REMOTES)], None, &[]),
         ("git tag", &[(1, ARG_MODE_GIT_TAGS)], None, &[]),
         ("git stash", &[], None, &[]),
-        ("git add", &[], Some(ARG_MODE_PATHS), &[]),
         ("git rm", &[], Some(ARG_MODE_GIT_FILES), &[]),
         (
             "git restore",
@@ -780,9 +779,12 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
     if action.contains("__git_files")
         || action.contains("__git_cached_files")
         || action.contains("__git_modified_files")
-        || action.contains("__git_other_files")
     {
         return Some(trie::ARG_MODE_GIT_FILES);
+    }
+    // Untracked/other working-tree files are just regular filesystem files.
+    if action.contains("__git_other_files") {
+        return Some(trie::ARG_MODE_PATHS);
     }
 
     // System resources
