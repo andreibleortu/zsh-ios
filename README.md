@@ -258,9 +258,13 @@ src/
                         groups, hosts, signals, ports, network interfaces, locales
   history.rs            Zsh history parser
   scanner.rs            PATH scanner, builtins, alias parser
-  completions.rs        Zsh completion file parser (→state, _alternative, _regex_arguments)
+  completions.rs        Zsh completion file parser (→state, _alternative, _regex_arguments);
+                        also extracts subcommand descriptions from completion arrays
   pins.rs               Pin storage (load/save/match)
   config.rs             Config directory paths
+data/
+  descriptions.yaml     Fallback subcommand descriptions for IOS-style ? help
+                        (bundled at compile time; parsed Zsh descriptions override these)
 plugin/
   zsh-ios.zsh           Zsh plugin (ZLE widgets, key bindings, preexec/precmd hooks)
 install.sh              Installer
