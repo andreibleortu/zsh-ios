@@ -1214,9 +1214,22 @@ fn accumulate_runtime_type(
         trie::ARG_MODE_PATHS => *has_files = true,
         trie::ARG_MODE_EXECS_ONLY => *has_execs = true,
         other => {
-            // Keep the first runtime type seen; subsequent different types are
-            // typically secondary alternatives (e.g. file fallback in the same state).
-            if runtime_type.is_none() {
+            if let Some(existing) = *runtime_type {
+                if existing != other {
+                    // Users + Groups → combined type (e.g. chown/chgrp shared state body)
+                    let combined = match (existing, other) {
+                        (trie::ARG_MODE_USERS, trie::ARG_MODE_GROUPS)
+                        | (trie::ARG_MODE_GROUPS, trie::ARG_MODE_USERS) => {
+                            Some(trie::ARG_MODE_USERS_GROUPS)
+                        }
+                        // All other conflicts: keep the first type seen
+                        _ => None,
+                    };
+                    if let Some(t) = combined {
+                        *runtime_type = Some(t);
+                    }
+                }
+            } else {
                 *runtime_type = Some(other);
             }
         }

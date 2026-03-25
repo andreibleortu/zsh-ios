@@ -337,6 +337,14 @@ pub fn list_matches(arg_type: u8, prefix: &str) -> Vec<String> {
             .filter(|g| g.starts_with(prefix) || g.to_lowercase().starts_with(&prefix_lower))
             .cloned()
             .collect(),
+        trie::ARG_MODE_USERS_GROUPS => USERS
+            .iter()
+            .chain(GROUPS.iter())
+            .filter(|s| s.starts_with(prefix) || s.to_lowercase().starts_with(&prefix_lower))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect(),
         trie::ARG_MODE_HOSTS => HOSTS
             .iter()
             .filter(|h| h.starts_with(prefix) || h.to_lowercase().starts_with(&prefix_lower))
@@ -391,6 +399,7 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_EXECS_ONLY => "<command>",
         trie::ARG_MODE_USERS => "<user>",
         trie::ARG_MODE_GROUPS => "<group>",
+        trie::ARG_MODE_USERS_GROUPS => "<user|group>",
         trie::ARG_MODE_HOSTS => "<host>",
         trie::ARG_MODE_PIDS => "<pid>",
         trie::ARG_MODE_SIGNALS => "<signal>",

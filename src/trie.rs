@@ -99,6 +99,8 @@ pub const ARG_MODE_GIT_FILES: u8 = 13;
 pub const ARG_MODE_URLS: u8 = 14;
 pub const ARG_MODE_GROUPS: u8 = 15;
 pub const ARG_MODE_LOCALES: u8 = 16;
+/// Accepts either a user name or a group name (e.g. `chown owner:group`).
+pub const ARG_MODE_USERS_GROUPS: u8 = 17;
 
 /// Per-command argument specification, parsed from Zsh completion files.
 /// Knows what type of argument each position and flag expects.
