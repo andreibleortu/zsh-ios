@@ -410,7 +410,7 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>) {
         ("git fetch", &[(1, ARG_MODE_GIT_REMOTES)], None, &[]),
         ("git tag", &[(1, ARG_MODE_GIT_TAGS)], None, &[]),
         ("git stash", &[], None, &[]),
-        ("git add", &[], Some(ARG_MODE_GIT_FILES), &[]),
+        ("git add", &[], Some(ARG_MODE_PATHS), &[]),
         ("git rm", &[], Some(ARG_MODE_GIT_FILES), &[]),
         (
             "git restore",
