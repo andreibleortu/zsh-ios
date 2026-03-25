@@ -1396,7 +1396,105 @@ fn extract_argument_specs(line: &str) -> Vec<String> {
         }
     }
 
+    // Also handle brace-expanded flag specs:
+    // '(excl)'{-f,--flag=}'[desc]:label:_action'
+    // The flag names are in the unquoted brace group; the action is in the
+    // subsequent quoted description string.
+    specs.extend(extract_brace_expanded_specs(line));
+
     specs
+}
+
+/// Extract synthesized flag specs from brace-expanded `_arguments` patterns.
+///
+/// Pattern: (optional quoted exclusion) `{-f,--flag=}` `'[desc]:label:_action'`
+///
+/// Produces: `-f[desc]:label:_action`, `--flag[desc]:label:_action`, ...
+/// so that `process_spec_string` can classify the flag type.
+fn extract_brace_expanded_specs(line: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+
+        // Find the matching closing brace
+        let brace_start = i;
+        let mut depth = 0u32;
+        let mut j = i;
+        while j < len {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let brace_end = j; // position of closing '}'
+        let brace_content = &line[brace_start + 1..brace_end];
+
+        // Must look like a flag list (contains '-')
+        if !brace_content.contains('-') {
+            i = brace_end + 1;
+            continue;
+        }
+
+        // Skip optional whitespace after '}'
+        let mut k = brace_end + 1;
+        while k < len && bytes[k] == b' ' {
+            k += 1;
+        }
+
+        // Must be followed by a single-quoted description+action string
+        if k >= len || bytes[k] != b'\'' {
+            i = brace_end + 1;
+            continue;
+        }
+
+        // Extract the quoted description+action
+        k += 1; // skip opening quote
+        let mut desc_action = String::new();
+        while k < len && bytes[k] != b'\'' {
+            desc_action.push(bytes[k] as char);
+            k += 1;
+        }
+
+        // Only if it starts with '[' (description-only form) and has a known action
+        if !desc_action.starts_with('[') || !desc_action.contains(':') || !has_known_action(&desc_action) {
+            i = brace_end + 1;
+            continue;
+        }
+
+        // Expand brace: parse comma-separated flags, trim + and = suffixes
+        for flag_raw in brace_content.split(',') {
+            let flag = flag_raw
+                .trim()
+                .trim_end_matches('+')
+                .trim_end_matches('=');
+            if flag.starts_with('-') && flag.len() > 1 {
+                // Synthesize: "-f[desc]:label:_action"
+                result.push(format!("{}{}", flag, desc_action));
+            }
+        }
+
+        i = brace_end + 1;
+    }
+
+    result
 }
 
 /// Process a single _arguments spec string and add to the ArgSpec.
@@ -2322,6 +2420,36 @@ subcmds=(
         assert!(!is_internal_completion("git"));
         assert!(!is_internal_completion("docker"));
         assert!(!is_internal_completion("ssh"));
+    }
+
+    #[test]
+    fn test_make_flag_f_from_completion_file() {
+        let path = "/usr/share/zsh/5.9/functions/_make";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let spec = parse_arg_spec(&content);
+        assert_eq!(
+            spec.flag_args.get("-f"),
+            Some(&trie::ARG_MODE_PATHS),
+            "make -f should be PATHS, got {:?}",
+            spec.flag_args.get("-f")
+        );
+    }
+
+    #[test]
+    fn test_sudo_flag_u_from_completion_file() {
+        let path = "/usr/share/zsh/5.9/functions/_sudo";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let spec = parse_arg_spec(&content);
+        assert_eq!(
+            spec.flag_args.get("-u"),
+            Some(&trie::ARG_MODE_USERS),
+            "sudo -u should be USERS, got {:?}",
+            spec.flag_args.get("-u")
+        );
     }
 
     #[test]

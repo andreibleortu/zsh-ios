@@ -1256,7 +1256,17 @@ fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     }
 
     // --- Trie-based completion (subcommands) ---
-    let trie_matches = node.prefix_search(prefix);
+    // Skip trie when we're completing the value of a flag that takes a typed
+    // argument (e.g. `sudo -u <user>`).  The trie children here are learned
+    // prior invocations of the command, not values for this flag.
+    let in_flag_value_context = prev_word
+        .is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.type_after_flag(p).is_some()));
+
+    let trie_matches = if in_flag_value_context {
+        vec![]
+    } else {
+        node.prefix_search(prefix)
+    };
 
     if trie_matches.is_empty() {
         // No trie matches — show type-aware completions based on arg spec
