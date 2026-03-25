@@ -30,22 +30,22 @@ if [[ -d "$xdg_dir" ]] && [[ "$xdg_dir" != "$HOME/Library/Application Support/zs
     config_dirs+=("$xdg_dir")
 fi
 
-for dir in "${config_dirs[@]}"; do
-    echo ""
-    echo "Found config directory: $dir"
-    ls -la "$dir" 2>/dev/null | tail -n +2 | sed 's/^/  /'
-    echo ""
-    read -r -p "Delete $dir? [y/N] " choice
-    if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-        rm -rf "$dir"
-        echo "Removed."
-    else
-        echo "Kept."
-    fi
-done
-
 if [[ ${#config_dirs[@]} -eq 0 ]]; then
     echo "No config directories found."
+else
+    for dir in "${config_dirs[@]}"; do
+        echo ""
+        echo "Found config directory: $dir"
+        ls -la "$dir" 2>/dev/null | tail -n +2 | sed 's/^/  /'
+        echo ""
+        read -r -p "Delete $dir? [y/N] " choice
+        if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+            rm -rf "$dir"
+            echo "Removed."
+        else
+            echo "Kept."
+        fi
+    done
 fi
 
 # 3. Remove source line from .zshrc
