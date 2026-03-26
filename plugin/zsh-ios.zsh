@@ -1,5 +1,10 @@
 #!/usr/bin/env zsh
 # zsh-ios: Cisco IOS-style command abbreviation engine for Zsh
+# vim: set ft=zsh:
+
+# When running inside the ZLE completion worker, skip the entire plugin.
+# The worker only needs the base completion system (compinit from .zshrc).
+[[ -n "$_ZSH_IOS_IS_WORKER" ]] && return 0
 
 # --- Configuration ---
 ZSH_IOS_BIN="${ZSH_IOS_BIN:-zsh-ios}"
@@ -261,6 +266,10 @@ _zsh_ios_handle_path_ambiguity() {
 # Cisco IOS behavior:
 #   "show ?" (space before ?) = what arguments/subcommands come after "show"
 #   "sh?"    (no space)       = what commands match the "sh" prefix
+#
+# When the Rust binary cannot provide completions (returns a generic
+# "no completions" signal), we fall back to asking the ZLE worker —
+# a background Zsh process with the full completion system loaded.
 _zsh_ios_help() {
     if _zsh_ios_is_disabled; then
         zle self-insert
@@ -280,12 +289,72 @@ _zsh_ios_help() {
         zle self-insert
         return
     fi
-    # If cursor is mid-word (not at start, not after space), we're completing
-    # that partial word — pass WITHOUT trailing space so engine prefix-searches.
-    # If cursor is after a space, pass WITH the space so engine shows next-arg.
-    # CURSOR==0 means empty buffer — show top-level commands.
+
+    # Fast path: Rust binary handles typed completions (branches, hosts, etc.)
     local output
     output=$("$ZSH_IOS_BIN" complete -- "$prefix" 2>/dev/null)
+
+    # Detect "generic" output — the Rust binary signaling it has nothing useful.
+    # In these cases the ZLE worker may have better results.
+    # Also treat a static list of ≤2 items as potentially incomplete: the static
+    # parser may have captured only Zsh syntax tokens or a prefix-mode pair (+/-)
+    # when the real completions come from a dynamic dispatch (e.g. ssh -o 'Ciphers=').
+    local _zio_generic=0
+    if [[ "$output" == *'<enter argument>'* || "$output" == *'No commands matching'* ]]; then
+        _zio_generic=1
+    elif [[ "$output" == *'Expects: <value>'* ]]; then
+        # Count non-empty, non-header lines to detect thin static lists
+        local _item_count
+        _item_count=$(printf '%s' "$output" | grep -c '^  [^E]')
+        (( _item_count <= 2 )) && _zio_generic=1
+    fi
+
+    if (( _zio_generic )) && _zsh_ios_worker_is_ready; then
+        # If the prefix ends with a closing single-quote, strip it before
+        # sending to the worker so the cursor is inside the open-quoted context.
+        local _worker_prefix="$prefix"
+        # Strip trailing whitespace then check for closing quote.
+        local _trimmed="${_worker_prefix%%[[:space:]]}"
+        if [[ "$_trimmed" == *\' ]]; then
+            local _stripped="${_trimmed%\'}"
+            local _sq_n="${#${_stripped//[^\']/}}"
+            (( _sq_n % 2 != 0 )) && _worker_prefix="$_stripped"
+        fi
+
+        # IMPORTANT: call directly in the main shell process, NOT in a $(...)
+        # subshell.  zpty handles don't survive fork — the subshell silently
+        # fails to write to the worker.  Output goes to a temp file instead.
+        local _wc_out="${TMPDIR:-/tmp}/zio-wc-out.$$"
+        _zsh_ios_worker_complete "$_worker_prefix" > "$_wc_out" 2>/dev/null
+        local worker_items=""
+        [[ -s "$_wc_out" ]] && worker_items=$(<"$_wc_out")
+        rm -f "$_wc_out"
+        if [[ -n "$worker_items" ]]; then
+            # Format items into columns (simple, matches the Rust binary style)
+            local -a items=("${(@f)worker_items}")
+            # Deduplicate and sort
+            items=("${(@u)items}")
+            local col_output
+            # Build a simple two-column layout at 80 chars
+            local max_w=0 item
+            for item in "${items[@]}"; do
+                (( ${#item} > max_w )) && max_w=${#item}
+            done
+            local col_w=$(( max_w + 2 ))
+            local cols=$(( 80 / col_w ))
+            (( cols < 1 )) && cols=1
+            local line="" col_n=0
+            col_output=""
+            for item in "${items[@]}"; do
+                (( col_n == cols )) && { col_output+="${line}"$'\n'; line=""; col_n=0 }
+                line+="$(printf "  %-${max_w}s" "$item")"
+                (( col_n++ ))
+            done
+            [[ -n "$line" ]] && col_output+="${line}"$'\n'
+            output="  Expects: <argument> [ZLE]\n${col_output}"
+        fi
+    fi
+
     if [[ -n "$output" ]]; then
         zle -M "$output"
     else
@@ -433,6 +502,258 @@ _zsh_ios_handle_ambiguity() {
     BUFFER="${full_cmd%% }"
     zle accept-line
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZLE COMPLETION WORKER
+#
+# A persistent background Zsh process (started via `zpty`) that has the full
+# completion system loaded and ZLE active.  When the static analysis in the
+# Rust binary cannot provide completions (e.g. `ssh -o 'Ciphers='`, `ip link
+# add type`), we ask the worker to run `zle complete-word` with the current
+# buffer and capture what `compadd` would normally add.
+#
+# Architecture
+# ────────────
+#  • The worker starts lazily on the first ZLE line-init event (so startup cost
+#    is hidden while the user reads the previous output / thinks).
+#  • The worker's Zsh loads via a custom ZDOTDIR that sources the user's real
+#    .zshrc (plugin returns early due to _ZSH_IOS_IS_WORKER), then a setup
+#    script that overrides `compadd` and `accept-line`.
+#  • The parent triggers completion by writing a request file then sending a
+#    newline via `zpty -w`, which triggers the worker's accept-line override.
+#  • Before each request, the parent drains accumulated pty output to prevent
+#    the worker's ZLE from blocking on a full output buffer.
+#  • Requests and results are exchanged via temp files to avoid the noise that
+#    pty I/O carries (ANSI escape sequences, echoed input, etc.).
+#  • A "done file" (result_file.done) acts as a zero-cost semaphore: the worker
+#    touches it when the completion widget finishes.  We poll in 10 ms slices
+#    up to ZSH_IOS_WORKER_TIMEOUT_MS (default 500 ms).
+#  • We only invoke the worker when the Rust binary returns a generic "no
+#    completions" signal — fast / typed completions (branches, hosts, etc.) are
+#    still served by the Rust binary with zero IPC overhead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# How long (ms) to wait for the worker before giving up on a single request.
+: ${ZSH_IOS_WORKER_TIMEOUT_MS:=500}
+
+# Well-known directory for this shell's worker (deterministic path = no leaks).
+typeset -g _ZSH_IOS_WORKER_DIR="${TMPDIR:-/tmp}/zsh-ios-worker-$$"
+typeset -g _ZSH_IOS_WORKER_STARTING=0
+
+# On (re-)source: always tear down any previous worker from this PID.
+_zsh_ios_worker_teardown() {
+    zmodload zsh/zpty 2>/dev/null
+    zpty -d _zsh_ios_worker 2>/dev/null
+    if [[ -f "${_ZSH_IOS_WORKER_DIR}/pid" ]]; then
+        local _p; _p=$(<"${_ZSH_IOS_WORKER_DIR}/pid")
+        [[ -n "$_p" ]] && kill "$_p" 2>/dev/null && sleep 0.1 && kill -9 "$_p" 2>/dev/null
+    fi
+    [[ -d "$_ZSH_IOS_WORKER_DIR" ]] && rm -rf "$_ZSH_IOS_WORKER_DIR"
+    _ZSH_IOS_WORKER_STARTING=0
+}
+_zsh_ios_worker_teardown
+
+_zsh_ios_worker_is_ready() {
+    [[ -f "${_ZSH_IOS_WORKER_DIR}/ready" ]]
+}
+
+_zsh_ios_worker_start() {
+    _zsh_ios_worker_is_ready && return 0
+    (( _ZSH_IOS_WORKER_STARTING )) && return 0
+    _ZSH_IOS_WORKER_STARTING=1
+
+    zmodload zsh/zpty 2>/dev/null || { _ZSH_IOS_WORKER_STARTING=0; return 1; }
+    mkdir -p "$_ZSH_IOS_WORKER_DIR" || { _ZSH_IOS_WORKER_STARTING=0; return 1; }
+
+    local _sf="${_ZSH_IOS_WORKER_DIR}/setup.zsh"
+    # Heredoc delimiter is unquoted: parent-side $vars expand at write time,
+    # worker-side vars use \$ to defer evaluation to source time.
+    cat > "$_sf" <<WORKER_SETUP
+# Ensure emacs keybindings so regular chars → self-insert (predictable).
+bindkey -e
+# No history pollution from the worker.
+HISTSIZE=0; SAVEHIST=0
+# Prevent interactive menu/listing behavior during programmatic completion.
+# NO_AUTO_MENU: don't enter menu selection on ambiguous completions.
+# NO_AUTO_LIST: don't display the match list (would swallow the next keypress).
+# NO_LIST_BEEP: don't beep on ambiguous completions.
+setopt NO_AUTO_MENU NO_AUTO_LIST NO_LIST_BEEP
+# Ensure the completion system is initialized (the user's .zshrc may skip
+# compinit under ZDOTDIR or conditional checks).  Use the real home zcompdump.
+autoload -Uz compinit && compinit -d "$HOME/.zcompdump" 2>/dev/null
+
+compadd() {
+    builtin compadd "\$@"
+    [[ -z "\$_ZIO_RF" ]] && return
+    local -a _zio_items=()
+    local _zio_sep=0 _zio_skip=0 _zio_arr_mode=0 _zio_arr_name=""
+    local _zio_a
+    for _zio_a in "\$@"; do
+        if (( _zio_skip )); then _zio_skip=0; continue; fi
+        if (( _zio_sep )); then _zio_items+=("\$_zio_a"); continue; fi
+        case "\$_zio_a" in
+            --|-)  _zio_sep=1 ;;
+            -a)    _zio_arr_mode=1 ;;
+            -k)    _zio_arr_mode=2 ;;
+            -[JVXxMPSpsIWFrRDOAEd]) _zio_skip=1 ;;
+            -[JVXxMPSpsIWFrRDOAEd]*) ;;
+            -*)    ;;
+            *)  if (( _zio_arr_mode )); then _zio_arr_name="\$_zio_a"
+                else _zio_items+=("\$_zio_a"); fi ;;
+        esac
+    done
+    if [[ -n "\$_zio_arr_name" ]] && (( _zio_arr_mode )); then
+        eval 'printf "%s\n" "\${(P@)_zio_arr_name}"' >> "\$_ZIO_RF" 2>/dev/null
+    elif (( \$#_zio_items )); then
+        printf '%s\n' "\${_zio_items[@]}" >> "\$_ZIO_RF"
+    fi
+}
+
+# Override accept-line: when a request file exists, run completion instead of
+# accepting input.  The parent triggers this by sending a newline via zpty -w.
+_zio_accept_line() {
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+    if [[ -f "\$_req" ]]; then
+        source "\$_req"
+        BUFFER="\$_ZIO_BUFFER"
+        CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+        : > "\$_ZIO_RF"
+        zle complete-word 2>/dev/null
+        BUFFER=""
+        CURSOR=0
+        [[ -n "\$_ZIO_DF" ]] && touch "\$_ZIO_DF"
+        rm -f "\$_req"
+        return
+    fi
+    zle .accept-line
+}
+zle -N accept-line _zio_accept_line
+WORKER_SETUP
+
+    # Create a ZDOTDIR so the worker's zsh -i auto-sources setup — no zpty -w needed.
+    local _real_zdotdir="${ZDOTDIR:-$HOME}"
+    local _zdot="${_ZSH_IOS_WORKER_DIR}/zdot"
+    mkdir -p "$_zdot"
+    cat > "${_zdot}/.zshenv" <<EOF
+[[ -f "${_real_zdotdir}/.zshenv" ]] && source "${_real_zdotdir}/.zshenv"
+EOF
+    cat > "${_zdot}/.zshrc" <<EOF
+source "${_real_zdotdir}/.zshrc"
+source "${_sf}"
+touch "${_ZSH_IOS_WORKER_DIR}/ready"
+EOF
+
+    zpty -b _zsh_ios_worker "exec env _ZSH_IOS_IS_WORKER=1 ZDOTDIR='${_zdot}' TERM=${TERM:-xterm-256color} ${SHELL:-zsh} -i 2>/dev/null" 2>/dev/null || {
+        _ZSH_IOS_WORKER_STARTING=0; return 1
+    }
+
+    # Record the worker PID for kill-based cleanup.
+    local _wpid
+    _wpid=$(pgrep -n -u "$UID" -f 'zsh -i' 2>/dev/null)
+    [[ -n "$_wpid" ]] && printf '%s' "$_wpid" > "${_ZSH_IOS_WORKER_DIR}/pid"
+}
+
+_zsh_ios_worker_complete() {
+    _zsh_ios_worker_is_ready || return 1
+    local _buf="$1" _rf _df
+
+    # Drain accumulated pty output so the worker's ZLE can start/continue.
+    # Without this, ZLE blocks writing the prompt to a full pty output buffer.
+    local _zio_drain_buf _zio_drain_n=0
+    while zpty -t _zsh_ios_worker 2>/dev/null; do
+        zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        (( ++_zio_drain_n > 200 )) && break
+    done
+
+    _rf=$(mktemp "${TMPDIR:-/tmp}/zio-result.XXXXXX") || return 1
+    _df="${_rf}.done"
+
+    # Write request file (sourced by the worker — no quoting issues).
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+    local _bf="${_rf}.buf"
+    printf '%s' "$_buf" > "$_bf"
+    cat > "$_req" <<EOF
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+_ZIO_BUFFER="\$(<'$_bf')"
+_ZIO_CURSOR=${#_buf}
+EOF
+
+    # Send a newline to the worker's ZLE — triggers our accept-line override.
+    # Use -n + explicit \n (zpty -w rejects empty strings but accepts no args).
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null || {
+        rm -f "$_rf" "$_df" "$_bf" "$_req"; return 1
+    }
+
+    # Poll for the done-file, draining pty output each cycle so the worker's
+    # ZLE can re-enter after precmd / prompt display without blocking.
+    local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
+    for _i in $(seq 1 $_slices); do
+        [[ -f "$_df" ]] && break
+        sleep 0.01
+        while zpty -t _zsh_ios_worker 2>/dev/null; do
+            zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        done
+    done
+    local _rc=1
+    if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
+    rm -f "$_rf" "$_df" "$_bf" "$_req"
+    return $_rc
+}
+
+_zsh_ios_worker_cleanup() {
+    _zsh_ios_worker_teardown
+}
+zshexit_functions+=(_zsh_ios_worker_cleanup)
+
+_zsh_ios_worker_ping() {
+    print "=== Worker Diagnostics ==="
+    print "worker_dir: $_ZSH_IOS_WORKER_DIR"
+    print "ready file: $([[ -f "${_ZSH_IOS_WORKER_DIR}/ready" ]] && echo YES || echo NO)"
+    print "zpty       : $(zpty -L 2>/dev/null | grep _zsh_ios_worker || echo 'none')"
+    local _wpid; _wpid=$(cat "${_ZSH_IOS_WORKER_DIR}/pid" 2>/dev/null)
+    print "pid        : ${_wpid:-none}"
+    [[ -n "$_wpid" ]] && print "pid alive  : $(kill -0 "$_wpid" 2>/dev/null && echo YES || echo NO)"
+    print "=== Completion Test ==="
+    # Drain pty first
+    local _d; for _d in {1..200}; do zpty -t _zsh_ios_worker 2>/dev/null || break; zpty -r _zsh_ios_worker _d 2>/dev/null; done
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+    local _rf="${_ZSH_IOS_WORKER_DIR}/ping-result"
+    local _df="${_rf}.done"
+    rm -f "$_rf" "$_df" "$_req"
+    cat > "$_req" <<EOF
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+_ZIO_BUFFER='echo hello'
+_ZIO_CURSOR=10
+EOF
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null
+    print "zpty -w rc=$?"
+    sleep 1.0
+    print "Done file: $([[ -f "$_df" ]] && echo YES || echo NO)"
+    print "Result: $(cat "$_rf" 2>/dev/null || echo 'no result')"
+    rm -f "$_rf" "$_df" "$_req"
+}
+
+_zsh_ios_worker_status() {
+    print "  worker_dir : $_ZSH_IOS_WORKER_DIR"
+    print "  ready      : $(_zsh_ios_worker_is_ready && echo yes || echo no)"
+    print "  pid        : $(cat "${_ZSH_IOS_WORKER_DIR}/pid" 2>/dev/null || echo none)"
+    print "  starting   : $_ZSH_IOS_WORKER_STARTING"
+    print "  zpty       : $(zpty -L 2>/dev/null | grep _zsh_ios_worker || echo none)"
+}
+alias zsh-ios-worker-status='_zsh_ios_worker_status'
+
+_zsh_ios_worker_lazy_start() {
+    _zsh_ios_worker_start
+    add-zle-hook-widget -d line-init _zsh_ios_worker_lazy_start 2>/dev/null
+}
+autoload -Uz add-zle-hook-widget 2>/dev/null
+add-zle-hook-widget line-init _zsh_ios_worker_lazy_start 2>/dev/null
+
+# ─────────────────────────────────────────────────────────────────────────────
+# END WORKER
+# ─────────────────────────────────────────────────────────────────────────────
 
 # --- Register widgets ---
 zle -N _zsh_ios_accept_line

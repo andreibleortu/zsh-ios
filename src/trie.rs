@@ -102,6 +102,22 @@ pub const ARG_MODE_LOCALES: u8 = 16;
 /// Accepts either a user name or a group name (e.g. `chown owner:group`).
 pub const ARG_MODE_USERS_GROUPS: u8 = 17;
 
+/// A context-sensitive completion rule evaluated at query time.
+///
+/// When any flag in `trigger_flags` is already present on the current command
+/// line, the completion type for the next positional argument is overridden
+/// with `override_type` instead of the default.
+///
+/// Parsed from Zsh `if [[ -n ${opt_args[(I)-b|-B|...]} ]]; then ACTION`
+/// patterns inside `case $state in` arm bodies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRule {
+    /// Any of these flags being present in the current words triggers the rule.
+    pub trigger_flags: Vec<String>,
+    /// The completion type (ARG_MODE_* constant) to use when triggered.
+    pub override_type: u8,
+}
+
 /// Per-command argument specification, parsed from Zsh completion files.
 /// Knows what type of argument each position and flag expects.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -116,6 +132,27 @@ pub struct ArgSpec {
     /// e.g., "-o" → Paths means the word after -o is a file path.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub flag_args: HashMap<String, u8>,
+    /// Flags whose value is produced by running an external command.
+    /// From Zsh `_call_program` specs: `'-c+:cipher:_call_program ciphers ssh -Q cipher'`.
+    /// Maps flag → (tag, argv).  `tag` is the human label; `argv` is run to get completions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flag_call_programs: HashMap<String, (String, Vec<String>)>,
+    /// Same as `flag_call_programs` but for rest/positional arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_call_program: Option<(String, Vec<String>)>,
+    /// Flags whose value is a static enumeration of literal strings.
+    /// From `compadd - yes no`, `_values 'mode' fast slow`, etc.
+    /// Maps flag → sorted deduplicated completion items.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flag_static_lists: HashMap<String, Vec<String>>,
+    /// Same as `flag_static_lists` but for rest/positional arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_static_list: Option<Vec<String>>,
+    /// Context-sensitive rules: when certain flags are present in the current
+    /// command line, override what we complete for the next positional argument.
+    /// Evaluated at completion time by checking the typed words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_rules: Vec<ContextRule>,
 }
 
 impl ArgSpec {
@@ -139,7 +176,66 @@ impl ArgSpec {
 
     /// Convenience: is this spec non-empty?
     pub fn is_empty(&self) -> bool {
-        self.positional.is_empty() && self.rest.is_none() && self.flag_args.is_empty()
+        self.positional.is_empty()
+            && self.rest.is_none()
+            && self.flag_args.is_empty()
+            && self.flag_call_programs.is_empty()
+            && self.rest_call_program.is_none()
+            && self.flag_static_lists.is_empty()
+            && self.rest_static_list.is_none()
+            && self.context_rules.is_empty()
+    }
+
+    /// Whether a flag consumes the next word (either via typed arg, call_program, or static list).
+    pub fn flag_takes_value(&self, flag: &str) -> bool {
+        self.type_after_flag(flag).is_some()
+            || self.flag_call_programs.contains_key(flag)
+            || self.flag_static_lists.contains_key(flag)
+    }
+
+    /// Merge another `ArgSpec` into this one (pure gap-fill).
+    /// Only slots that are completely absent in `self` are filled from `other`;
+    /// any existing value — even a generic one — is preserved.  This ensures
+    /// that the primary function's explicit specs always take precedence over
+    /// what a helper function infers.
+    pub fn merge(&mut self, other: &ArgSpec) {
+        for (&pos, &arg_type) in &other.positional {
+            self.positional.entry(pos).or_insert(arg_type);
+        }
+        if self.rest.is_none() {
+            self.rest = other.rest;
+        }
+        for (flag, arg_type) in &other.flag_args {
+            self.flag_args.entry(flag.clone()).or_insert(*arg_type);
+        }
+        for (flag, entry) in &other.flag_call_programs {
+            self.flag_call_programs
+                .entry(flag.clone())
+                .or_insert_with(|| entry.clone());
+        }
+        if self.rest_call_program.is_none() {
+            self.rest_call_program = other.rest_call_program.clone();
+        }
+        for (flag, list) in &other.flag_static_lists {
+            self.flag_static_lists
+                .entry(flag.clone())
+                .or_insert_with(|| list.clone());
+        }
+        if self.rest_static_list.is_none() {
+            self.rest_static_list = other.rest_static_list.clone();
+        }
+        // Gap-fill context rules: add any rules from other whose trigger_flags
+        // are not already covered by an existing rule in self.
+        for other_rule in &other.context_rules {
+            let already_covered = self.context_rules.iter().any(|r| {
+                r.trigger_flags
+                    .iter()
+                    .any(|f| other_rule.trigger_flags.contains(f))
+            });
+            if !already_covered {
+                self.context_rules.push(other_rule.clone());
+            }
+        }
     }
 }
 

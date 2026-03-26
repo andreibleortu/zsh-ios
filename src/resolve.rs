@@ -848,6 +848,25 @@ fn u8_to_arg_mode(val: u8) -> ArgMode {
     }
 }
 
+/// Apply context-sensitive rules from the spec against the already-typed words.
+///
+/// When a flag listed in a `ContextRule.trigger_flags` is present anywhere in
+/// the resolved command line, the rule's `override_type` replaces the default
+/// completion mode.  Rules are checked in order; the first match wins.
+fn apply_context_rules(spec: Option<&ArgSpec>, words: &[String], base: ArgMode) -> ArgMode {
+    let Some(spec) = spec else { return base; };
+    for rule in &spec.context_rules {
+        if rule
+            .trigger_flags
+            .iter()
+            .any(|f| words.iter().any(|w| w == f))
+        {
+            return u8_to_arg_mode(rule.override_type);
+        }
+    }
+    base
+}
+
 fn resolve_paths_in_words(
     words: &[String],
     spec: Option<&ArgSpec>,
@@ -880,7 +899,7 @@ fn resolve_paths_in_words(
         if word.starts_with('-') {
             result.push(word.clone());
             // Check if this flag consumes the next word as a typed value
-            next_is_flag_value = spec.and_then(|s| s.type_after_flag(word)).is_some();
+            next_is_flag_value = spec.is_some_and(|s| s.flag_takes_value(word));
             continue;
         }
 
@@ -1247,7 +1266,10 @@ fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     let total_words = completed_words.len() + 1; // completed + the word being typed
     let arg_position = total_words.saturating_sub(cmd_words).max(1) as u32;
     let prev_word = completed_words.last().copied();
-    let current_mode = arg_type_for_word(arg_position, prev_word, spec, fallback_mode);
+    let current_mode = {
+        let base = arg_type_for_word(arg_position, prev_word, spec, fallback_mode);
+        apply_context_rules(spec, &resolved_words, base)
+    };
 
     // --- Flag completion mode ---
     // When typing a flag prefix (starts with '-'), show known flags + their expected arg types.
@@ -1256,11 +1278,80 @@ fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
     }
 
     // --- Trie-based completion (subcommands) ---
+    // _call_program: flag value or rest is produced by running an external command.
+    // Check this before the trie so we show live dynamic values (e.g. ssh -Q cipher).
+    if let Some(prev) = prev_word
+        && prev.starts_with('-')
+        && let Some((tag, argv)) = spec.and_then(|s| s.flag_call_programs.get(prev))
+    {
+        output.push_str(&format!("  Expects: <{}>\n", tag));
+        let results = runtime_complete::call_program_cached(argv, prefix);
+        if !results.is_empty() {
+            let names: Vec<&str> = results.iter().map(String::as_str).collect();
+            output.push_str(&format_columns(&names, 80));
+        } else if !prefix.is_empty() {
+            output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+        }
+        return output;
+    }
+
+    // Static list: flag value is a literal enumeration (compadd - yes no, _values, etc.)
+    if let Some(prev) = prev_word
+        && prev.starts_with('-')
+        && let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prev))
+    {
+        output.push_str("  Expects: <value>\n");
+        let filtered: Vec<&str> = items
+            .iter()
+            .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+            .map(String::as_str)
+            .collect();
+        if !filtered.is_empty() {
+            output.push_str(&format_columns(&filtered, 80));
+        } else if !prefix.is_empty() {
+            output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+        }
+        return output;
+    }
+
+    // Rest position with call_program (and not completing a subcommand / flag)
+    let prev_is_flag_consuming =
+        prev_word.is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.flag_takes_value(p)));
+    if !prefix.starts_with('-')
+        && !prev_is_flag_consuming
+        && let Some((tag, argv)) = spec.and_then(|s| s.rest_call_program.as_ref())
+    {
+        let results = runtime_complete::call_program_cached(argv, prefix);
+        if !results.is_empty() {
+            output.push_str(&format!("  Expects: <{}>\n", tag));
+            let names: Vec<&str> = results.iter().map(String::as_str).collect();
+            output.push_str(&format_columns(&names, 80));
+            return output;
+        }
+    }
+
+    // Rest position with static list
+    if !prefix.starts_with('-')
+        && !prev_is_flag_consuming
+        && let Some(items) = spec.and_then(|s| s.rest_static_list.as_ref())
+    {
+        let filtered: Vec<&str> = items
+            .iter()
+            .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+            .map(String::as_str)
+            .collect();
+        if !filtered.is_empty() {
+            output.push_str("  Expects: <value>\n");
+            output.push_str(&format_columns(&filtered, 80));
+            return output;
+        }
+    }
+
     // Skip trie when we're completing the value of a flag that takes a typed
     // argument (e.g. `sudo -u <user>`).  The trie children here are learned
     // prior invocations of the command, not values for this flag.
     let in_flag_value_context = prev_word
-        .is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.type_after_flag(p).is_some()));
+        .is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.flag_takes_value(p)));
 
     let trie_matches = if in_flag_value_context {
         vec![]
@@ -1345,6 +1436,18 @@ fn complete_flags(
                 known_flags.push((flag.clone(), Some(arg_type)));
             }
         }
+        // Also include _call_program flags (they take a value but the type is dynamic)
+        for flag in spec.flag_call_programs.keys() {
+            if flag.starts_with(prefix) && !known_flags.iter().any(|(f, _)| f == flag) {
+                known_flags.push((flag.clone(), None));
+            }
+        }
+        // Also include static list flags
+        for flag in spec.flag_static_lists.keys() {
+            if flag.starts_with(prefix) && !known_flags.iter().any(|(f, _)| f == flag) {
+                known_flags.push((flag.clone(), None));
+            }
+        }
     }
 
     // Collect flags from trie children (flags learned from history — may be boolean)
@@ -1377,6 +1480,21 @@ fn complete_flags(
             if !names.is_empty() {
                 output.push_str(&format_columns(&names, 80));
             }
+        } else if let Some((tag, argv)) =
+            spec.and_then(|s| s.flag_call_programs.get(prefix))
+        {
+            // _call_program flag: run it now to show valid values
+            output.push_str(&format!("  {} expects: <{}>\n", prefix, tag));
+            let results = runtime_complete::call_program_cached(argv, "");
+            if !results.is_empty() {
+                let names: Vec<&str> = results.iter().map(String::as_str).collect();
+                output.push_str(&format_columns(&names, 80));
+            }
+        } else if let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prefix)) {
+            // Static list flag: show the known items
+            output.push_str(&format!("  {} expects: <value>\n", prefix));
+            let names: Vec<&str> = items.iter().map(String::as_str).collect();
+            output.push_str(&format_columns(&names, 80));
         } else {
             // Boolean flag, no argument
             output.push_str(&format!("  {} (no argument)\n", prefix));
@@ -1402,10 +1520,20 @@ fn format_flags_from_trie(flags: &[(&str, &TrieNode)], spec: Option<&trie::ArgSp
     let col_width = flags.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 2;
     let mut out = String::new();
     for (name, _) in flags {
-        let hint = spec
+        let typed_hint = spec
             .and_then(|s| s.type_after_flag(name))
             .map(runtime_complete::type_hint);
-        if let Some(hint) = hint {
+        let call_program_hint = spec
+            .and_then(|s| s.flag_call_programs.get(*name))
+            .map(|(tag, _)| tag.as_str());
+        let static_hint: Option<String> = spec
+            .and_then(|s| s.flag_static_lists.get(*name))
+            .map(|items| items.iter().take(4).cloned().collect::<Vec<_>>().join("|"));
+        if let Some(hint) = typed_hint {
+            out.push_str(&format!("  {:<width$}<{}>\n", name, hint, width = col_width));
+        } else if let Some(hint) = call_program_hint {
+            out.push_str(&format!("  {:<width$}<{}>\n", name, hint, width = col_width));
+        } else if let Some(hint) = static_hint {
             out.push_str(&format!("  {:<width$}{}\n", name, hint, width = col_width));
         } else {
             out.push_str(&format!("  {}\n", name));
@@ -1556,6 +1684,29 @@ fn show_type_completions(
             output.push_str(&complete_filesystem(prefix, false));
         }
         ArgMode::Runtime(type_id) => {
+            // Handle user@host prefix splitting: typing `alice@gi` means
+            // we should complete host names that start with "gi", then
+            // prepend "alice@" to each result.  Mirrors `compset -P '*@'`
+            // in Zsh completion functions like _ssh.
+            if type_id == trie::ARG_MODE_HOSTS
+                && let Some(at_pos) = prefix.find('@')
+            {
+                let user_prefix = &prefix[..=at_pos]; // e.g. "alice@"
+                let host_prefix = &prefix[at_pos + 1..]; // e.g. "gi"
+                let hosts = runtime_complete::list_matches(trie::ARG_MODE_HOSTS, host_prefix);
+                let with_user: Vec<String> =
+                    hosts.iter().map(|h| format!("{user_prefix}{h}")).collect();
+                output.push_str("  Expects: <user@host>\n");
+                if with_user.is_empty() {
+                    if !host_prefix.is_empty() {
+                        output.push_str(&format!("  No matches for \"{host_prefix}\"\n"));
+                    }
+                } else {
+                    let names: Vec<&str> = with_user.iter().map(String::as_str).collect();
+                    output.push_str(&format_columns(&names, 80));
+                }
+                return;
+            }
             let hint = runtime_complete::type_hint(type_id);
             output.push_str(&format!("  Expects: {}\n", hint));
             let rt = runtime_complete::list_matches(type_id, prefix);

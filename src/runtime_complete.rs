@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::io::BufRead;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 /// Each resource initializes independently on first access — no upfront cost,
 /// no mutex contention, and no risk of poisoned-mutex panics.
 static SIGNALS: LazyLock<Vec<String>> = LazyLock::new(load_signals);
+
+/// Session-level cache for `_call_program` results.
+/// Key: joined argv string (e.g. "ssh -Q cipher").
+/// Value: raw output lines captured from the command.
+/// Git queries are always fresh (CWD-sensitive), but `_call_program` results
+/// for things like cipher lists or rsync options are stable per process.
+static CALL_PROGRAM_CACHE: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PORTS: LazyLock<HashMap<String, u16>> = LazyLock::new(load_ports);
 static USERS: LazyLock<Vec<String>> = LazyLock::new(load_users);
 static GROUPS: LazyLock<Vec<String>> = LazyLock::new(load_groups);
@@ -253,7 +261,11 @@ fn git_query(args: &[&str]) -> Vec<String> {
 }
 
 pub fn git_branches() -> Vec<String> {
-    git_query(&["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+    let mut branches =
+        git_query(&["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"]);
+    // Drop remote HEAD symrefs (e.g. "origin/HEAD")
+    branches.retain(|b| !b.ends_with("/HEAD"));
+    branches
 }
 
 pub fn git_tags() -> Vec<String> {
@@ -271,6 +283,69 @@ pub fn git_tracked_files() -> Vec<String> {
     files.sort();
     files.dedup();
     files
+}
+
+// --- _call_program dynamic runner ---
+
+/// Run an external command (from a Zsh `_call_program` spec) and return its
+/// output lines filtered by prefix.
+///
+/// Results are cached per argv for the lifetime of the process so repeated
+/// `?` presses don't re-exec the same command.  Git-like CWD-sensitive queries
+/// should use the dedicated git helpers instead.
+///
+/// Each output line is split on whitespace and only the first token is kept —
+/// many completions emit `value  # comment` or `value  description` format.
+pub fn call_program_cached(argv: &[String], prefix: &str) -> Vec<String> {
+    if argv.is_empty() {
+        return vec![];
+    }
+    let cache_key = argv.join("\x00");
+
+    // Try cache first
+    if let Ok(cache) = CALL_PROGRAM_CACHE.lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return filter_prefix(cached, prefix);
+    }
+
+    // Run the command with a 3-second timeout via a thread
+    let argv_owned = argv.to_vec();
+    let output = std::process::Command::new(&argv_owned[0])
+        .args(&argv_owned[1..])
+        .output();
+
+    let items: Vec<String> = match output {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let tok = line.split_whitespace().next()?;
+                    if tok.is_empty() { None } else { Some(tok.to_string()) }
+                })
+                .collect()
+        }
+        _ => vec![],
+    };
+
+    // Store in cache
+    if let Ok(mut cache) = CALL_PROGRAM_CACHE.lock() {
+        cache.insert(cache_key, items.clone());
+    }
+
+    filter_prefix(&items, prefix)
+}
+
+fn filter_prefix(items: &[String], prefix: &str) -> Vec<String> {
+    if prefix.is_empty() {
+        return items.to_vec();
+    }
+    let prefix_lower = prefix.to_lowercase();
+    items
+        .iter()
+        .filter(|s| s.starts_with(prefix) || s.to_lowercase().starts_with(&prefix_lower))
+        .cloned()
+        .collect()
 }
 
 // --- Public API ---

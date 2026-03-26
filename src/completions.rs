@@ -595,33 +595,113 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ("podman run", &[], None, &[("-v", ARG_MODE_PATHS), ("--volume", ARG_MODE_PATHS)]),
         ("podman exec", &[], None, &[("-u", ARG_MODE_USERS)]),
         ("podman cp", &[], Some(ARG_MODE_PATHS), &[]),
+        // --- ip (Linux iproute2 — uses _regex_arguments, subcommands are static) ---
+        ("ip", &[], None, &[]),
+        ("ip addr", &[], None, &[]),
+        ("ip link", &[], None, &[]),
+        ("ip route", &[], None, &[]),
+        ("ip neigh", &[], None, &[]),
+        ("ip rule", &[], None, &[]),
+        ("ip monitor", &[], None, &[]),
+        ("ip netns", &[], None, &[]),
+    ];
+
+    // Commands whose rest/positional completions come from an external program.
+    // These mirror `_call_program` in Zsh completion files but bypass the
+    // `_regex_arguments` grammar that prevents static extraction.
+    // Each entry: (command, tag, argv for call_program).
+    // Used for package managers, `ip` object-type completions, etc.
+    type CallProg<'a> = (&'a str, &'a str, &'a [&'a str]);
+    let call_prog_rest: &[CallProg] = &[
+        // Debian/Ubuntu package managers — apt-cache pkgnames is fast and prefix-aware
+        ("apt install",    "package", &["apt-cache", "pkgnames"]),
+        ("apt remove",     "package", &["apt-cache", "pkgnames"]),
+        ("apt purge",      "package", &["apt-cache", "pkgnames"]),
+        ("apt reinstall",  "package", &["apt-cache", "pkgnames"]),
+        ("apt show",       "package", &["apt-cache", "pkgnames"]),
+        ("apt-get install","package", &["apt-cache", "pkgnames"]),
+        ("apt-get remove", "package", &["apt-cache", "pkgnames"]),
+        ("apt-get purge",  "package", &["apt-cache", "pkgnames"]),
+        ("aptitude install","package",&["apt-cache", "pkgnames"]),
+        ("aptitude remove", "package",&["apt-cache", "pkgnames"]),
+        // RPM-based — dnf repoquery is equivalent to apt-cache pkgnames
+        ("dnf install",    "package", &["dnf", "repoquery", "--available", "--qf", "%{name}"]),
+        ("dnf remove",     "package", &["rpm", "-qa", "--qf", "%{name}\n"]),
+        // Arch pacman — packaged in core repos
+        ("pacman -S",      "package", &["pacman", "-Ssq"]),
+        ("pacman -R",      "package", &["pacman", "-Qq"]),
+    ];
+
+    // Commands with static-list rest completions (object types for `ip`, etc.)
+    type StaticRest<'a> = (&'a str, &'a [&'a str]);
+    let static_list_rest: &[StaticRest] = &[
+        ("ip",         &["addr", "link", "route", "neigh", "rule", "monitor", "netns", "maddr",
+                         "mroute", "mrule", "tunnel", "tuntap", "l2tp", "fou", "xfrm",
+                         "vrf", "sr", "nexthop", "macsec"]),
+        ("ip addr",    &["add", "del", "show", "flush", "save", "restore"]),
+        ("ip link",    &["add", "set", "show", "delete", "up", "down"]),
+        ("ip route",   &["add", "del", "show", "flush", "get", "save", "restore"]),
+        ("ip neigh",   &["add", "del", "show", "flush"]),
+        ("ip rule",    &["add", "del", "list", "flush"]),
+        ("ip netns",   &["add", "del", "list", "exec", "identify", "pids", "monitor"]),
     ];
 
     for &(cmd, positional, rest, flags) in overrides {
-        // Skip entirely if the base command has a Zsh completion file —
-        // everything must come from the parser in that case.
         let base_cmd = cmd.split_whitespace().next().unwrap_or(cmd);
-        if cmds_with_completions.contains(base_cmd) {
-            continue;
+        let has_completions = cmds_with_completions.contains(base_cmd);
+
+        // For commands with a Zsh completion file, the parser handles positional
+        // and rest specs. Flag specs are still applied as a supplement because
+        // some completion functions put branch/file specs inside runtime
+        // variables rather than literal _arguments specs. For example, in
+        // `_git-branch`, `-d`/`-D` are defined as boolean flags (no arg spec),
+        // and the subsequent branch names live in `$dependent_deletion_args`
+        // populated by `if (( words[(I)-d] ))` — a variable the parser never
+        // resolves. The parser CAN extract `-b → branches` from `_git-checkout`
+        // because that spec is a literal string inside `_arguments`.
+        if !has_completions {
+            let spec = specs.entry(cmd.to_string()).or_default();
+            for &(pos, arg_type) in positional {
+                let existing = spec.positional.get(&pos).copied();
+                if existing.is_none() || existing == Some(ARG_MODE_PATHS) || existing == Some(0) {
+                    spec.positional.insert(pos, arg_type);
+                }
+            }
+            if let Some(r) = rest
+                && (spec.rest.is_none() || spec.rest == Some(ARG_MODE_PATHS))
+            {
+                spec.rest = Some(r);
+            }
         }
 
+        // Flag specs are always applied (gap-fill only — won't overwrite a
+        // type already detected by the parser).
+        if !flags.is_empty() {
+            let spec = specs.entry(cmd.to_string()).or_default();
+            for &(flag, arg_type) in flags {
+                let existing = spec.flag_args.get(flag).copied();
+                if existing.is_none() || existing == Some(ARG_MODE_PATHS) || existing == Some(0) {
+                    spec.flag_args.insert(flag.to_string(), arg_type);
+                }
+            }
+        }
+    }
+
+    // Apply _call_program rest completions (gap-fill only).
+    for &(cmd, tag, argv_refs) in call_prog_rest {
         let spec = specs.entry(cmd.to_string()).or_default();
-        for &(pos, arg_type) in positional {
-            let existing = spec.positional.get(&pos).copied();
-            if existing.is_none() || existing == Some(ARG_MODE_PATHS) || existing == Some(0) {
-                spec.positional.insert(pos, arg_type);
-            }
+        if spec.rest_call_program.is_none() && spec.rest_static_list.is_none() {
+            let argv: Vec<String> = argv_refs.iter().map(|s| s.to_string()).collect();
+            spec.rest_call_program = Some((tag.to_string(), argv));
         }
-        if let Some(r) = rest
-            && (spec.rest.is_none() || spec.rest == Some(ARG_MODE_PATHS))
-        {
-            spec.rest = Some(r);
-        }
-        for &(flag, arg_type) in flags {
-            let existing = spec.flag_args.get(flag).copied();
-            if existing.is_none() || existing == Some(ARG_MODE_PATHS) || existing == Some(0) {
-                spec.flag_args.insert(flag.to_string(), arg_type);
-            }
+    }
+
+    // Apply static-list rest completions (gap-fill only).
+    for &(cmd, items_refs) in static_list_rest {
+        let spec = specs.entry(cmd.to_string()).or_default();
+        if spec.rest_static_list.is_none() && spec.rest_call_program.is_none() {
+            let items: Vec<String> = items_refs.iter().map(|s| s.to_string()).collect();
+            spec.rest_static_list = Some(items);
         }
     }
 }
@@ -815,6 +895,7 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
 
     // Git-specific (checked before generic resources to avoid false positives)
     if action.contains("__git_branch_names")
+        || action.contains("__git_remote_branch_names")
         || action.contains("__git_heads")
         || action.contains("_git_branch")
     {
@@ -838,8 +919,10 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
     if action.contains("__git_other_files") {
         return Some(trie::ARG_MODE_PATHS);
     }
-    // Commits, tree-ishs — resolve as branches (closest approximation).
+    // Commits, tree-ishs, revisions — resolve as branches (closest approximation).
     if action.contains("__git_commits")
+        || action.contains("__git_committishs")
+        || action.contains("__git_revisions")
         || action.contains("__git_tree_ish")
         || action.contains("__git_recent")
     {
@@ -878,16 +961,466 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
     None
 }
 
+/// The resolved completion for a single Zsh case-state arm.
+#[derive(Debug, Clone)]
+enum StateAction {
+    /// A typed arg mode (e.g. ARG_MODE_HOSTS for _ssh_hosts).
+    ArgType(u8),
+    /// Run an external command and use its output as completions.
+    CallProgram(String, Vec<String>),
+    /// A fixed enumeration of literal completion items.
+    StaticList(Vec<String>),
+}
+
+/// Parse `case $state in` / `case "$lstate" in` blocks from a Zsh completion
+/// function body and return a map of state-name → completion action.
+///
+/// Each case arm is scanned with a priority order:
+///   1. `_call_program tag cmd ...` → CallProgram
+///   2. `compadd - items` / `_values 'desc' items` → StaticList
+///   3. Known function names (`_ssh_hosts`, `__git_branch_names`, …) → ArgType
+///   4. `_files` / `_directories` → ArgType(PATHS / DIRS_ONLY)
+///
+/// Only the first recognisable completion in each arm is recorded.
+fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
+    let mut result = HashMap::new();
+
+    // Find `case $state in` or `case "$lstate" in` or `case "${state}" in` etc.
+    let case_pat = ["case $state in", "case \"$state\" in",
+                    "case $lstate in", "case \"$lstate\" in",
+                    "case ${state} in", "case \"${state}\" in"];
+    let case_start = case_pat.iter()
+        .filter_map(|p| body.find(p).map(|pos| pos + p.len()))
+        .min();
+
+    let Some(case_body_start) = case_start else { return result; };
+
+    // Find `esac` that closes this case block (simplified: first one after case_body_start)
+    let case_body_end = body[case_body_start..].find("\nesac")
+        .map(|p| case_body_start + p)
+        .unwrap_or(body.len());
+
+    let case_body = &body[case_body_start..case_body_end];
+
+    // Split on arm terminators `;;` to get individual arms
+    for arm_text in case_body.split(";;") {
+        let arm = arm_text.trim();
+        if arm.is_empty() {
+            continue;
+        }
+
+        // Extract arm name: first non-empty line that matches `(name)` or `name)`
+        let name = arm.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .and_then(|l| {
+                // Forms: `(name)`, `name)`, `(name1|name2)` (take first)
+                let stripped = l.trim_start_matches('(');
+                let end = stripped.find(')')?;
+                let raw = &stripped[..end];
+                // Take the first alternative in `name1|name2`
+                Some(raw.split('|').next()?.trim().to_string())
+            });
+
+        let Some(name) = name else { continue };
+        if name.is_empty() || name == "*" {
+            continue;
+        }
+
+        // Scan the arm body for a recognisable completion
+        let action = extract_state_arm_action(arm);
+        if let Some(action) = action {
+            result.entry(name).or_insert(action);
+        }
+    }
+
+    result
+}
+
+/// Given the raw text of a `case` arm, return the first completion action found.
+fn extract_state_arm_action(arm: &str) -> Option<StateAction> {
+    // Priority 1: _call_program
+    if arm.contains("_call_program")
+        && let Some((tag, argv)) = parse_call_program(arm)
+    {
+        return Some(StateAction::CallProgram(tag, argv));
+    }
+
+    // Priority 2: static list via compadd / _values
+    if arm.contains("compadd") || arm.contains("_values") {
+        // Find the compadd / _values call — look for the line that contains it
+        for line in arm.lines() {
+            let line = line.trim();
+            if (line.contains("compadd") || line.starts_with("_values"))
+                && let Some(items) = action_to_static_list(line)
+                && !items.is_empty()
+            {
+                return Some(StateAction::StaticList(items));
+            }
+        }
+    }
+
+    // Priority 3: known function names → typed arg mode
+    if let Some(t) = action_to_arg_type(arm) {
+        return Some(StateAction::ArgType(t));
+    }
+
+    // Priority 4: _files / _directories shorthand
+    if arm.contains("_files") {
+        return Some(StateAction::ArgType(trie::ARG_MODE_PATHS));
+    }
+    if arm.contains("_directories") {
+        return Some(StateAction::ArgType(trie::ARG_MODE_DIRS_ONLY));
+    }
+    if arm.contains("_normal") || arm.contains("_command_names") {
+        return Some(StateAction::ArgType(trie::ARG_MODE_EXECS_ONLY));
+    }
+
+    None
+}
+
+/// Extract context-sensitive completion rules from the body of a Zsh function.
+///
+/// Scans for patterns like:
+/// ```zsh
+/// if [[ -n ${opt_args[(I)-b|-B|--orphan]} ]]; then
+///     _alternative branches::__git_branch_names
+/// ```
+/// and builds `ContextRule` entries: "when any of [-b, -B, --orphan] are in
+/// the current words, override the completion type with GIT_BRANCHES".
+///
+/// Also handles `if (( $+opt_args[-f] )); then` (single flag, present test).
+pub fn extract_state_context_rules(body: &str) -> Vec<trie::ContextRule> {
+    let mut rules = Vec::new();
+    let lines: Vec<&str> = body.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // Match patterns:
+        //   if [[ -n ${opt_args[(I)-b|-B|--flag]} ]]
+        //   if (( $+opt_args[-f] ))
+        let flags = if line.contains("opt_args[(I)") {
+            extract_opt_args_flags(line)
+        } else if line.contains("$+opt_args[") || line.contains("$+opt_args [") {
+            extract_plus_opt_args_flag(line)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if flags.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Skip negated conditions: -z, == 0, != 1, < 1, <= 0
+        if line.contains("-z ") || line.contains("== 0") || line.contains("!= 1")
+            || line.contains("< 1") || line.contains("<= 0")
+        {
+            i += 1;
+            continue;
+        }
+
+        // Collect the "then" block (stop at elif/else/fi at the same nesting depth)
+        i += 1;
+        let then_start = i;
+        let mut depth = 0usize;
+        while i < lines.len() {
+            let l = lines[i].trim();
+            // Nesting: `if`/`case` open a new level, `fi`/`esac` close
+            if l.starts_with("if ") || l == "if" || l.starts_with("case ") {
+                depth += 1;
+            }
+            if l == "fi" || l == "esac" {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            // At depth 0, elif/else ends the then-block
+            if depth == 0 && (l.starts_with("elif ") || l == "else") {
+                break;
+            }
+            i += 1;
+        }
+
+        let then_block = lines[then_start..i].join("\n");
+        if let Some(StateAction::ArgType(t)) = extract_state_arm_action(&then_block) {
+            rules.push(trie::ContextRule {
+                trigger_flags: flags,
+                override_type: t,
+            });
+        }
+        // Don't increment i here — we want to process the elif/else too
+    }
+
+    rules
+}
+
+/// Parse `${opt_args[(I)-a|-b|--long]}` flags from a line.
+fn extract_opt_args_flags(line: &str) -> Vec<String> {
+    let marker = "opt_args[(I)";
+    let Some(pos) = line.find(marker) else {
+        return vec![];
+    };
+    let after = &line[pos + marker.len()..];
+    let end = after.find("]}").unwrap_or(after.find(']').unwrap_or(0));
+    if end == 0 {
+        return vec![];
+    }
+    after[..end]
+        .split('|')
+        .map(str::trim)
+        .filter(|f| f.starts_with('-'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse `$+opt_args[-f]` single-flag from a line.
+fn extract_plus_opt_args_flag(line: &str) -> Vec<String> {
+    let marker = "$+opt_args[";
+    let Some(pos) = line.find(marker) else {
+        return vec![];
+    };
+    let after = &line[pos + marker.len()..];
+    let end = after.find(']').unwrap_or(0);
+    if end == 0 {
+        return vec![];
+    }
+    let flag = after[..end].trim();
+    if flag.starts_with('-') {
+        vec![flag.to_string()]
+    } else {
+        vec![]
+    }
+}
+
+/// Split a shell command string into tokens, respecting single- and double-quoted
+/// strings so that e.g. `compadd -M 'r:|.=* r:|=*'` yields `["-M", "r:|.=* r:|=*"]`
+/// rather than splitting the quoted matcher spec on the interior space.
+fn shell_tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            chars.next();
+        } else if c == '\'' {
+            chars.next(); // skip opening quote
+            while let Some(&ch) = chars.peek() {
+                if ch == '\'' {
+                    chars.next();
+                    break;
+                }
+                current.push(ch);
+                chars.next();
+            }
+        } else if c == '"' {
+            chars.next();
+            while let Some(&ch) = chars.peek() {
+                if ch == '"' {
+                    chars.next();
+                    break;
+                }
+                current.push(ch);
+                chars.next();
+            }
+        } else {
+            current.push(c);
+            chars.next();
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Extract a static list of literal completion items from a Zsh action string.
+///
+/// Recognises:
+/// - `compadd - item1 item2 ...`
+/// - `compadd item1 item2 ...` (no `-` separator)
+/// - `_sequence compadd - item1 item2 ...` (the `_sequence` wrapper is ignored)
+/// - `_wanted tag expl desc compadd - item1 item2 ...`
+/// - `_values 'desc' item1 item2 ...`
+///
+/// Returns `None` if the action does not produce a static list.
+pub fn action_to_static_list(action: &str) -> Option<Vec<String>> {
+    let action = action.trim();
+
+    // Strip _sequence / _wanted prefix wrappers to get at the compadd
+    let inner = if let Some(pos) = action.find("compadd") {
+        &action[pos..]
+    } else if action.starts_with("_values") {
+        action
+    } else {
+        return None;
+    };
+
+    if inner.starts_with("compadd") {
+        // compadd [opts] - item1 item2 ...
+        // Skip flags/options (words starting with -), then collect items after
+        // the `--` or `-` separator (or directly after compadd if no separator).
+        //
+        // Quote-aware tokenizer: respect single-quoted strings so that e.g.
+        // `-M 'r:|.=* r:|=*'` is treated as one token, not two.
+        let tokens = shell_tokenize(inner);
+        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        // tokens[0] == "compadd"
+        let mut items = Vec::new();
+        let mut after_sep = false;
+        let mut array_mode = false;
+        let mut i = 1usize;
+        while i < tokens.len() {
+            let t = tokens[i];
+            // The `-` or `--` separator marks the end of compadd options.
+            // Only honour the first occurrence; after `after_sep` is set,
+            // a bare `-` is a literal completion item (e.g. `compadd - + -`).
+            if !after_sep && (t == "-" || t == "--") {
+                after_sep = true;
+                i += 1;
+                continue;
+            }
+            // Skip compadd option flags and their arguments.
+            if !after_sep && t.starts_with('-') {
+                // `-a` / `-k`: array mode — items after separator are array
+                // names, not literal strings.  We can't expand arrays at parse
+                // time, so bail out entirely.
+                if t == "-a" || t == "-k" {
+                    array_mode = true;
+                }
+                i += 1;
+                // Flags that consume the next token as a value:
+                //   -J group  -V group  -X expl  -x msg  -M matcher
+                //   -P prefix -S suffix -p hpfx  -s hsfx -I sep
+                //   -W fpfx   -F array  -r rchars -R rfunc
+                //   -D array  -O array  -A array  -E num  -d array
+                if matches!(
+                    t,
+                    "-J" | "-V" | "-X" | "-x" | "-M"
+                    | "-P" | "-S" | "-p" | "-s" | "-I"
+                    | "-W" | "-F" | "-r" | "-R"
+                    | "-D" | "-O" | "-A" | "-E" | "-d"
+                ) {
+                    i += 1; // skip option argument
+                }
+                continue;
+            }
+            // Shell operators end the compadd argument list
+            if matches!(t, "&&" | "||" | ";" | "&" | "|") {
+                break;
+            }
+            // In array mode, words after the separator are array names, not items.
+            if array_mode {
+                i += 1;
+                continue;
+            }
+            // Skip shell expansions (items starting with $, {, or () )
+            if t.starts_with('$') || t.starts_with('{') || t.starts_with('(') {
+                i += 1;
+                continue;
+            }
+            // Valid completion item
+            let item = t.trim_matches('\'').trim_matches('"');
+            if !item.is_empty() && !item.starts_with('$') {
+                items.push(item.to_string());
+            }
+            i += 1;
+        }
+        if items.is_empty() {
+            return None;
+        }
+        return Some(items);
+    }
+
+    if inner.starts_with("_values") {
+        // _values 'description' item1 item2 ...
+        // or _values -s sep 'description' item1 item2 ...
+        let tokens: Vec<&str> = inner.split_whitespace().collect();
+        let mut items = Vec::new();
+        let mut i = 1usize;
+        // Skip _values options (-s, -w, -C, -S, -O)
+        let mut desc_done = false;
+        while i < tokens.len() {
+            let t = tokens[i];
+            if t.starts_with('-') {
+                i += 1;
+                // -s and -O take a separator/variable argument
+                if t == "-s" || t == "-O" {
+                    i += 1;
+                }
+                continue;
+            }
+            // First non-flag token is the description (possibly multi-word, quoted).
+            // Consume tokens until we find the closing quote.
+            if !desc_done && (t.starts_with('\'') || t.starts_with('"')) {
+                let quote = if t.starts_with('\'') { '\'' } else { '"' };
+                // If the opening token is also the closing token, done in one step
+                let already_closed = t.len() > 1 && t.ends_with(quote);
+                i += 1;
+                if !already_closed {
+                    // Consume more tokens until the closing quote
+                    while i < tokens.len() && !tokens[i].ends_with(quote) {
+                        i += 1;
+                    }
+                    if i < tokens.len() {
+                        i += 1; // skip the closing token
+                    }
+                }
+                desc_done = true;
+                continue;
+            }
+            // A bare unquoted first token is also the description — skip it
+            if !desc_done {
+                i += 1;
+                desc_done = true;
+                continue;
+            }
+            // Shell operators end the argument list
+            if matches!(t, "&&" | "||" | ";" | "&" | "|") {
+                break;
+            }
+            // Collect remaining items (may have 'item:description' form)
+            let item = t.split(':').next().unwrap_or(t);
+            let item = item.trim_matches('\'').trim_matches('"');
+            if !item.is_empty() && !item.starts_with('$') {
+                items.push(item.to_string());
+            }
+            i += 1;
+        }
+        if items.is_empty() {
+            return None;
+        }
+        return Some(items);
+    }
+
+    None
+}
+
 /// Extract argument specs from subcommand function bodies within a completion file.
 ///
 /// Finds functions like `_git-add () { ... }` and parses each body for
 /// `_arguments` specs. Returns a map of "cmd subcmd" → ArgSpec.
 ///
-/// Uses a simple approach: split the file at function definition lines
-/// and parse the content between each pair.
+/// Also performs a helper-function cross-reference pass: functions like
+/// `__git_setup_log_options` / `__git_setup_revision_options` populate spec
+/// arrays (`log_options`, `revision_options`) that are passed as `$varname`
+/// to `_arguments` in subcommand functions.  We parse those helpers and merge
+/// their specs into each subcommand that calls them.
 fn extract_subcommand_arg_specs(cmd: &str, content: &str) -> HashMap<String, ArgSpec> {
     let mut specs = HashMap::new();
     let prefix = format!("_{}-", cmd);
+
+    // --- Pre-pass: build a map of helper function name → ArgSpec ---
+    // Helpers are `__<cmd>_*` functions whose names suggest they populate spec
+    // arrays (e.g. `__git_setup_log_options`, `__git_setup_diff_options`).
+    let helper_specs = extract_helper_function_specs(cmd, content);
 
     // Find all function definition positions and their subcmd names
     let mut funcs: Vec<(usize, String)> = Vec::new();
@@ -925,7 +1458,19 @@ fn extract_subcommand_arg_specs(cmd: &str, content: &str) -> HashMap<String, Arg
         };
 
         let body: String = lines[*start_line..end_line].join("\n");
-        let spec = parse_arg_spec(&body);
+        let mut spec = parse_arg_spec(&body);
+
+        // Merge specs from any helper functions called in this body
+        if !helper_specs.is_empty() {
+            for body_line in body.lines() {
+                let t = body_line.trim();
+                // A bare helper call: just the function name on a line, no args
+                if let Some(helper_spec) = helper_specs.get(t) {
+                    spec.merge(helper_spec);
+                }
+            }
+        }
+
         if !spec.is_empty() {
             let key = format!("{} {}", cmd, subcmd);
             specs.insert(key, spec);
@@ -933,6 +1478,65 @@ fn extract_subcommand_arg_specs(cmd: &str, content: &str) -> HashMap<String, Arg
     }
 
     specs
+}
+
+/// Scan the completion file for helper functions that populate spec arrays.
+///
+/// Targets functions matching `__<cmd>_setup_*` or `__<cmd>_*_options` —
+/// the naming convention used in `_git` for `__git_setup_log_options`,
+/// `__git_setup_diff_options`, `__git_setup_revision_options`, etc.
+///
+/// Returns a map of `function_name → ArgSpec` parsed from the function body.
+fn extract_helper_function_specs(cmd: &str, content: &str) -> HashMap<String, ArgSpec> {
+    let mut result = HashMap::new();
+    // Match `__<cmd>_setup_*` and `__<cmd>_*_options` naming conventions
+    let setup_prefix = format!("__{}_setup_", cmd);
+    let options_suffix = "_options";
+
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+
+    // Collect (start_line_idx, function_name) for matching helpers
+    let mut helpers: Vec<(usize, String)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // Function definition lines look like:
+        //   __git_setup_log_options () {
+        // or preceded by a guard:
+        //   (( $+functions[__git_setup_log_options] )) ||
+        //   __git_setup_log_options () {
+        let name = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches("()");
+        if (name.starts_with(&setup_prefix)
+            || (name.starts_with(&format!("__{}_", cmd)) && name.ends_with(options_suffix)))
+            && (trimmed.contains('(') || trimmed.ends_with('{'))
+        {
+            helpers.push((i, name.to_string()));
+        }
+    }
+
+    if helpers.is_empty() {
+        return result;
+    }
+
+    // Parse each helper's body (lines from its definition to the next helper or EOF)
+    for (idx, (start, name)) in helpers.iter().enumerate() {
+        let end = if idx + 1 < helpers.len() {
+            helpers[idx + 1].0
+        } else {
+            n
+        };
+        let body = lines[*start..end].join("\n");
+        let spec = parse_arg_spec(&body);
+        if !spec.is_empty() {
+            result.insert(name.clone(), spec);
+        }
+    }
+
+    result
 }
 
 /// Describes where a `->state` reference appears in an `_arguments` spec.
@@ -957,23 +1561,32 @@ fn extract_state_refs(content: &str) -> Vec<(StateRefKind, String)> {
             continue;
         }
 
-        // Extract single-quoted strings containing ->
+        // Extract single-quoted and double-quoted strings containing ->
         let mut chars = trimmed.chars().peekable();
         while let Some(&ch) = chars.peek() {
             if ch == '\'' {
                 chars.next();
                 let mut s = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c == '\'' {
-                        chars.next();
-                        break;
-                    }
+                    if c == '\'' { chars.next(); break; }
                     s.push(c);
                     chars.next();
                 }
-                if s.contains("->")
-                    && let Some(r) = parse_state_ref(&s)
-                {
+                if s.contains("->") && let Some(r) = parse_state_ref(&s) {
+                    refs.push(r);
+                }
+            } else if ch == '"' {
+                chars.next();
+                let mut s = String::new();
+                let mut escaped = false;
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if escaped { s.push(c); escaped = false; continue; }
+                    if c == '\\' { escaped = true; continue; }
+                    if c == '"' { break; }
+                    s.push(c);
+                }
+                if s.contains("->") && let Some(r) = parse_state_ref(&s) {
                     refs.push(r);
                 }
             } else {
@@ -1296,6 +1909,259 @@ fn scan_quoted_action_specs(
     }
 }
 
+/// Extract flag names from `words[(I)flag]` patterns in a Zsh condition string.
+///
+/// Handles all common variants:
+///   `words[(I)-d]`                 → `["-d"]`
+///   `words[(I)-d] || words[(I)-D]` → `["-d", "-D"]`
+///   `words[(I)(-d|-D)]`            → `["-d", "-D"]`
+///   `words[(I)(-r|--remotes)]`     → `["-r", "--remotes"]`
+fn extract_words_flags(condition: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    let mut s = condition;
+    let pattern = "words[(I)";
+    while let Some(pos) = s.find(pattern) {
+        let after = &s[pos + pattern.len()..];
+        if let Some(close) = after.find(']') {
+            let inner = &after[..close];
+            // Strip enclosing parens: (-d|-D) → -d|-D
+            let inner = inner.trim_matches('(').trim_matches(')');
+            for part in inner.split('|') {
+                let flag = part.trim().trim_matches('(').trim_matches(')');
+                if flag.starts_with('-') {
+                    // Strip trailing = or + that indicate the flag takes a value
+                    let flag = flag.trim_end_matches('=').trim_end_matches('+');
+                    if !flag.is_empty() {
+                        flags.push(flag.to_string());
+                    }
+                }
+            }
+            s = &after[close..];
+        } else {
+            break;
+        }
+    }
+    flags
+}
+
+/// Extract arg type associations from conditional variable blocks.
+///
+/// Many complex Zsh completion functions (notably `_git-branch`) place their
+/// `_arguments` specs inside variables that are conditionally assigned based on
+/// which flags are already in the command line, e.g.:
+///
+/// ```zsh
+/// if (( words[(I)-d] || words[(I)-D] )); then
+///   dependent_deletion_args=(
+///     '*: :__git_ignore_line_inside_arguments __git_branch_names'
+///   )
+/// fi
+/// # ... later ...
+/// _arguments ... $dependent_deletion_args
+/// ```
+///
+/// Zsh evaluates this dynamically at completion time. We replicate the intent
+/// statically: when flag X appears in a `words[(I)X]` condition and the block
+/// body contains a positional spec with a known action, record that association
+/// in `spec.flag_args` (gap-fill only).
+/// Scan a Zsh completion function body for array variable declarations and their
+/// spec strings.  Handles patterns like:
+///
+/// ```zsh
+/// declare -a opts
+/// local -a opts
+/// opts=( '-f+[file]:file:_files' '--flag=:label:_users' )
+/// opts+=( '...' )
+/// if (( words[(I)-d] )); then
+///   opts+=( '*: :__git_branch_names' )
+/// fi
+/// _arguments ... "$opts[@]"
+/// ```
+///
+/// Returns a map from array variable name to all spec strings collected across all
+/// branches (conservative union — we include specs from every `if`/`else` branch).
+fn extract_array_specs(content: &str) -> HashMap<String, Vec<String>> {
+    let mut arrays: HashMap<String, Vec<String>> = HashMap::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // First pass: find all declared array variables (`declare -a`, `local -a`, `typeset -a`)
+    let mut tracked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in &lines {
+        let t = line.trim();
+        for kw in &["declare -a ", "local -a ", "typeset -a "] {
+            if let Some(rest) = t.strip_prefix(kw) {
+                // May be `declare -a foo bar` or `declare -a foo`
+                for name in rest.split_whitespace() {
+                    let name = name.trim_end_matches('=');
+                    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        tracked.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if tracked.is_empty() {
+        return arrays;
+    }
+
+    // Second pass: scan all assignment lines `varname=(...)` and `varname+=(...)`
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // Match `varname=(` or `varname+=(`
+        for var in &tracked {
+            let assign_pat = format!("{var}=(");
+            let append_pat = format!("{var}+=(");
+            let is_assign = line.starts_with(&assign_pat) || line == format!("{var}=").as_str();
+            let is_append = line.starts_with(&append_pat);
+            if !is_assign && !is_append {
+                continue;
+            }
+
+            // Collect lines until closing `)` at column 0 (or line-end `)`)
+            let mut collected = String::new();
+            // Start from first `(` in the line
+            let paren_start = line.find('(').unwrap_or(line.len());
+            collected.push_str(&line[paren_start..]);
+
+            // Count parens to find the end of the assignment
+            let mut depth: i32 = 0;
+            let mut j = i;
+            'outer: loop {
+                let chunk = if j == i { &line[paren_start..] } else { lines[j].trim() };
+                for ch in chunk.chars() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth <= 0 {
+                                break 'outer;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+                if j >= lines.len() { break; }
+                if j > i {
+                    collected.push('\n');
+                    collected.push_str(lines[j].trim());
+                }
+            }
+
+            // Extract spec strings from the collected block
+            let entry = arrays.entry(var.clone()).or_default();
+            for spec_line in collected.lines() {
+                for spec_str in extract_argument_specs(spec_line) {
+                    if !entry.contains(&spec_str) {
+                        entry.push(spec_str);
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    arrays
+}
+
+fn extract_conditional_variable_specs(content: &str, spec: &mut ArgSpec) {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let mut i = 0;
+
+    while i < n {
+        let line = lines[i].trim();
+
+        // Match `if` lines that inspect `words[(I)FLAG]`
+        if (line.starts_with("if ") || line.starts_with("if("))
+            && line.contains("words[(I)")
+        {
+            let all_flags = extract_words_flags(line);
+            if all_flags.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            // Skip negated conditions: `words[(I)FLAG] == 0` means the flag is
+            // *absent*.  Associating the flag with the block's arg type would be
+            // wrong — the block fires when the flag is NOT present.
+            if line.contains("== 0")
+                || line.contains("!= 1")
+                || line.contains("< 1")
+                || line.contains("<= 0")
+            {
+                i += 1;
+                continue;
+            }
+
+            // For AND conditions (&&), be conservative: only use flags from OR
+            // clusters. If the condition is `words[(I)-a] && words[(I)-b]`, we
+            // can't know which flag is "responsible" for the completion type, so
+            // we take only the first flag.
+            // For OR conditions (||), all flags map to the same type.
+            let flags: Vec<String> = if line.contains("&&") && !line.contains("||") {
+                // Pure AND: take only the first flag as the trigger
+                all_flags.into_iter().take(1).collect()
+            } else {
+                // OR or single flag: all flags trigger the same type
+                all_flags
+            };
+
+            // Walk forward to the matching `fi`, respecting nested `if`/`fi`
+            let body_start = i + 1;
+            let mut depth: i32 = 1;
+            let mut j = body_start;
+            while j < n && depth > 0 {
+                let l = lines[j].trim();
+                if l.starts_with("if ") || l == "if" || l.starts_with("if(") {
+                    depth += 1;
+                } else if l == "fi"
+                    || l.starts_with("fi;")
+                    || l.starts_with("fi ")
+                    || l.starts_with("fi\t")
+                {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            let body_end = j;
+
+            // Scan the block body (including nested blocks) for quoted spec
+            // strings with known actions.  Skip specs that start with `-`
+            // (those are flag definitions, not positional arg specs).
+            let mut found_type: Option<u8> = None;
+            'scan: for line in &lines[body_start..body_end] {
+                for spec_str in extract_argument_specs(line.trim()) {
+                    let s = spec_str.trim();
+                    if s.starts_with('-') {
+                        continue;
+                    }
+                    if let Some(action) = find_action_in_spec(s)
+                        && let Some(arg_type) = action_to_arg_type(&action)
+                    {
+                        found_type = Some(arg_type);
+                        break 'scan;
+                    }
+                }
+            }
+
+            if let Some(arg_type) = found_type {
+                for flag in &flags {
+                    spec.flag_args.entry(flag.clone()).or_insert(arg_type);
+                }
+            }
+
+            i = body_end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Parse per-position and per-flag argument specs from a completion file.
 ///
 /// Extracts from `_arguments` specs:
@@ -1305,6 +2171,10 @@ fn scan_quoted_action_specs(
 /// - `'--flag=:desc:_files'` → flag --flag takes a file argument
 fn parse_arg_spec(content: &str) -> ArgSpec {
     let mut spec = ArgSpec::default();
+
+    // Pre-scan: build a map of array variable name → spec strings collected from
+    // all assignment sites (including conditional branches).
+    let array_specs = extract_array_specs(content);
 
     for line in content.lines() {
         let trimmed = line.trim().trim_end_matches('\\').trim();
@@ -1337,20 +2207,81 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                 }
             }
         }
+
+        // For `_arguments` calls that reference array variables ($opts[@], $args[@], etc.),
+        // process the specs collected from those arrays.
+        if trimmed.contains("_arguments") && trimmed.contains("$") {
+            for (var, var_specs) in &array_specs {
+                // Check if this _arguments line references $var or "$var[@]" etc.
+                if trimmed.contains(&format!("${var}"))
+                    || trimmed.contains(&format!("\"${var}"))
+                {
+                    for spec_str in var_specs {
+                        process_spec_string(spec_str, &mut spec);
+                    }
+                }
+            }
+        }
     }
+
+    // Extract flag→arg-type associations from conditional variable blocks, e.g.
+    //   if (( words[(I)-d] )); then ...'*: :__git_branch_names'... fi
+    // This handles completion functions that build _arguments specs dynamically
+    // rather than embedding them as literals.
+    extract_conditional_variable_specs(content, &mut spec);
 
     // Resolve ->state references: connect _arguments `->statename` specs
     // to the types detected in `case $state` handler bodies.
+    // `extract_state_handlers` handles ArgType, CallProgram, and StaticList.
+    // `extract_state_types` is kept as a fallback for plain u8 types.
     let state_refs = extract_state_refs(content);
     if !state_refs.is_empty() {
-        let state_types = extract_state_types(content);
+        let state_actions = extract_state_handlers(content);
+        let state_types = if state_actions.is_empty() {
+            extract_state_types(content)
+        } else {
+            HashMap::new()
+        };
+
         for (kind, state_name) in state_refs {
-            if let Some(&arg_type) = state_types.get(&state_name) {
+            // Try the richer handler first
+            if let Some(action) = state_actions.get(&state_name) {
+                match (kind, action.clone()) {
+                    (StateRefKind::Rest, StateAction::ArgType(t)) => {
+                        if spec.rest.is_none() { spec.rest = Some(t); }
+                    }
+                    (StateRefKind::Rest, StateAction::CallProgram(tag, argv)) => {
+                        spec.rest_call_program.get_or_insert((tag, argv));
+                    }
+                    (StateRefKind::Rest, StateAction::StaticList(items)) => {
+                        spec.rest_static_list.get_or_insert(items);
+                    }
+                    (StateRefKind::Positional(pos), StateAction::ArgType(t)) => {
+                        spec.positional.entry(pos).or_insert(t);
+                    }
+                    (StateRefKind::Positional(_), StateAction::CallProgram(tag, argv)) => {
+                        // No per-position call_program field; fall through to rest
+                        spec.rest_call_program.get_or_insert((tag, argv));
+                    }
+                    (StateRefKind::Positional(_), StateAction::StaticList(items)) => {
+                        spec.rest_static_list.get_or_insert(items);
+                    }
+                    (StateRefKind::Flag(flag), StateAction::ArgType(t)) => {
+                        spec.flag_args.entry(flag).or_insert(t);
+                    }
+                    (StateRefKind::Flag(flag), StateAction::CallProgram(tag, argv)) => {
+                        spec.flag_call_programs.entry(flag)
+                            .or_insert_with(|| (tag, argv));
+                    }
+                    (StateRefKind::Flag(flag), StateAction::StaticList(items)) => {
+                        spec.flag_static_lists.entry(flag).or_insert(items);
+                    }
+                }
+            } else if let Some(&arg_type) = state_types.get(&state_name) {
+                // Fallback: plain u8 type from detect_type_in_block
                 match kind {
                     StateRefKind::Rest => {
-                        if spec.rest.is_none() {
-                            spec.rest = Some(arg_type);
-                        }
+                        if spec.rest.is_none() { spec.rest = Some(arg_type); }
                     }
                     StateRefKind::Positional(pos) => {
                         spec.positional.entry(pos).or_insert(arg_type);
@@ -1360,6 +2291,21 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                     }
                 }
             }
+        }
+    }
+
+    // Extract context-sensitive rules from opt_args[(I)...] conditions.
+    // These are evaluated at completion time by checking which flags the user
+    // has already typed on the current command line.
+    let context_rules = extract_state_context_rules(content);
+    for rule in context_rules {
+        let already_covered = spec.context_rules.iter().any(|r| {
+            r.trigger_flags
+                .iter()
+                .any(|f| rule.trigger_flags.contains(f))
+        });
+        if !already_covered {
+            spec.context_rules.push(rule);
         }
     }
 
@@ -1382,30 +2328,58 @@ fn detect_dominant_action(content: &str) -> Option<u8> {
 }
 
 /// Extract argument spec strings from a line.
-/// Looks for single-quoted strings that contain colons (argument specs).
+///
+/// Handles three forms:
+/// 1. Single-quoted:  `'specifier:desc:action'`
+/// 2. Double-quoted:  `"($vars): :action"` — common in `_git-branch` etc.; the
+///    `$var` expansions in exclusion lists don't affect action extraction since
+///    the action is always the last colon-delimited field.
+/// 3. Brace-expanded: `{-f,--flag=}'[desc]:label:_action'`
 fn extract_argument_specs(line: &str) -> Vec<String> {
     let mut specs = Vec::new();
     let mut chars = line.chars().peekable();
 
     while let Some(&ch) = chars.peek() {
-        if ch == '\'' {
-            chars.next(); // consume opening quote
-            let mut s = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == '\'' {
+        match ch {
+            '\'' => {
+                chars.next(); // consume opening quote
+                let mut s = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == '\'' {
+                        chars.next();
+                        break;
+                    }
+                    s.push(c);
                     chars.next();
-                    break;
                 }
-                s.push(c);
+                if s.contains(':') && has_known_action(&s) {
+                    specs.push(s);
+                }
+            }
+            '"' => {
+                chars.next(); // consume opening quote
+                let mut s = String::new();
+                let mut escaped = false;
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if escaped {
+                        s.push(c);
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        break;
+                    } else {
+                        s.push(c);
+                    }
+                }
+                if s.contains(':') && has_known_action(&s) {
+                    specs.push(s);
+                }
+            }
+            _ => {
                 chars.next();
             }
-            // Include strings that look like argument specs (contain colons
-            // and a completion action we recognize)
-            if s.contains(':') && has_known_action(&s) {
-                specs.push(s);
-            }
-        } else {
-            chars.next();
         }
     }
 
@@ -1510,6 +2484,151 @@ fn extract_brace_expanded_specs(line: &str) -> Vec<String> {
     result
 }
 
+/// Parse a `_call_program tag cmd [args...]` action string.
+/// Returns `(tag, argv)` where argv is the command to run.
+///
+/// Handles two forms:
+/// - Direct:   `_call_program ciphers ssh -Q cipher`
+/// - Embedded: `compadd - $(_call_program ciphers ssh -Q cipher)`
+fn parse_call_program(action: &str) -> Option<(String, Vec<String>)> {
+    // Locate `_call_program` anywhere in the action string
+    let cp_pos = action.find("_call_program")?;
+    let after = &action[cp_pos + "_call_program".len()..];
+
+    // If embedded in $(...), stop at the closing paren; otherwise take the whole tail
+    let end = after.find(')').unwrap_or(after.len());
+    let inner = &after[..end];
+
+    let mut parts = inner.split_whitespace();
+    let tag = parts.next()?.to_string();
+    let argv: Vec<String> = parts
+        .take_while(|s| !s.starts_with('$') && !s.starts_with('{'))
+        .map(|s| s.to_string())
+        .collect();
+    if argv.is_empty() {
+        return None;
+    }
+    Some((tag, argv))
+}
+
+/// Store a call_program association in `spec` based on the spec string prefix.
+fn store_call_program(spec_str: &str, tag: String, argv: Vec<String>, spec: &mut ArgSpec) {
+    let s = spec_str.trim();
+    let entry = (tag, argv);
+
+    // Rest or bare positional
+    if s.starts_with('*') {
+        let after_star = s.get(1..).unwrap_or("").trim_start();
+        if !after_star.starts_with('-') {
+            spec.rest_call_program.get_or_insert(entry);
+            return;
+        }
+        // *--flag= : repeatable flag with call_program
+        let flags = extract_flags_from_spec(after_star);
+        for flag in flags {
+            spec.flag_call_programs.entry(flag).or_insert_with(|| entry.clone());
+        }
+        return;
+    }
+    if s.starts_with(':') {
+        spec.rest_call_program.get_or_insert(entry);
+        return;
+    }
+
+    // Exclusion-group prefix: (excl)rest_or_flag
+    if s.starts_with('(') && let Some(close) = s.find(')') {
+        let after = s[close + 1..].trim_start();
+        if after.starts_with('*') {
+            let after_star = after.get(1..).unwrap_or("").trim_start();
+            if after_star.starts_with('-') {
+                let flags = extract_flags_from_spec(after_star);
+                for flag in flags {
+                    spec.flag_call_programs.entry(flag).or_insert_with(|| entry.clone());
+                }
+            } else {
+                spec.rest_call_program.get_or_insert(entry);
+            }
+            return;
+        }
+        if after.starts_with(':') {
+            spec.rest_call_program.get_or_insert(entry);
+            return;
+        }
+        if after.starts_with('-') {
+            let flags = extract_flags_from_spec(after);
+            for flag in flags {
+                spec.flag_call_programs.entry(flag).or_insert_with(|| entry.clone());
+            }
+            return;
+        }
+    }
+
+    // Flag spec
+    if s.starts_with('-') {
+        let flags = extract_flags_from_spec(s);
+        for flag in flags {
+            spec.flag_call_programs.entry(flag).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
+/// Store a static list of literal completion items in `spec` based on the spec string prefix.
+/// Follows the same routing logic as `store_call_program`.
+fn store_static_list(spec_str: &str, items: Vec<String>, spec: &mut ArgSpec) {
+    let s = spec_str.trim();
+
+    if s.starts_with('*') {
+        let after_star = s.get(1..).unwrap_or("").trim_start();
+        if !after_star.starts_with('-') {
+            spec.rest_static_list.get_or_insert(items);
+            return;
+        }
+        let flags = extract_flags_from_spec(after_star);
+        for flag in flags {
+            spec.flag_static_lists.entry(flag).or_insert_with(|| items.clone());
+        }
+        return;
+    }
+    if s.starts_with(':') {
+        spec.rest_static_list.get_or_insert(items);
+        return;
+    }
+
+    if s.starts_with('(') && let Some(close) = s.find(')') {
+        let after = s[close + 1..].trim_start();
+        if after.starts_with('*') {
+            let after_star = after.get(1..).unwrap_or("").trim_start();
+            if after_star.starts_with('-') {
+                let flags = extract_flags_from_spec(after_star);
+                for flag in flags {
+                    spec.flag_static_lists.entry(flag).or_insert_with(|| items.clone());
+                }
+            } else {
+                spec.rest_static_list.get_or_insert(items);
+            }
+            return;
+        }
+        if after.starts_with(':') {
+            spec.rest_static_list.get_or_insert(items);
+            return;
+        }
+        if after.starts_with('-') {
+            let flags = extract_flags_from_spec(after);
+            for flag in flags {
+                spec.flag_static_lists.entry(flag).or_insert_with(|| items.clone());
+            }
+            return;
+        }
+    }
+
+    if s.starts_with('-') {
+        let flags = extract_flags_from_spec(s);
+        for flag in flags {
+            spec.flag_static_lists.entry(flag).or_insert_with(|| items.clone());
+        }
+    }
+}
+
 /// Process a single _arguments spec string and add to the ArgSpec.
 fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
     // Find the action: it's after the last colon that isn't inside brackets
@@ -1518,6 +2637,20 @@ fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
         None => return,
     };
 
+    // _call_program: run an external command at completion time to get values
+    if action.contains("_call_program") {
+        if let Some((tag, argv)) = parse_call_program(&action) {
+            store_call_program(spec_str, tag, argv, spec);
+        }
+        return;
+    }
+
+    // Static list: compadd/compadd/_values with literal items
+    if let Some(items) = action_to_static_list(&action) {
+        store_static_list(spec_str, items, spec);
+        return;
+    }
+
     let arg_type = match action_to_arg_type(&action) {
         Some(t) => t,
         None => return,
@@ -1525,9 +2658,20 @@ fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
 
     let s = spec_str.trim();
 
-    // Positional: starts with a digit or *
+    // `*` prefix: either rest (`*:desc:action`, `*::action`) or a repeatable
+    // flag (`*-f+:value:action`, `*--flag=:value:action`).
     if s.starts_with('*') {
-        spec.rest = Some(arg_type);
+        let after_star = s.get(1..).unwrap_or("").trim_start();
+        if after_star.starts_with('-') {
+            // Repeatable flag: *--flag= or *-f+ — treat like a regular flag spec
+            let flags = extract_flags_from_spec(after_star);
+            for flag in flags {
+                spec.flag_args.insert(flag, arg_type);
+            }
+        } else {
+            // Rest spec: *:desc:action or *::action
+            spec.rest = Some(arg_type);
+        }
         return;
     }
 
@@ -1544,26 +2688,55 @@ fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
     }
 
     // Positional with exclusion group: '(-a -b)N:desc:action'
-    // The ( ... ) is a mutual-exclusion list; after it comes the position digit.
-    if s.starts_with('(') {
-        if let Some(close) = s.find(')') {
-            let after = s[close + 1..].trim_start();
-            if after.starts_with('*') {
+    // The ( ... ) is a mutual-exclusion list; after it comes the position digit,
+    // `*`, `:` (bare positional), or a flag name.
+    if s.starts_with('(') && let Some(close) = s.find(')') {
+        let after = s[close + 1..].trim_start();
+        if after.starts_with('*') {
+            let after_star = after.get(1..).unwrap_or("").trim_start();
+            if after_star.starts_with('-') {
+                // Repeatable flag: (excl)*--flag= …
+                let flags = extract_flags_from_spec(after_star);
+                for flag in flags {
+                    spec.flag_args.insert(flag, arg_type);
+                }
+            } else {
                 spec.rest = Some(arg_type);
-                return;
             }
-            if let Some(fc) = after.chars().next()
-                && fc.is_ascii_digit()
-                && let Ok(pos) = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse::<u32>()
-            {
-                spec.positional.insert(pos, arg_type);
-                return;
-            }
+            return;
         }
+        if let Some(fc) = after.chars().next()
+            && fc.is_ascii_digit()
+            && let Ok(pos) = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+        {
+            spec.positional.insert(pos, arg_type);
+            return;
+        }
+        // '(excl): :action' — bare positional (no number), treat as rest
+        if after.starts_with(':') {
+            spec.rest = Some(arg_type);
+            return;
+        }
+        // '(excl)--flag=:desc:action' — flag with exclusion group
+        if after.starts_with('-') {
+            let flags = extract_flags_from_spec(after);
+            for flag in flags {
+                spec.flag_args.insert(flag, arg_type);
+            }
+            return;
+        }
+    }
+
+    // Bare positional: ':desc:action' or '::desc:action'
+    // In _arguments syntax, `:desc:action` means "next positional argument"
+    // and `::desc:action` means "optional next positional".  Both map to rest.
+    if s.starts_with(':') {
+        spec.rest = Some(arg_type);
+        return;
     }
 
     // Flag spec: starts with -
@@ -1596,6 +2769,8 @@ fn has_known_action(s: &str) -> bool {
         "_urls",
         "_locales",
         "__git_branch",
+        "__git_branch_names",
+        "__git_remote_branch_names",
         "__git_heads",
         "__git_tags",
         "__git_remotes",
@@ -1604,6 +2779,14 @@ fn has_known_action(s: &str) -> bool {
         "__git_modified_files",
         "__git_other_files",
         "__git_commit_tags",
+        "__git_commits",
+        "__git_committishs",
+        "__git_revisions",
+        "_call_program",
+        "compadd",
+        "_values",
+        "_sequence",
+        "_wanted",
     ];
     KNOWN_ACTIONS.iter().any(|a| s.contains(a))
 }
@@ -2141,12 +3324,39 @@ _arguments \
         covered.insert("ssh".to_string());
         covered.insert("kill".to_string());
         apply_well_known_specs(&mut specs, &covered);
-        // These have completion files — overrides must not be applied
-        assert!(!specs.contains_key("git checkout"));
-        assert!(!specs.contains_key("git push"));
-        assert!(!specs.contains_key("ssh"));
-        assert!(!specs.contains_key("kill"));
-        // These don't have completion files — overrides should still apply
+
+        // Positional/rest specs must not be added for covered commands (the
+        // parser handles those from the completion file).
+        // git checkout pos-1 = GIT_BRANCHES comes from well-known; it must be
+        // absent so the parser's result is the sole source of truth.
+        if let Some(spec) = specs.get("git checkout") {
+            assert!(
+                spec.positional.is_empty(),
+                "positional specs must not be injected for covered 'git'"
+            );
+            assert!(spec.rest.is_none(), "rest must not be injected for covered 'git'");
+        }
+
+        // Flag specs ARE applied even for covered commands (parser misses them).
+        // git branch: -d/-D/-m/-M should be present
+        let branch_spec = specs.get("git branch").expect("git branch flag specs should be added");
+        assert!(branch_spec.flag_args.contains_key("-d"), "-d should be supplemented");
+        assert!(branch_spec.flag_args.contains_key("-D"), "-D should be supplemented");
+        // git checkout: -b should be present
+        let co_spec = specs.get("git checkout").expect("git checkout flag specs should be added");
+        assert!(co_spec.flag_args.contains_key("-b"), "-b should be supplemented");
+
+        // ssh/kill have flag overrides so entries ARE created, but
+        // positional/rest are not injected for covered commands.
+        let ssh_spec = specs.get("ssh").expect("ssh flag specs should be added");
+        assert!(ssh_spec.flag_args.contains_key("-i"), "ssh -i should be supplemented");
+        assert!(ssh_spec.positional.is_empty(), "ssh positional must not be injected");
+        let kill_spec = specs.get("kill").expect("kill -s spec should be added");
+        assert!(kill_spec.flag_args.contains_key("-s"), "kill -s should be supplemented");
+        assert!(kill_spec.positional.is_empty(), "kill positional must not be injected");
+        assert!(kill_spec.rest.is_none(), "kill rest must not be injected");
+
+        // Commands without completion files are fully covered as before
         assert!(specs.contains_key("docker run"));
         assert!(specs.contains_key("curl"));
     }
@@ -2492,6 +3702,96 @@ subcmds=(
     }
 
     #[test]
+    fn test_extract_words_flags_basic() {
+        assert_eq!(extract_words_flags("if (( words[(I)-d] ))"), vec!["-d"]);
+        assert_eq!(
+            extract_words_flags("if (( words[(I)-d] || words[(I)-D] ))"),
+            vec!["-d", "-D"]
+        );
+        assert_eq!(
+            extract_words_flags("if (( words[(I)(-d|-D)] ))"),
+            vec!["-d", "-D"]
+        );
+        assert_eq!(
+            extract_words_flags("if (( words[(I)(-r|--remotes)] == 0 ))"),
+            vec!["-r", "--remotes"]
+        );
+        // Condition without words[(I)...] → empty
+        assert!(extract_words_flags("if [[ -n $foo ]]").is_empty());
+    }
+
+    #[test]
+    fn test_conditional_variable_specs_synthetic() {
+        let content = r#"
+_test-cmd () {
+  declare -a deletion_args
+  if (( words[(I)-d] || words[(I)-D] )); then
+    deletion_args=(
+      '*: :__git_branch_names'
+    )
+  fi
+  declare -a modification_args
+  if (( words[(I)-m] )); then
+    modification_args=(
+      ':old branch:__git_branch_names'
+      '::new branch:__git_branch_names'
+    )
+  fi
+  _arguments $deletion_args $modification_args
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.flag_args.get("-d"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "-d should map to GIT_BRANCHES"
+        );
+        assert_eq!(
+            spec.flag_args.get("-D"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "-D should map to GIT_BRANCHES"
+        );
+        assert_eq!(
+            spec.flag_args.get("-m"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "-m should map to GIT_BRANCHES"
+        );
+    }
+
+    #[test]
+    fn test_git_branch_spec_from_completion_file() {
+        let path = "/usr/share/zsh/5.9/functions/_git";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let sub_specs = extract_subcommand_arg_specs("git", &content);
+        let spec = sub_specs
+            .get("git branch")
+            .expect("git branch spec missing");
+        assert_eq!(
+            spec.flag_args.get("-d"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "git branch -d should complete branches, got {:?}",
+            spec.flag_args.get("-d")
+        );
+        assert_eq!(
+            spec.flag_args.get("-D"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "git branch -D should complete branches"
+        );
+        assert_eq!(
+            spec.flag_args.get("-m"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "git branch -m should complete branches"
+        );
+        assert_eq!(
+            spec.flag_args.get("-M"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "git branch -M should complete branches"
+        );
+    }
+
+    #[test]
     fn test_git_checkout_spec_from_completion_file() {
         let path = "/usr/share/zsh/5.9/functions/_git";
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -2506,5 +3806,804 @@ subcmds=(
             "git checkout rest should be GIT_BRANCHES, got {:?}",
             spec.rest
         );
+    }
+
+    // --- Gap 1: Double-quoted spec strings ---
+
+    #[test]
+    fn test_double_quoted_spec_extraction_rest() {
+        // "($l $m $d): :__git_branch_names" — exclusion-group bare positional
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    "($l $m $d): :__git_branch_names" \
+    "($l $m $d)*--contains=[only list branches that contain commit]: :__git_committishs"
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_GIT_BRANCHES),
+            "double-quoted bare positional should give rest=GIT_BRANCHES"
+        );
+        assert!(
+            spec.flag_args.contains_key("--contains"),
+            "--contains flag should be extracted from double-quoted spec"
+        );
+        assert_eq!(
+            spec.flag_args.get("--contains"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES)
+        );
+    }
+
+    #[test]
+    fn test_double_quoted_flag_spec_extraction() {
+        // Double-quoted flag spec: "--merged=[...]: :__git_committishs"
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    "($l $m $d)--merged=[only list branches that are fully contained by HEAD]: :__git_committishs"
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.flag_args.get("--merged"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "--merged should map to GIT_BRANCHES via double-quoted spec"
+        );
+    }
+
+    #[test]
+    fn test_git_branch_double_quoted_from_file() {
+        let path = "/usr/share/zsh/5.9/functions/_git";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let sub_specs = extract_subcommand_arg_specs("git", &content);
+        let spec = sub_specs.get("git branch").expect("git branch spec missing");
+        // --contains and --merged come from double-quoted specs in _git-branch
+        assert_eq!(
+            spec.flag_args.get("--contains"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "--contains should be extracted from double-quoted spec"
+        );
+        assert_eq!(
+            spec.flag_args.get("--merged"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "--merged should be extracted from double-quoted spec"
+        );
+        // rest should come from "($l $m $d): :__git_branch_names"
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_GIT_BRANCHES),
+            "git branch positional (new branch name) should resolve as GIT_BRANCHES"
+        );
+    }
+
+    // --- Gap 2: Negated conditions ---
+
+    #[test]
+    fn test_negated_condition_skipped() {
+        let content = r#"
+_test-cmd () {
+  if (( words[(I)(-r|--remotes)] == 0 )); then
+    creation_args=(
+      '*: :__git_branch_names'
+    )
+  fi
+  _arguments $creation_args
+}
+"#;
+        let spec = parse_arg_spec(content);
+        // The positional spec IS extracted (from the single-quoted string inside
+        // the body, via the main line scanner — gap 1+3 handle this).
+        // Crucially, `-r` / `--remotes` must NOT be associated with GIT_BRANCHES.
+        assert!(
+            !spec.flag_args.contains_key("-r"),
+            "-r must not be associated with GIT_BRANCHES (negated condition)"
+        );
+        assert!(
+            !spec.flag_args.contains_key("--remotes"),
+            "--remotes must not be associated with GIT_BRANCHES (negated condition)"
+        );
+    }
+
+    // --- Gap 3: Bare :desc:action positional specs ---
+
+    #[test]
+    fn test_bare_positional_spec_single_colon() {
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    ':old branch name:__git_branch_names'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_GIT_BRANCHES),
+            "bare ':desc:action' should set rest=GIT_BRANCHES"
+        );
+    }
+
+    #[test]
+    fn test_bare_positional_spec_double_colon() {
+        // '::optional arg:_files' — optional positional, also maps to rest
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '::optional file:_files'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_PATHS),
+            "bare '::desc:action' should set rest=PATHS"
+        );
+    }
+
+    #[test]
+    fn test_exclusion_group_bare_positional() {
+        // "($l $m $d): :__git_branch_names" after stripping (excl) leaves ": ..."
+        let content = r#"
+_test-cmd () {
+  _arguments "($excl): :__git_branch_names"
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_GIT_BRANCHES),
+            "'(excl): :action' should set rest=GIT_BRANCHES"
+        );
+    }
+
+    // --- Gap 4: Helper function cross-reference ---
+
+    #[test]
+    fn test_helper_function_spec_merge() {
+        let content = r#"
+(( $+functions[__test_setup_options] )) ||
+__test_setup_options () {
+  test_options=(
+    '--author=[limit by author]:author'
+    '--format=[output format]:format'
+    '-u+[track remote]:remote:__git_remotes'
+  )
+}
+
+(( $+functions[_test-log] )) ||
+_test-log () {
+  __test_setup_options
+  _arguments \
+    $test_options \
+    '*: :__git_branch_names'
+}
+"#;
+        let sub_specs = extract_subcommand_arg_specs("test", content);
+        let spec = sub_specs.get("test log").expect("test log spec missing");
+        // rest from '*: :__git_branch_names' in _test-log
+        assert_eq!(spec.rest, Some(trie::ARG_MODE_GIT_BRANCHES));
+        // -u from __test_setup_options (merged via helper cross-reference)
+        assert_eq!(
+            spec.flag_args.get("-u"),
+            Some(&trie::ARG_MODE_GIT_REMOTES),
+            "-u should be merged from helper function"
+        );
+    }
+
+    #[test]
+    fn test_git_log_revision_options_from_file() {
+        let path = "/usr/share/zsh/5.9/functions/_git";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let sub_specs = extract_subcommand_arg_specs("git", &content);
+        let spec = sub_specs.get("git log").expect("git log spec missing");
+        // __git_setup_revision_options provides many flag specs; check that the
+        // helper cross-reference wired them in (the spec should be non-empty)
+        assert!(
+            !spec.flag_args.is_empty(),
+            "git log should have flag specs from __git_setup_revision_options"
+        );
+    }
+
+    // --- ArgSpec::merge ---
+
+    #[test]
+    fn test_argspec_merge_gap_fill() {
+        let mut base = trie::ArgSpec::default();
+        base.positional.insert(1, trie::ARG_MODE_PATHS);
+        base.rest = Some(trie::ARG_MODE_PATHS);
+
+        let mut other = trie::ArgSpec::default();
+        other.positional.insert(1, trie::ARG_MODE_GIT_BRANCHES); // should NOT overwrite PATHS
+        other.positional.insert(2, trie::ARG_MODE_GIT_REMOTES);  // should fill in
+        other.rest = Some(trie::ARG_MODE_GIT_BRANCHES);           // should NOT overwrite PATHS
+        other.flag_args.insert("-u".into(), trie::ARG_MODE_GIT_REMOTES);
+
+        base.merge(&other);
+
+        assert_eq!(base.positional.get(&1), Some(&trie::ARG_MODE_PATHS), "pos 1 not overwritten");
+        assert_eq!(base.positional.get(&2), Some(&trie::ARG_MODE_GIT_REMOTES), "pos 2 filled in");
+        assert_eq!(base.rest, Some(trie::ARG_MODE_PATHS), "rest not overwritten");
+        assert_eq!(base.flag_args.get("-u"), Some(&trie::ARG_MODE_GIT_REMOTES), "-u filled in");
+    }
+
+    // --- _call_program parsing ---
+
+    #[test]
+    fn test_call_program_direct_action() {
+        // _call_program as the direct spec action
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-c+[cipher]:cipher:_call_program ciphers ssh -Q cipher'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let (tag, argv) = spec
+            .flag_call_programs
+            .get("-c")
+            .expect("-c should have a call_program");
+        assert_eq!(tag, "ciphers");
+        assert_eq!(argv, &["ssh", "-Q", "cipher"]);
+    }
+
+    #[test]
+    fn test_call_program_embedded_in_compadd() {
+        // _call_program embedded inside a compadd call
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-Z+[cipher]:cipher:compadd - $(_call_program ciphers ssh -Q cipher)'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let (tag, argv) = spec
+            .flag_call_programs
+            .get("-Z")
+            .expect("-Z should have a call_program");
+        assert_eq!(tag, "ciphers");
+        assert_eq!(argv, &["ssh", "-Q", "cipher"]);
+    }
+
+    #[test]
+    fn test_call_program_rest_positional() {
+        // _call_program for a rest/positional argument
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '*:module:_call_program modules myapp list'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let (tag, argv) = spec
+            .rest_call_program
+            .as_ref()
+            .expect("rest_call_program should be set");
+        assert_eq!(tag, "modules");
+        assert_eq!(argv, &["myapp", "list"]);
+    }
+
+    #[test]
+    fn test_call_program_parse_helper_direct() {
+        // Unit test for parse_call_program function directly
+        let direct = parse_call_program("_call_program macs ssh -Q mac");
+        assert_eq!(direct, Some(("macs".into(), vec!["ssh".into(), "-Q".into(), "mac".into()])));
+
+        let embedded = parse_call_program("compadd - $(_call_program macs ssh -Q mac)");
+        assert_eq!(embedded, Some(("macs".into(), vec!["ssh".into(), "-Q".into(), "mac".into()])));
+
+        let none = parse_call_program("_files -/");
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn test_call_program_from_ssh_file() {
+        let path = "/usr/share/zsh/5.9/functions/_ssh";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return; // skip if not available
+        };
+        let sub_specs = extract_subcommand_arg_specs("ssh", &content);
+        // The -c flag in _ssh completions is handled via state machine, so the
+        // spec may be empty for ssh itself; just verify parsing doesn't crash
+        let _ = sub_specs;
+    }
+
+    // --- State machine (->state) resolution ---
+
+    #[test]
+    fn test_state_machine_call_program() {
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-c+[select cipher]:cipher:->ciphers' \
+    ':host:->userhost'
+
+  case $state in
+    ciphers)
+      _wanted ciphers expl cipher _sequence compadd - $(_call_program ciphers ssh -Q cipher)
+      return
+      ;;
+    userhost)
+      _wanted hosts expl host _ssh_hosts
+      return
+      ;;
+  esac
+}
+"#;
+        let spec = parse_arg_spec(content);
+        // -c should resolve to call_program via the ciphers state
+        let entry = spec.flag_call_programs.get("-c")
+            .expect("-c should have a call_program from state machine");
+        assert_eq!(entry.0, "ciphers");
+        assert_eq!(entry.1, &["ssh", "-Q", "cipher"]);
+        // :host should resolve to HOSTS via userhost state
+        assert_eq!(spec.rest, None, "rest should not be set (positional 1 covers it)");
+    }
+
+    #[test]
+    fn test_state_machine_static_list() {
+        let content = r#"
+_test-mode () {
+  _arguments \
+    '-m+[compression mode]:mode:->mode'
+
+  case $state in
+    mode)
+      compadd - fast slow best
+      return
+      ;;
+  esac
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let items = spec.flag_static_lists.get("-m")
+            .expect("-m should have a static list from state machine");
+        assert!(items.contains(&"fast".to_string()), "fast should be in list");
+        assert!(items.contains(&"slow".to_string()), "slow should be in list");
+        assert!(items.contains(&"best".to_string()), "best should be in list");
+    }
+
+    #[test]
+    fn test_state_machine_arg_type() {
+        let content = r#"
+_test-copy () {
+  _arguments \
+    ':source file:->srcfile' \
+    ':dest dir:->destdir'
+
+  case $state in
+    srcfile)
+      _files
+      return
+      ;;
+    destdir)
+      _directories
+      return
+      ;;
+  esac
+}
+"#;
+        let spec = parse_arg_spec(content);
+        // srcfile state → PATHS, destdir state → DIRS_ONLY
+        // Both map to positional or rest
+        assert!(
+            spec.rest == Some(trie::ARG_MODE_PATHS)
+                || spec.positional.values().any(|&v| v == trie::ARG_MODE_PATHS),
+            "should have PATHS from srcfile state"
+        );
+    }
+
+    #[test]
+    fn test_state_machine_from_ssh_file() {
+        let path = "/usr/share/zsh/5.9/functions/_ssh";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return; // skip if not available
+        };
+        let spec = parse_arg_spec(&content);
+        // -c+[cipher]:->ciphers state → ciphers) arm → _call_program ciphers ssh -Q cipher
+        let cipher_entry = spec.flag_call_programs.get("-c");
+        assert!(
+            cipher_entry.is_some(),
+            "-c should have a call_program (via ciphers state). Got flag_call_programs: {:?}",
+            spec.flag_call_programs.keys().collect::<Vec<_>>()
+        );
+        if let Some((tag, argv)) = cipher_entry {
+            assert_eq!(tag, "ciphers");
+            assert_eq!(argv, &["ssh", "-Q", "cipher"]);
+        }
+        // -m+[mac]:->macs state → macs) arm → _call_program macs ssh -Q mac
+        let mac_entry = spec.flag_call_programs.get("-m");
+        assert!(mac_entry.is_some(), "-m should have a call_program (via macs state)");
+    }
+
+    // --- Static list direct action ---
+
+    #[test]
+    fn test_static_list_compadd_direct() {
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-m+[mode]:mode:compadd - yes no maybe'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let items = spec.flag_static_lists.get("-m")
+            .expect("-m should have a static list");
+        assert_eq!(items, &["yes", "no", "maybe"]);
+    }
+
+    #[test]
+    fn test_static_list_values() {
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-t+[type]:type:_values "compression type" fast slow best'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let items = spec.flag_static_lists.get("-t")
+            .expect("-t should have a static list from _values");
+        assert!(items.contains(&"fast".to_string()));
+        assert!(items.contains(&"slow".to_string()));
+    }
+
+    #[test]
+    fn test_static_list_sequence() {
+        let content = r#"
+_test-cmd () {
+  _arguments \
+    '-k+[key type]:key type:_sequence compadd - rsa ecdsa ed25519'
+}
+"#;
+        let spec = parse_arg_spec(content);
+        let items = spec.flag_static_lists.get("-k")
+            .expect("-k should have a static list from _sequence compadd");
+        assert!(items.contains(&"rsa".to_string()));
+        assert!(items.contains(&"ed25519".to_string()));
+    }
+
+    #[test]
+    fn test_static_list_compadd_matcher_spec_not_leaked() {
+        // compadd -M 'matcher' should not leak the matcher spec as an item.
+        // This is a direct call to action_to_static_list (the real _git uses
+        // compadd -M inside function bodies / ->state arms, not _arguments actions,
+        // because the matcher spec contains colons that would break spec parsing).
+        let result = action_to_static_list(
+            "compadd -M 'r:|.=* r:|=*' - foo bar baz"
+        );
+        let items = result.expect("should produce a static list");
+        assert_eq!(items, &["foo", "bar", "baz"]);
+        // Matcher specs must NOT appear as items
+        assert!(!items.iter().any(|i| i.contains("r:|")));
+    }
+
+    #[test]
+    fn test_static_list_compadd_array_mode_returns_none() {
+        // compadd -a - arrayname  →  items come from array expansion, not literals
+        let result = action_to_static_list("compadd -M 'r:|.=* r:|=*' -a - git_present_options");
+        assert!(result.is_none(), "array-mode compadd should not produce static items");
+    }
+
+    #[test]
+    fn test_static_list_compadd_k_array_mode_returns_none() {
+        // compadd -k - assoc_array  →  keys from assoc array, not literals
+        let result = action_to_static_list("compadd -k - my_hash");
+        assert!(result.is_none(), "-k array-mode compadd should not produce static items");
+    }
+
+    // --- OR conditions ---
+
+    #[test]
+    fn test_or_condition_both_flags_get_type() {
+        let content = r#"
+_git-branch () {
+  declare -a dependent_deletion_args
+  if (( words[(I)-d] || words[(I)-D] )); then
+    dependent_deletion_args=(
+      '*: :__git_ignore_line_inside_arguments __git_branch_names'
+    )
+  fi
+  _arguments -S "$dependent_deletion_args[@]"
+}
+"#;
+        let spec = parse_arg_spec(content);
+        // Both -d and -D should be associated with GIT_BRANCHES
+        assert_eq!(
+            spec.flag_args.get("-d"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "-d should map to GIT_BRANCHES from OR condition"
+        );
+        assert_eq!(
+            spec.flag_args.get("-D"),
+            Some(&trie::ARG_MODE_GIT_BRANCHES),
+            "-D should map to GIT_BRANCHES from OR condition"
+        );
+    }
+
+    // --- Dynamic array construction ---
+
+    #[test]
+    fn test_dynamic_array_construction_basic() {
+        let content = r#"
+_test-cmd () {
+  declare -a args
+  args=(
+    '-f+[file]:file:_files'
+    '-u+[user]:user:_users'
+  )
+  _arguments "$args[@]"
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.flag_args.get("-f"),
+            Some(&trie::ARG_MODE_PATHS),
+            "-f should be PATHS from dynamic array"
+        );
+        assert_eq!(
+            spec.flag_args.get("-u"),
+            Some(&trie::ARG_MODE_USERS),
+            "-u should be USERS from dynamic array"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_array_construction_append() {
+        let content = r#"
+_test-cmd () {
+  local -a opts
+  opts=( '--output=[output file]:file:_files' )
+  opts+=( '--user=[user]:user:_users' )
+  _arguments $opts[@]
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert_eq!(
+            spec.flag_args.get("--output"),
+            Some(&trie::ARG_MODE_PATHS),
+            "--output should be PATHS"
+        );
+        assert_eq!(
+            spec.flag_args.get("--user"),
+            Some(&trie::ARG_MODE_USERS),
+            "--user should be USERS"
+        );
+    }
+
+    // ── Context rules ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_context_rules_basic_opt_args() {
+        // Simulate a function body with opt_args[(I)...] conditions
+        let content = r#"
+_git-checkout() {
+  _arguments -C -s \
+    '(-b -B)-b+[create new branch]:branch:->branch' \
+    '*: :->branch-or-file'
+
+  case $state in
+    branch-or-file)
+      if [[ -n ${opt_args[(I)-b|-B|--orphan]} ]]; then
+        __git_branch_names
+      else
+        _files
+      fi
+      ;;
+  esac
+}
+"#;
+        let rules = extract_state_context_rules(content);
+        assert!(
+            !rules.is_empty(),
+            "should extract at least one context rule"
+        );
+        let rule = &rules[0];
+        assert!(
+            rule.trigger_flags.contains(&"-b".to_string()),
+            "rule should trigger on -b"
+        );
+        assert!(
+            rule.trigger_flags.contains(&"-B".to_string()),
+            "rule should trigger on -B"
+        );
+        assert_eq!(
+            rule.override_type,
+            trie::ARG_MODE_GIT_BRANCHES,
+            "override should be GIT_BRANCHES"
+        );
+    }
+
+    #[test]
+    fn test_context_rules_plus_opt_args() {
+        // $+opt_args[-f] single-flag form
+        let content = r#"
+_my_cmd() {
+  case $state in
+    arg)
+      if (( $+opt_args[-l] )); then
+        _ssh_users
+      else
+        _ssh_hosts
+      fi
+      ;;
+  esac
+}
+"#;
+        let rules = extract_state_context_rules(content);
+        assert!(!rules.is_empty(), "should extract rule from $+opt_args[-l]");
+        let rule = &rules[0];
+        assert!(rule.trigger_flags.contains(&"-l".to_string()));
+        assert_eq!(rule.override_type, trie::ARG_MODE_USERS);
+    }
+
+    #[test]
+    fn test_context_rules_negated_skipped() {
+        // -z (negated) conditions should be skipped — they trigger when flag is ABSENT
+        let content = r#"
+_my_cmd() {
+  case $state in
+    arg)
+      if [[ -z ${opt_args[(I)-l]} ]]; then
+        _ssh_hosts
+      fi
+      ;;
+  esac
+}
+"#;
+        let rules = extract_state_context_rules(content);
+        assert!(
+            rules.is_empty(),
+            "negated condition (-z) should not produce context rules"
+        );
+    }
+
+    #[test]
+    fn test_context_rules_stored_in_argspec() {
+        // Full round-trip: parse_arg_spec should populate context_rules
+        let content = r#"
+_git-checkout() {
+  _arguments -C \
+    '(-b -B)-b+[create]:branch:->branch' \
+    '*: :->branch-or-file'
+
+  case $state in
+    branch-or-file)
+      if [[ -n ${opt_args[(I)-b|-B]} ]]; then
+        __git_branch_names
+      else
+        _files
+      fi
+      ;;
+  esac
+}
+"#;
+        let spec = parse_arg_spec(content);
+        assert!(
+            !spec.context_rules.is_empty(),
+            "parse_arg_spec should propagate context rules"
+        );
+        assert!(
+            spec.context_rules[0].trigger_flags.contains(&"-b".to_string())
+        );
+    }
+
+    // ── @ prefix splitting ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_at_prefix_splitting_in_arg_spec() {
+        // Ensure ssh positional[1] = ARG_MODE_HOSTS so @ splitting activates
+        let mut specs: HashMap<String, trie::ArgSpec> = HashMap::new();
+        let cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        apply_well_known_specs(&mut specs, &cmds);
+        let ssh_spec = specs.get("ssh").expect("ssh should have well-known spec");
+        assert_eq!(
+            ssh_spec.positional.get(&1).copied(),
+            Some(trie::ARG_MODE_HOSTS),
+            "ssh positional[1] should be HOSTS so @ splitting activates"
+        );
+    }
+
+    // ── _call_program well-known specs ─────────────────────────────────────────
+
+    #[test]
+    fn test_apt_install_call_program() {
+        let mut specs: HashMap<String, trie::ArgSpec> = HashMap::new();
+        let cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        apply_well_known_specs(&mut specs, &cmds);
+
+        let spec = specs.get("apt install").expect("apt install should have well-known spec");
+        let (tag, argv) = spec.rest_call_program.as_ref().expect("apt install should have rest_call_program");
+        assert_eq!(tag, "package");
+        assert_eq!(argv[0], "apt-cache");
+        assert_eq!(argv[1], "pkgnames");
+    }
+
+    #[test]
+    fn test_ip_static_list() {
+        let mut specs: HashMap<String, trie::ArgSpec> = HashMap::new();
+        let cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        apply_well_known_specs(&mut specs, &cmds);
+
+        let spec = specs.get("ip").expect("ip should have well-known spec");
+        let items = spec.rest_static_list.as_ref().expect("ip should have rest_static_list");
+        assert!(items.contains(&"addr".to_string()), "ip should complete addr");
+        assert!(items.contains(&"route".to_string()), "ip should complete route");
+        assert!(items.contains(&"link".to_string()), "ip should complete link");
+    }
+
+    #[test]
+    fn test_apt_get_install_call_program() {
+        let mut specs: HashMap<String, trie::ArgSpec> = HashMap::new();
+        let cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        apply_well_known_specs(&mut specs, &cmds);
+
+        let spec = specs.get("apt-get install").expect("apt-get install should have spec");
+        let (tag, argv) = spec.rest_call_program.as_ref().expect("apt-get install should have rest_call_program");
+        assert_eq!(tag, "package");
+        assert_eq!(argv[0], "apt-cache");
+    }
+
+    // ── Shell-operator truncation in static list extraction ────────────────────
+
+    #[test]
+    fn test_static_list_stops_at_shell_operators() {
+        // compadd - + - && ret=0  →  items should be ["+", "-"], NOT ["&&", "ret=0"]
+        let items = action_to_static_list("compadd - + - && ret=0");
+        let items = items.expect("should parse items");
+        assert!(items.contains(&"+".to_string()), "should contain +");
+        assert!(items.contains(&"-".to_string()), "should contain -");
+        assert!(
+            !items.contains(&"&&".to_string()),
+            "&& should NOT be an item"
+        );
+        assert!(
+            !items.iter().any(|i| i.contains("ret")),
+            "ret=0 should NOT be an item"
+        );
+    }
+
+    #[test]
+    fn test_static_list_values_stops_at_operator() {
+        // _values 'truth value' yes no && ret=0  →  items are [yes, no]
+        let items = action_to_static_list("_values 'truth value' yes no && ret=0");
+        let items = items.expect("should parse items");
+        assert_eq!(items, vec!["yes".to_string(), "no".to_string()]);
+        assert!(!items.contains(&"&&".to_string()));
+    }
+
+    #[test]
+    fn test_ssh_option_state_arm_no_garbage() {
+        // The _ssh option state arm contains `compadd - + - && ret=0`.
+        // After the fix, the static list for -o should be ["+", "-"] only.
+        let content = std::fs::read_to_string("/usr/share/zsh/5.9/functions/_ssh").unwrap_or_default();
+        if content.is_empty() {
+            return; // skip on systems without this file
+        }
+        let spec = parse_arg_spec(&content);
+        // -o → flag_static_lists["-o"] should exist (it's a string option with literals)
+        // OR flag_args["-o"] → some type, either way no garbage items
+        if let Some(items) = spec.flag_static_lists.get("-o") {
+            for item in items {
+                assert!(
+                    !item.contains("ret") && item != "&&" && item != "||",
+                    "flag_static_lists[\"-o\"] contains Zsh syntax garbage: {:?}",
+                    item
+                );
+            }
+        }
+        // Also check the flat rest_static_list
+        if let Some(items) = &spec.rest_static_list {
+            for item in items {
+                assert!(
+                    !item.contains("ret") && item != "&&" && item != "||",
+                    "rest_static_list contains Zsh syntax garbage: {:?}",
+                    item
+                );
+            }
+        }
     }
 }
