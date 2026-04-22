@@ -658,15 +658,25 @@ pub(super) fn resolve_from_node(
                 // was indecisive (multiple survivors) OR produced no survivors
                 // (the next word isn't a subcommand — it's likely a typed arg).
                 // In the zero-survivor case we narrow on the full original matches.
-                let deep = if deep_raw.len() > 1 {
+                let mut deep = if deep_raw.len() > 1 {
                     let narrowed = narrow_by_arg_type(&deep_raw, result, rest, arg_specs);
                     if narrowed.len() < deep_raw.len() { narrowed } else { deep_raw }
                 } else if deep_raw.is_empty() {
+                    // The next word isn't a subcommand — treat all original matches
+                    // as candidates so arg-type narrowing (and stats) can weigh in.
                     let narrowed = narrow_by_arg_type(&matches, result, rest, arg_specs);
-                    if narrowed.len() < matches.len() { narrowed } else { deep_raw }
+                    if narrowed.len() < matches.len() { narrowed } else { matches.to_vec() }
                 } else {
                     deep_raw
                 };
+
+                // Phase 5.2: if still ambiguous after arg-type narrowing,
+                // try the statistical tiebreaker (frequency + recency + success rate).
+                if deep.len() > 1
+                    && let Some(winner) = score_candidates_stats(&deep, current_unix_ts())
+                {
+                    deep = vec![winner];
+                }
 
                 if deep.len() == 1 {
                     // Deep disambiguation resolved it
@@ -853,6 +863,90 @@ pub(super) fn narrow_by_arg_type<'a>(
         with_evidence
     } else {
         candidates.to_vec()
+    }
+}
+
+/// When arg-type narrowing is indecisive, pick by statistical evidence:
+/// frequency (log(1+count)), recency (exponential decay on age_seconds,
+/// half-life ~14 days), and success_rate.  All three signals multiply
+/// together so a never-used-but-typed command cannot beat a lightly-used
+/// one on history alone.
+///
+/// Returns Some(winner) only when the top score is at least
+/// `DOMINANCE_MARGIN` times the runner-up's.  Otherwise returns None
+/// and the caller preserves ambiguity.
+pub(super) fn score_candidates_stats<'a>(
+    candidates: &[(&'a str, &'a TrieNode)],
+    now: u64,
+) -> Option<(&'a str, &'a TrieNode)> {
+    const DOMINANCE_MARGIN: f32 = 1.05;
+    if candidates.len() <= 1 {
+        return candidates.first().copied();
+    }
+
+    let mut scored: Vec<(f32, (&'a str, &'a TrieNode))> = candidates
+        .iter()
+        .map(|&(name, node)| (score_node(node, now), (name, node)))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top = scored[0].0;
+    let runner_up = scored[1].0;
+    // Require: top strictly positive (has some signal at all) AND
+    // top >= runner_up * margin. If runner_up is 0, top >= epsilon suffices.
+    if top <= 0.0 {
+        return None;
+    }
+    if runner_up <= 0.0 || top >= runner_up * DOMINANCE_MARGIN {
+        Some(scored[0].1)
+    } else {
+        None
+    }
+}
+
+fn score_node(node: &TrieNode, now: u64) -> f32 {
+    // Frequency: log base-e (1 + count). Never zero; plateaus so a single
+    // use contributes 0.693, ten uses contribute 2.4, etc.
+    let freq = (1.0 + node.count as f32).ln();
+
+    // Recency: exponential decay with 14-day half-life. Unused (last_used=0)
+    // gets a small baseline 0.5 so never-timestamped nodes don't get crushed
+    // by a single recent one.
+    let recency = match node.age_seconds(now) {
+        None => 0.5,
+        Some(age) => {
+            let half_life_secs = 14.0 * 24.0 * 3600.0;
+            (-((age as f32) / half_life_secs) * std::f32::consts::LN_2).exp()
+        }
+    };
+
+    // Success rate: default to 1.0 when we have no failure signal yet.
+    let success = node.success_rate().unwrap_or(1.0);
+
+    freq * recency * success
+}
+
+/// Helper: current unix timestamp.  Called from resolve sites.
+pub(super) fn current_unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 30 * 86400 {
+        format!("{}d", secs / 86400)
+    } else if secs < 365 * 86400 {
+        format!("{}mo", secs / (30 * 86400))
+    } else {
+        format!("{}y", secs / (365 * 86400))
     }
 }
 
@@ -1484,11 +1578,19 @@ pub(super) fn explain_segment(
                 );
             }
             match survivors.len() {
-                0 => push(
-                    out,
-                    depth + 1,
-                    "→ no survivor — ambiguity stands".into(),
-                ),
+                0 => {
+                    push(
+                        out,
+                        depth + 1,
+                        "→ no survivor — arg is not a subcommand; stats tiebreak on all candidates".into(),
+                    );
+                    // When no subcommand matches, resolve falls back to the full
+                    // original candidate set. Narrate the stats tiebreak here.
+                    if first_matches.len() > 1 {
+                        let now = current_unix_ts();
+                        narrate_stats_tiebreak(out, depth, &first_matches, now, word_refs[0]);
+                    }
+                }
                 1 => push(
                     out,
                     depth + 1,
@@ -1500,6 +1602,14 @@ pub(super) fn explain_segment(
                         depth + 1,
                         format!("→ {} candidates survive — still ambiguous", n),
                     );
+                    // Collect survivor_nodes for arg-type and stats narration.
+                    let survivor_nodes: Vec<(&str, &TrieNode)> = survivors
+                        .iter()
+                        .filter_map(|(name, _)| {
+                            first_matches.iter().find(|(sn, _)| sn == name).copied()
+                        })
+                        .collect();
+
                     // Try arg-type narrowing narration when there are still multiple survivors.
                     if word_refs.len() > 2 {
                         let probe_word = word_refs[2];
@@ -1508,12 +1618,6 @@ pub(super) fn explain_segment(
                             depth + 1,
                             format!("arg-type narrowing: probe {:?}", probe_word),
                         );
-                        let survivor_nodes: Vec<(&str, &TrieNode)> = survivors
-                            .iter()
-                            .filter_map(|(name, _)| {
-                                first_matches.iter().find(|(n, _)| n == name).copied()
-                            })
-                            .collect();
                         let mut any_match = false;
                         let mut any_no_match = false;
                         for (name, _node) in &survivor_nodes {
@@ -1552,12 +1656,28 @@ pub(super) fn explain_segment(
                                 depth + 1,
                                 format!("→ narrowed to: {}", narrowed.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")),
                             );
+                            // Stats tiebreaker narration after arg-type narrowing.
+                            if narrowed.len() > 1 {
+                                let now = current_unix_ts();
+                                narrate_stats_tiebreak(out, depth, &narrowed, now, word_refs[0]);
+                            }
                         } else {
                             push(
                                 out,
                                 depth + 1,
                                 "→ no discriminating arg-type evidence".into(),
                             );
+                            // Stats tiebreaker narration when arg-type gave no split.
+                            if survivor_nodes.len() > 1 {
+                                let now = current_unix_ts();
+                                narrate_stats_tiebreak(out, depth, &survivor_nodes, now, word_refs[0]);
+                            }
+                        }
+                    } else {
+                        // No probe word available; apply stats directly to survivors.
+                        if survivor_nodes.len() > 1 {
+                            let now = current_unix_ts();
+                            narrate_stats_tiebreak(out, depth, &survivor_nodes, now, word_refs[0]);
                         }
                     }
                 }
@@ -1634,6 +1754,70 @@ pub(super) fn describe_spec(out: &mut Vec<String>, depth: usize, spec: &ArgSpec)
             depth,
             format!("{} context rule(s)", spec.context_rules.len()),
         );
+    }
+}
+
+/// Narrate the stats tiebreaker step into `out`.
+/// Emits a table of per-candidate scores and — if a winner was chosen —
+/// reports the dominance ratio.  Called from `explain_segment` when
+/// arg-type narrowing left multiple candidates.
+fn narrate_stats_tiebreak(
+    out: &mut Vec<String>,
+    depth: usize,
+    candidates: &[(&str, &TrieNode)],
+    now: u64,
+    prefix_cmd: &str,
+) {
+    let push = |out: &mut Vec<String>, d: usize, s: String| {
+        out.push(format!("{}{}", "  ".repeat(d), s));
+    };
+    push(out, depth + 1, "stats tiebreak:".into());
+    let mut scored: Vec<(f32, &str)> = candidates
+        .iter()
+        .map(|&(name, node)| (score_node(node, now), name))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    for &(score, name) in &scored {
+        let node = candidates.iter().find(|(n, _)| *n == name).map(|(_, nd)| nd).unwrap();
+        let last_str = match node.age_seconds(now) {
+            None => "never".to_string(),
+            Some(age) => format!("{} ago", format_age(age)),
+        };
+        let success_str = match node.success_rate() {
+            None => "n/a".to_string(),
+            Some(r) => format!("{:.2}", r),
+        };
+        push(
+            out,
+            depth + 2,
+            format!(
+                "{} {}  count={} last={}  success={}  score={:.2}",
+                prefix_cmd, name, node.count, last_str, success_str, score
+            ),
+        );
+    }
+
+    if scored.len() >= 2 {
+        let top = scored[0].0;
+        let runner_up = scored[1].0;
+        if top > 0.0 && (runner_up <= 0.0 || top >= runner_up * 1.05) {
+            let ratio = if runner_up > 0.0 { top / runner_up } else { f32::INFINITY };
+            push(
+                out,
+                depth + 1,
+                format!(
+                    "→ chose: {} {} (dominance {:.1}×)",
+                    prefix_cmd, scored[0].1, ratio
+                ),
+            );
+        } else {
+            push(
+                out,
+                depth + 1,
+                "→ scores too close — ambiguity preserved".into(),
+            );
+        }
     }
 }
 
@@ -3411,5 +3595,151 @@ mod tests {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].0, "git");
         }
+    }
+
+    // --- Tests for score_candidates_stats ---
+
+    fn make_node(count: u32, last_used: u64, failures: u32) -> TrieNode {
+        TrieNode { count, last_used, failures, ..Default::default() }
+    }
+
+    #[test]
+    fn score_candidates_stats_picks_higher_count() {
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600; // 1 hour ago
+        let high = make_node(10, recent, 0);
+        let low = make_node(1, recent, 0);
+        let candidates = vec![("high", &high), ("low", &low)];
+        let winner = score_candidates_stats(&candidates, now);
+        assert!(winner.is_some(), "expected a winner");
+        assert_eq!(winner.unwrap().0, "high");
+    }
+
+    #[test]
+    fn score_candidates_stats_picks_more_recent() {
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600;       // 1 hour ago
+        let old = now - 30 * 86400;    // 30 days ago
+        let a = make_node(5, recent, 0);
+        let b = make_node(5, old, 0);
+        let candidates = vec![("recent", &a), ("old", &b)];
+        let winner = score_candidates_stats(&candidates, now);
+        assert!(winner.is_some(), "expected a winner");
+        assert_eq!(winner.unwrap().0, "recent");
+    }
+
+    #[test]
+    fn score_candidates_stats_penalty_for_failures() {
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600;
+        // count=10, failures=5 → success_rate = 10/15 ≈ 0.667
+        let flaky = make_node(10, recent, 5);
+        // count=10, failures=0 → success_rate = 1.0
+        let clean = make_node(10, recent, 0);
+        let candidates = vec![("flaky", &flaky), ("clean", &clean)];
+        let winner = score_candidates_stats(&candidates, now);
+        // clean / flaky ≈ 1.0/0.667 ≈ 1.5× > 1.05 → should pick clean
+        assert!(winner.is_some(), "expected a winner");
+        assert_eq!(winner.unwrap().0, "clean");
+    }
+
+    #[test]
+    fn score_candidates_stats_returns_none_when_tied() {
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600;
+        let a = make_node(5, recent, 0);
+        let b = make_node(5, recent, 0);
+        let candidates = vec![("a", &a), ("b", &b)];
+        let result = score_candidates_stats(&candidates, now);
+        assert!(result.is_none(), "tied nodes should return None");
+    }
+
+    #[test]
+    fn score_candidates_stats_returns_none_when_close() {
+        let now: u64 = 1_700_000_000;
+        let t1 = now - 3600;
+        // count=10 vs count=11 — ln(11)/ln(10) ≈ 1.04 < 1.05 → None
+        let a = make_node(10, t1, 0);
+        let b = make_node(11, t1, 0);
+        let candidates = vec![("a", &a), ("b", &b)];
+        let result = score_candidates_stats(&candidates, now);
+        // The margin check: top / runner_up = ln(12)/ln(11) ≈ 1.037 < 1.05
+        assert!(result.is_none(), "too close — should return None");
+    }
+
+    #[test]
+    fn score_candidates_stats_handles_empty() {
+        let candidates: Vec<(&str, &TrieNode)> = vec![];
+        let result = score_candidates_stats(&candidates, 1_700_000_000);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn score_candidates_stats_single_candidate() {
+        let now: u64 = 1_700_000_000;
+        let node = make_node(0, 0, 0);
+        let candidates = vec![("only", &node)];
+        let result = score_candidates_stats(&candidates, now);
+        assert!(result.is_some(), "single candidate always returned");
+        assert_eq!(result.unwrap().0, "only");
+    }
+
+    #[test]
+    fn resolve_stats_picks_frequently_used_sibling() {
+        // Build a trie where checkout has count=50 used recently,
+        // cherry has count=1 used a year ago. Both match "che*" prefix.
+        // With no arg-type narrowing evidence (no real branches available),
+        // the stats tiebreaker should pick checkout.
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600;          // 1 hour ago
+        let old = now - 400 * 86400;      // ~400 days ago
+
+        let mut trie = CommandTrie::new();
+        // Insert checkout 50 times with recent timestamps.
+        for _ in 0..50 {
+            trie.root.insert_with_time(&["git", "checkout"], recent);
+        }
+        // Insert cherry once with an old timestamp.
+        trie.root.insert_with_time(&["git", "cherry"], old);
+        // Also add git itself.
+        trie.insert_command("git");
+
+        // Use "totally_unknown_arg" so no runtime type resolver can match it,
+        // ensuring arg-type narrowing is a no-op and stats decides.
+        let pins = Pins::default();
+        match resolve_line("gi che totally_unknown_arg", &trie, &pins) {
+            ResolveResult::Resolved(s) => {
+                assert!(s.starts_with("git checkout"), "expected checkout, got: {}", s);
+            }
+            ResolveResult::Ambiguous(info) => {
+                panic!("expected stats to resolve, still ambiguous: {:?}", info.candidates);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn explain_stats_narration_shows_scores() {
+        // Use two top-level commands so the first-word ambiguity triggers stats
+        // narration in explain_segment (which only walks one level deep).
+        // checkout_tool: count=50, used 1h ago; cherry_app: count=1, used ~1yr ago.
+        let now: u64 = 1_700_000_000;
+        let recent = now - 3600;
+        let old = now - 400 * 86400;
+
+        let mut trie = CommandTrie::new();
+        for _ in 0..50 {
+            trie.root.insert_with_time(&["checkout_tool"], recent);
+        }
+        trie.root.insert_with_time(&["cherry_app"], old);
+
+        let pins = Pins::default();
+        // Both "checkout_tool" and "cherry_app" start with "che". With no
+        // subcommand lookahead, stats decides at the first-word level.
+        let out = explain("che totally_unknown_arg", &trie, &pins);
+        // The stats narration section must be present.
+        assert!(out.contains("stats tiebreak"), "stats tiebreak section missing:\n{}", out);
+        // The chosen winner should be checkout_tool.
+        assert!(out.contains("checkout_tool"), "checkout_tool not mentioned:\n{}", out);
     }
 }
