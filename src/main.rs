@@ -22,7 +22,6 @@ pub(crate) mod test_util {
 }
 
 use clap::{Parser, Subcommand};
-use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process;
@@ -47,7 +46,7 @@ fn lock_for(path: &Path) -> Option<std::fs::File> {
         .truncate(false)
         .open(&lock_path)
         .ok()?;
-    file.lock_exclusive().ok()?;
+    file.lock().ok()?;
     Some(file)
 }
 
