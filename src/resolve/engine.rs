@@ -1089,7 +1089,7 @@ fn is_valid_timezone(s: &str) -> bool {
 /// Other typed values go through `type_resolver::REGISTRY`. Types without a
 /// cheap membership test return `false` (treated as "no evidence" — not a
 /// narrowing signal).
-fn word_matches_type(word: &str, arg_type: u8) -> bool {
+pub(super) fn word_matches_type(word: &str, arg_type: u8) -> bool {
     use crate::trie::*;
     use std::path::Path;
     match arg_type {
@@ -1446,6 +1446,203 @@ pub(super) fn has_filesystem_prefix_match(word: &str) -> bool {
     }
 }
 
+/// Narrate the inner-level disambiguation that happened when the result is
+/// `Ambiguous` with a non-empty `resolved_prefix`. Called from `explain`
+/// after the outer first-word narration to show what occurred inside the
+/// subcommand subtree (deep-disambiguate, arg-type narrowing, flag-match,
+/// stats tiebreak).
+fn narrate_inner_ambiguity(
+    info: &AmbiguityInfo,
+    trie: &CommandTrie,
+    out: &mut Vec<String>,
+    push: &impl Fn(&mut Vec<String>, usize, String),
+) {
+    // Walk the trie to the node corresponding to info.resolved_prefix.
+    let mut cur = &trie.root;
+    for w in &info.resolved_prefix {
+        match cur.get_child(w) {
+            Some(n) => cur = n,
+            None => return, // prefix not walkable — bail silently
+        }
+    }
+
+    let prefix_str = info.resolved_prefix.join(" ");
+    push(out, 0, String::new());
+    push(out, 0, format!("Inner ambiguity within {:?}:", prefix_str));
+
+    // Initial matches from the inner node for info.word
+    let matches = cur.prefix_search(&info.word);
+    if matches.is_empty() {
+        push(out, 1, format!("no subcommand matches for {:?} at this level", info.word));
+        return;
+    }
+    let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
+    push(
+        out,
+        1,
+        format!(
+            "prefix_search {:?} → {} candidate{}: {}",
+            info.word,
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            summarize_names(&names, 8),
+        ),
+    );
+
+    let remaining_words: Vec<&str> = info.remaining.iter().map(String::as_str).collect();
+
+    // Step 1: deep_disambiguate
+    let deep_raw = if !remaining_words.is_empty() && !remaining_words[0].starts_with('-') {
+        let next = remaining_words[0];
+        push(out, 1, format!("deep-disambiguate with next word {:?}:", next));
+        let result = deep_disambiguate(&matches, &remaining_words);
+        let mut survivors_detail: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut nonmatch_count = 0usize;
+        for (name, node) in &matches {
+            let sub = node.prefix_search(next);
+            if sub.is_empty() {
+                nonmatch_count += 1;
+            } else {
+                let sub_names: Vec<&str> = sub.iter().map(|(n, _)| *n).collect();
+                survivors_detail.push((name, sub_names));
+            }
+        }
+        for (name, sub_names) in &survivors_detail {
+            push(out, 2, format!("{}: {}", name, summarize_names(sub_names, 6)));
+        }
+        if nonmatch_count > 0 {
+            push(
+                out,
+                2,
+                format!(
+                    "({} other candidate{} had no {:?} subcommand)",
+                    nonmatch_count,
+                    if nonmatch_count == 1 { "" } else { "s" },
+                    next
+                ),
+            );
+        }
+        match result.len() {
+            0 => push(out, 1, "→ no deep survivor — treating all candidates as pool".into()),
+            1 => push(out, 1, format!("→ deep winner: {}", result[0].0)),
+            n => push(out, 1, format!("→ {} survivors after deep-disambiguate", n)),
+        }
+        result
+    } else {
+        matches.clone()
+    };
+
+    // Determine the pool to hand to the next phases.
+    // Mirrors resolve_from_node: when deep_raw is empty, fall back to full matches.
+    let pool_after_deep: Vec<(&str, &TrieNode)> = if deep_raw.is_empty() {
+        matches.iter().map(|(n, nd)| (*n, *nd)).collect()
+    } else {
+        deep_raw.iter().map(|(n, nd)| (*n, *nd)).collect()
+    };
+
+    if pool_after_deep.len() <= 1 {
+        return;
+    }
+
+    // Step 2: arg-type narrowing (when remaining has a non-flag word)
+    let probe = remaining_words.iter().find(|w| !w.starts_with('-')).copied();
+    let pool_after_arg_type = if let Some(probe_word) = probe {
+        push(out, 1, format!("arg-type narrowing: probe {:?}", probe_word));
+        let mut any_match = false;
+        let mut any_no_match = false;
+        for (name, _node) in &pool_after_deep {
+            let key = format!("{} {}", prefix_str, name);
+            let type_label = if let Some(spec) = trie.arg_specs.get(&key) {
+                if let Some(expected) = spec.type_at(1) {
+                    let hint = trie::arg_mode_name(expected);
+                    if word_matches_type(probe_word, expected) {
+                        any_match = true;
+                        format!("expects {} at pos 1 → MATCH", hint)
+                    } else {
+                        any_no_match = true;
+                        format!("expects {} at pos 1 → no match", hint)
+                    }
+                } else {
+                    "no positional[1] in arg spec".to_string()
+                }
+            } else {
+                "no arg spec".to_string()
+            };
+            push(out, 2, format!("  {}  {}", name, type_label));
+        }
+        if any_match && any_no_match {
+            let narrowed = narrow_by_arg_type(
+                &pool_after_deep,
+                &info.resolved_prefix,
+                &remaining_words,
+                &trie.arg_specs,
+            );
+            push(
+                out,
+                1,
+                format!(
+                    "→ narrowed to: {}",
+                    narrowed.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                ),
+            );
+            narrowed
+        } else {
+            push(out, 1, "→ no discriminating arg-type evidence".into());
+            pool_after_deep.clone()
+        }
+    } else {
+        pool_after_deep.clone()
+    };
+
+    if pool_after_arg_type.len() <= 1 {
+        return;
+    }
+
+    // Step 3: flag-match narrowing
+    let flags: Vec<&str> = remaining_words
+        .iter()
+        .filter(|w| w.starts_with('-') && w.len() > 1)
+        .copied()
+        .collect();
+    let pool_after_flags = if !flags.is_empty() {
+        push(
+            out,
+            1,
+            format!("flag-match narrowing with flags: {}", flags.join(", ")),
+        );
+        let narrowed = narrow_by_flag_match(
+            &pool_after_arg_type,
+            &info.resolved_prefix,
+            &remaining_words,
+            &trie.arg_specs,
+        );
+        if narrowed.len() < pool_after_arg_type.len() {
+            push(
+                out,
+                1,
+                format!(
+                    "→ narrowed to: {}",
+                    narrowed.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                ),
+            );
+            narrowed
+        } else {
+            push(out, 1, "→ no discriminating flag evidence".into());
+            pool_after_arg_type.clone()
+        }
+    } else {
+        pool_after_arg_type.clone()
+    };
+
+    if pool_after_flags.len() <= 1 {
+        return;
+    }
+
+    // Step 4: stats tiebreak
+    let last_cmd = info.resolved_prefix.last().map(String::as_str).unwrap_or("");
+    narrate_stats_tiebreak(out, 0, &pool_after_flags, current_unix_ts(), last_cmd);
+}
+
 /// Produce a human-readable narrative of how `input` resolves against the
 /// trie and pins. Walks the same primitives as the real resolver (pins,
 /// wrapper detection, trie prefix search, deep disambiguation, arg-spec
@@ -1556,6 +1753,12 @@ pub fn explain(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
                         format!("{}  (subs: {})", dc.command, dc.subcommand_matches.join(", ")),
                     );
                 }
+            }
+            // When the ambiguity is inside a subcommand subtree (resolved_prefix
+            // is non-empty), re-walk the inner logic so the narrator shows what
+            // actually happened at that level.
+            if !info.resolved_prefix.is_empty() {
+                narrate_inner_ambiguity(&info, trie, &mut out, &push);
             }
         }
         ResolveResult::PathAmbiguous(cands) => {
@@ -4154,5 +4357,112 @@ mod tests {
             }
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    // --- explain inner-ambiguity narration tests ---
+
+    #[test]
+    fn explain_narrates_inner_arg_type_narrowing() {
+        // Uses the same trie as the Phase 5.1 integration tests.
+        // "gi che totally_not_anything" stays ambiguous at the inner level.
+        // explain() should emit the "Inner ambiguity within" header and
+        // describe the arg-type narrowing attempt.
+        let mut trie = trie_with_git_subcommands_and_argspecs();
+        trie.insert_command("git");
+        let pins = Pins::default();
+        let output = explain("gi che totally_not_anything", &trie, &pins);
+        assert!(
+            output.contains("Inner ambiguity within"),
+            "expected 'Inner ambiguity within' in explain output;\ngot:\n{}",
+            output
+        );
+        assert!(
+            output.contains("expects"),
+            "expected 'expects' (arg-type label) in explain output;\ngot:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn explain_narrates_inner_flag_match() {
+        // Build a trie where "git checkout" has -p in flag_args but "git cherry"
+        // does not.  "gi che -p main" resolves (flag narrows to checkout), but
+        // "gi che -p" alone stays ambiguous so explain gets a chance to narrate
+        // the flag-match step.
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        trie.insert(&["git", "cherry"]);
+        trie.insert_command("git");
+        trie.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        // cherry has no arg spec — flag-match gives checkout a hit, cherry none.
+        let pins = Pins::default();
+        // "gi che -p": the flag narrows it down, so the result is Resolved.
+        // We need input that stays Ambiguous to exercise narration.  Add
+        // "cherry" the same -p spec so flag-match is unanimous (no split),
+        // then the narration still fires and reports "no discriminating flag evidence".
+        trie.arg_specs.insert(
+            "git cherry".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let output = explain("gi che -p", &trie, &pins);
+        // Both candidates now have -p, so flag-match reports unanimous / no split.
+        assert!(
+            output.contains("Inner ambiguity within"),
+            "expected 'Inner ambiguity within';\ngot:\n{}",
+            output
+        );
+        assert!(
+            output.contains("flag"),
+            "expected flag-narrowing narration;\ngot:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn explain_handles_non_resolvable_prefix_gracefully() {
+        // Construct an AmbiguityInfo whose resolved_prefix points at a word
+        // that doesn't exist in the trie.  narrate_inner_ambiguity must bail
+        // silently — no panic, no garbage output.
+        //
+        // We can't manufacture a real Ambiguous result with a broken prefix
+        // easily, so we call narrate_inner_ambiguity directly via a wrapper
+        // that builds the info by hand.
+        let trie = build_test_trie();
+
+        // "gi che totally_not_anything" on the basic trie (no git subcommands
+        // beyond checkout/commit/push/...).  "gi" resolves to git uniquely.
+        // With no "che*" subcommands in build_test_trie other than "checkout",
+        // "che" is unambiguous → Resolved.  So we use a raw call to
+        // narrate_inner_ambiguity with a crafted info to test the bail-out path.
+        let fake_info = AmbiguityInfo {
+            word: "something".into(),
+            position: 1,
+            candidates: vec!["foo".into(), "bar".into()],
+            lcp: String::new(),
+            deep_candidates: vec![],
+            resolved_prefix: vec!["nonexistent_command_xyz".into()],
+            remaining: vec![],
+        };
+        let mut out: Vec<String> = Vec::new();
+        let push = |out: &mut Vec<String>, depth: usize, s: String| {
+            out.push(format!("{}{}", "  ".repeat(depth), s));
+        };
+        // Must not panic.
+        narrate_inner_ambiguity(&fake_info, &trie, &mut out, &push);
+        // Should have produced no output (bailed silently at the walk step).
+        assert!(
+            out.is_empty(),
+            "expected no output for non-walkable prefix; got: {:?}",
+            out
+        );
     }
 }
