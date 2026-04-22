@@ -102,6 +102,159 @@ pub const ARG_MODE_LOCALES: u8 = 16;
 /// Accepts either a user name or a group name (e.g. `chown owner:group`).
 pub const ARG_MODE_USERS_GROUPS: u8 = 17;
 
+// Git advanced
+pub const ARG_MODE_GIT_STASH: u8 = 18;
+pub const ARG_MODE_GIT_WORKTREE: u8 = 19;
+pub const ARG_MODE_GIT_SUBMODULE: u8 = 20;
+pub const ARG_MODE_GIT_CONFIG_KEY: u8 = 21;
+pub const ARG_MODE_GIT_ALIAS: u8 = 22;
+pub const ARG_MODE_GIT_COMMIT: u8 = 23;
+pub const ARG_MODE_GIT_REFLOG: u8 = 24;
+
+// Docker
+pub const ARG_MODE_DOCKER_CONTAINER: u8 = 25;
+pub const ARG_MODE_DOCKER_IMAGE: u8 = 26;
+pub const ARG_MODE_DOCKER_NETWORK: u8 = 27;
+pub const ARG_MODE_DOCKER_VOLUME: u8 = 28;
+pub const ARG_MODE_DOCKER_COMPOSE_SERVICE: u8 = 29;
+
+// Kubernetes
+pub const ARG_MODE_K8S_CONTEXT: u8 = 30;
+pub const ARG_MODE_K8S_NAMESPACE: u8 = 31;
+pub const ARG_MODE_K8S_POD: u8 = 32;
+pub const ARG_MODE_K8S_DEPLOYMENT: u8 = 33;
+pub const ARG_MODE_K8S_SERVICE: u8 = 34;
+pub const ARG_MODE_K8S_RESOURCE_KIND: u8 = 35;
+
+// systemd
+pub const ARG_MODE_SYSTEMD_UNIT: u8 = 36;
+pub const ARG_MODE_SYSTEMD_SERVICE: u8 = 37;
+pub const ARG_MODE_SYSTEMD_TIMER: u8 = 38;
+pub const ARG_MODE_SYSTEMD_SOCKET: u8 = 39;
+
+// Package managers
+pub const ARG_MODE_BREW_FORMULA: u8 = 40;
+pub const ARG_MODE_BREW_CASK: u8 = 41;
+pub const ARG_MODE_APT_PACKAGE: u8 = 42;
+pub const ARG_MODE_DNF_PACKAGE: u8 = 43;
+pub const ARG_MODE_PACMAN_PACKAGE: u8 = 44;
+pub const ARG_MODE_NPM_PACKAGE: u8 = 45;
+pub const ARG_MODE_PIP_PACKAGE: u8 = 46;
+pub const ARG_MODE_CARGO_CRATE: u8 = 47;
+
+// Project scripts
+pub const ARG_MODE_NPM_SCRIPT: u8 = 48;
+pub const ARG_MODE_MAKE_TARGET: u8 = 49;
+pub const ARG_MODE_JUST_RECIPE: u8 = 50;
+pub const ARG_MODE_CARGO_TASK: u8 = 51;
+pub const ARG_MODE_POETRY_SCRIPT: u8 = 52;
+pub const ARG_MODE_COMPOSER_SCRIPT: u8 = 53;
+pub const ARG_MODE_GRADLE_TASK: u8 = 54;
+pub const ARG_MODE_RAKE_TASK: u8 = 55;
+
+// Shell introspection
+pub const ARG_MODE_SHELL_FUNCTION: u8 = 56;
+pub const ARG_MODE_SHELL_ALIAS: u8 = 57;
+pub const ARG_MODE_SHELL_VAR: u8 = 58;
+pub const ARG_MODE_NAMED_DIR: u8 = 59;
+pub const ARG_MODE_DIRSTACK_ENTRY: u8 = 60;
+pub const ARG_MODE_JOB_SPEC: u8 = 61;
+pub const ARG_MODE_HISTORY_ENTRY: u8 = 62;
+
+// Session managers
+pub const ARG_MODE_TMUX_SESSION: u8 = 63;
+pub const ARG_MODE_TMUX_WINDOW: u8 = 64;
+pub const ARG_MODE_TMUX_PANE: u8 = 65;
+pub const ARG_MODE_SCREEN_SESSION: u8 = 66;
+
+// Text/net types
+pub const ARG_MODE_URL_SCHEME: u8 = 67;
+pub const ARG_MODE_EMAIL: u8 = 68;
+pub const ARG_MODE_IPV4: u8 = 69;
+pub const ARG_MODE_IPV6: u8 = 70;
+pub const ARG_MODE_MAC_ADDR: u8 = 71;
+pub const ARG_MODE_TIMEZONE: u8 = 72;
+
+/// Returns a short human-readable label for an ARG_MODE_* constant.
+/// Returns "?" for unknown values.
+pub fn arg_mode_name(mode: u8) -> &'static str {
+    match mode {
+        ARG_MODE_PATHS => "path",
+        ARG_MODE_DIRS_ONLY => "directory",
+        ARG_MODE_EXECS_ONLY => "executable",
+        ARG_MODE_USERS => "user",
+        ARG_MODE_HOSTS => "host",
+        ARG_MODE_PIDS => "pid",
+        ARG_MODE_SIGNALS => "signal",
+        ARG_MODE_PORTS => "port",
+        ARG_MODE_NET_IFACES => "interface",
+        ARG_MODE_GIT_BRANCHES => "git-branch",
+        ARG_MODE_GIT_TAGS => "git-tag",
+        ARG_MODE_GIT_REMOTES => "git-remote",
+        ARG_MODE_GIT_FILES => "git-file",
+        ARG_MODE_URLS => "url",
+        ARG_MODE_GROUPS => "group",
+        ARG_MODE_LOCALES => "locale",
+        ARG_MODE_USERS_GROUPS => "user-or-group",
+        ARG_MODE_GIT_STASH => "git-stash",
+        ARG_MODE_GIT_WORKTREE => "git-worktree",
+        ARG_MODE_GIT_SUBMODULE => "git-submodule",
+        ARG_MODE_GIT_CONFIG_KEY => "git-config-key",
+        ARG_MODE_GIT_ALIAS => "git-alias",
+        ARG_MODE_GIT_COMMIT => "git-commit",
+        ARG_MODE_GIT_REFLOG => "git-reflog",
+        ARG_MODE_DOCKER_CONTAINER => "docker-container",
+        ARG_MODE_DOCKER_IMAGE => "docker-image",
+        ARG_MODE_DOCKER_NETWORK => "docker-network",
+        ARG_MODE_DOCKER_VOLUME => "docker-volume",
+        ARG_MODE_DOCKER_COMPOSE_SERVICE => "docker-compose-service",
+        ARG_MODE_K8S_CONTEXT => "k8s-context",
+        ARG_MODE_K8S_NAMESPACE => "k8s-namespace",
+        ARG_MODE_K8S_POD => "k8s-pod",
+        ARG_MODE_K8S_DEPLOYMENT => "k8s-deployment",
+        ARG_MODE_K8S_SERVICE => "k8s-service",
+        ARG_MODE_K8S_RESOURCE_KIND => "k8s-resource-kind",
+        ARG_MODE_SYSTEMD_UNIT => "systemd-unit",
+        ARG_MODE_SYSTEMD_SERVICE => "systemd-service",
+        ARG_MODE_SYSTEMD_TIMER => "systemd-timer",
+        ARG_MODE_SYSTEMD_SOCKET => "systemd-socket",
+        ARG_MODE_BREW_FORMULA => "brew-formula",
+        ARG_MODE_BREW_CASK => "brew-cask",
+        ARG_MODE_APT_PACKAGE => "apt-package",
+        ARG_MODE_DNF_PACKAGE => "dnf-package",
+        ARG_MODE_PACMAN_PACKAGE => "pacman-package",
+        ARG_MODE_NPM_PACKAGE => "npm-package",
+        ARG_MODE_PIP_PACKAGE => "pip-package",
+        ARG_MODE_CARGO_CRATE => "cargo-crate",
+        ARG_MODE_NPM_SCRIPT => "npm-script",
+        ARG_MODE_MAKE_TARGET => "make-target",
+        ARG_MODE_JUST_RECIPE => "just-recipe",
+        ARG_MODE_CARGO_TASK => "cargo-task",
+        ARG_MODE_POETRY_SCRIPT => "poetry-script",
+        ARG_MODE_COMPOSER_SCRIPT => "composer-script",
+        ARG_MODE_GRADLE_TASK => "gradle-task",
+        ARG_MODE_RAKE_TASK => "rake-task",
+        ARG_MODE_SHELL_FUNCTION => "shell-function",
+        ARG_MODE_SHELL_ALIAS => "shell-alias",
+        ARG_MODE_SHELL_VAR => "shell-var",
+        ARG_MODE_NAMED_DIR => "named-dir",
+        ARG_MODE_DIRSTACK_ENTRY => "dirstack-entry",
+        ARG_MODE_JOB_SPEC => "job-spec",
+        ARG_MODE_HISTORY_ENTRY => "history-entry",
+        ARG_MODE_TMUX_SESSION => "tmux-session",
+        ARG_MODE_TMUX_WINDOW => "tmux-window",
+        ARG_MODE_TMUX_PANE => "tmux-pane",
+        ARG_MODE_SCREEN_SESSION => "screen-session",
+        ARG_MODE_URL_SCHEME => "url-scheme",
+        ARG_MODE_EMAIL => "email",
+        ARG_MODE_IPV4 => "ipv4",
+        ARG_MODE_IPV6 => "ipv6",
+        ARG_MODE_MAC_ADDR => "mac-addr",
+        ARG_MODE_TIMEZONE => "timezone",
+        _ => "?",
+    }
+}
+
 /// A context-sensitive completion rule evaluated at query time.
 ///
 /// When any flag in `trigger_flags` is already present on the current command
@@ -249,6 +402,8 @@ pub type ArgModeMap = HashMap<String, u8>;
 /// subcommand -> description pairs for IOS-style `?` help.
 pub type DescriptionMap = HashMap<String, HashMap<String, String>>;
 
+pub const TREE_SCHEMA_VERSION: u32 = 2;
+
 /// The full command trie with serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandTrie {
@@ -263,11 +418,17 @@ pub struct CommandTrie {
     /// Key = parent command (e.g. "git"), value = subcommand -> description.
     #[serde(default)]
     pub descriptions: DescriptionMap,
+    /// Schema version stamped at save time. 0 means pre-versioned (legacy).
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 impl CommandTrie {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            schema_version: TREE_SCHEMA_VERSION,
+            ..Default::default()
+        }
     }
 
     pub fn insert(&mut self, words: &[&str]) {
@@ -283,7 +444,9 @@ impl CommandTrie {
     /// `learn` processes (spawned in the background by the Zsh plugin)
     /// cannot observe or produce a truncated file.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let data = rmp_serde::to_vec_named(self)?;
+        let mut t = self.clone();
+        t.schema_version = TREE_SCHEMA_VERSION;
+        let data = rmp_serde::to_vec_named(&t)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -305,6 +468,7 @@ impl CommandTrie {
     }
 
     /// Load from MessagePack file.
+    // TODO: check schema_version and trigger rebuild on mismatch (future phase).
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let data = fs::read(path)?;
         let trie: Self = rmp_serde::from_slice(&data)?;
@@ -575,5 +739,81 @@ mod tests {
         let loaded = CommandTrie::load(&path).unwrap();
         assert!(loaded.root.get_child("second").is_some());
         assert!(loaded.root.get_child("first").is_none());
+    }
+
+    #[test]
+    fn arg_mode_name_covers_all_modes() {
+        for mode in 1u8..=72 {
+            assert_ne!(
+                arg_mode_name(mode),
+                "?",
+                "arg_mode_name returned '?' for mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_mode_name_unknown_returns_placeholder() {
+        assert_eq!(arg_mode_name(0), "?");
+        assert_eq!(arg_mode_name(200), "?");
+    }
+
+    #[test]
+    fn arg_mode_names_unique() {
+        use std::collections::HashSet;
+        let labels: Vec<&str> = (1u8..=72).map(arg_mode_name).collect();
+        let unique: HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "duplicate label found among modes 1..=72"
+        );
+    }
+
+    #[test]
+    fn schema_version_stamped_on_save() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("tree.msgpack");
+
+        let mut trie = CommandTrie::new();
+        trie.schema_version = 0;
+        trie.save(&path).unwrap();
+
+        let loaded = CommandTrie::load(&path).unwrap();
+        assert_eq!(loaded.schema_version, TREE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn old_tree_deserializes_with_default_version() {
+        // Serialize a struct without the schema_version field, simulating a tree
+        // written before versioning was added. #[serde(default)] should produce
+        // schema_version == 0 on deserialization.
+        use serde::Serialize;
+        use std::collections::HashMap;
+
+        #[derive(Serialize)]
+        struct OldTree {
+            root: TrieNode,
+            arg_specs: ArgSpecMap,
+            arg_modes: ArgModeMap,
+            descriptions: DescriptionMap,
+        }
+
+        let mut ser_buf = Vec::new();
+        let mut se = rmp_serde::Serializer::new(&mut ser_buf).with_struct_map();
+        OldTree {
+            root: TrieNode::default(),
+            arg_specs: HashMap::new(),
+            arg_modes: HashMap::new(),
+            descriptions: HashMap::new(),
+        }
+        .serialize(&mut se)
+        .unwrap();
+
+        let loaded: CommandTrie = rmp_serde::from_slice(&ser_buf).unwrap();
+        assert_eq!(
+            loaded.schema_version, 0,
+            "missing field should default to 0"
+        );
     }
 }
