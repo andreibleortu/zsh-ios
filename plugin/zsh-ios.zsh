@@ -15,6 +15,19 @@ ZSH_IOS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh-ios"
 # unchanged buffer sees the match and enters the picker instead.
 typeset -g _zsh_ios_last_tab_buffer=""
 
+# Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
+# have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
+# an already-open file descriptor containing the simulated keystrokes.
+_zsh_ios_read_picker_key() {
+    if [[ -n "$_ZSH_IOS_TEST_INPUT_FD" ]]; then
+        # -u must come BEFORE the variable name; otherwise zsh consumes the
+        # var name as the first positional and loses the -u fd binding.
+        read -r -k 1 -u "$_ZSH_IOS_TEST_INPUT_FD" "$1"
+    else
+        read -r -k 1 "$1" </dev/tty
+    fi
+}
+
 # --- Guard: check if binary exists ---
 if ! command -v "$ZSH_IOS_BIN" &>/dev/null; then
     echo "zsh-ios: binary not found in PATH. Run install.sh or cargo install --path ." >&2
@@ -295,7 +308,7 @@ _zsh_ios_handle_path_ambiguity() {
     if (( count <= 9 )); then
         echo -n "  > "
         local key
-        read -r -k 1 key </dev/tty
+        _zsh_ios_read_picker_key key
         echo ""
 
         if [[ "$key" =~ ^[1-9]$ ]] && (( key >= 1 && key <= count )); then
@@ -308,7 +321,11 @@ _zsh_ios_handle_path_ambiguity() {
     else
         echo -n "  > "
         local choice
-        read -r choice </dev/tty
+        if [[ -n "$_ZSH_IOS_TEST_INPUT_FD" ]]; then
+            read -r -u "$_ZSH_IOS_TEST_INPUT_FD" choice
+        else
+            read -r choice </dev/tty
+        fi
 
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
             BUFFER="${_zio_path_candidates[$choice]}"
@@ -525,7 +542,7 @@ _zsh_ios_handle_ambiguity() {
         fi
     }
     while true; do
-        read -r -k 1 key </dev/tty
+        _zsh_ios_read_picker_key key
         case "$key" in
             $'\n'|$'\r')
                 # Enter: commit digits if present, else cycle highlight, else cancel.

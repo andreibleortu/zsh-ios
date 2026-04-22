@@ -299,6 +299,15 @@ The trie is further protected from junk:
 
 Aliases are also learned by value: if you have `alias tfa='terraform apply -auto-approve'`, the trie learns both `tfa` as a command and `terraform apply` as a subcommand path.
 
+## Tests
+
+```bash
+cargo test              # Rust unit + integration tests (src/*.rs, tests/cli.rs)
+bats tests/plugin/      # Zsh plugin tests (requires bats-core)
+```
+
+The bats suite drives `_zsh_ios_handle_ambiguity` and the ZLE widgets directly, using stubs for the `zsh-ios` binary and ZLE primitives — so you can iterate on the picker or a widget without a real interactive shell. The `_ZSH_IOS_TEST_INPUT_FD` hook lets tests feed keystrokes through a file descriptor instead of `/dev/tty`. Install bats with `brew install bats-core` (mac) or `apt install bats` (linux).
+
 ## Uninstall
 
 ```bash

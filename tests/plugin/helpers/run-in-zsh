@@ -1,0 +1,63 @@
+#!/usr/bin/env zsh
+# Run a Zsh snippet with `plugin/zsh-ios.zsh` sourced and a minimal ZLE
+# simulation so widgets can be invoked outside an interactive shell.
+#
+# Usage:  run-in-zsh <snippet-file-or-"-">
+#   <snippet-file>  path to a .zsh file with the test code
+#   "-"             read snippet from stdin
+#
+# The caller exports ZSH_IOS_STUB_* to shape the fake binary's output.
+# Bats captures stdout/stderr and exit status in the usual way.
+
+emulate -L zsh
+# Deliberately NO err_return: test snippets routinely poke functions that
+# return non-zero (safe_eval rejections, picker cancellations) and need to
+# observe the rc before continuing.
+setopt no_aliases
+
+SCRIPT_DIR="${0:A:h}"
+REPO_ROOT="${SCRIPT_DIR:h:h:h}"
+
+# Point the plugin at the fake binary.
+export PATH="${SCRIPT_DIR}:$PATH"
+export ZSH_IOS_BIN="${SCRIPT_DIR}/zsh-ios-stub"
+
+# Stub out the ZLE primitives the plugin uses. Each call is appended to the
+# `_zle_calls` array so tests can inspect the sequence.
+typeset -ga _zle_calls
+zle() {
+    _zle_calls+=("$*")
+}
+
+# BUFFER / CURSOR are normally ZLE-managed globals. Declare them so the
+# widgets have something to mutate.
+typeset -g BUFFER=""
+typeset -g CURSOR=0
+
+# Keep add-zsh-hook / add-zle-hook-widget from erroring out before the plugin
+# has autoloaded them. Cheap stubs are fine — we aren't exercising the hooks.
+add-zsh-hook() { :; }
+add-zle-hook-widget() { :; }
+autoload() { :; }
+
+# Now source the real plugin.
+source "${REPO_ROOT}/plugin/zsh-ios.zsh" || {
+    print -r -- "FATAL: plugin source failed" >&2
+    exit 127
+}
+
+# Reset any ZLE calls and stub-log entries made during plugin init so each
+# test starts from a clean slate.
+_zle_calls=()
+[[ -n "$ZSH_IOS_STUB_LOG" && -f "$ZSH_IOS_STUB_LOG" ]] && : > "$ZSH_IOS_STUB_LOG"
+
+# Execute the snippet.
+if [[ "$1" == "-" ]]; then
+    # Read from stdin: but stdin might be the simulated keystroke stream.
+    # Run the snippet directly so it can set _ZSH_IOS_TEST_INPUT_FD from fd 0.
+    local snippet
+    snippet="$(cat /dev/stdin)"
+    eval "$snippet"
+else
+    source "$1"
+fi

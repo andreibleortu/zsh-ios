@@ -1,0 +1,57 @@
+#!/usr/bin/env zsh
+# Fake `zsh-ios` binary used by plugin bats tests. Controlled via env:
+#
+#   ZSH_IOS_STUB_LOG        — append one line per invocation: "$1|$*" (all args)
+#   ZSH_IOS_STUB_RESOLVE_*  — per-resolve-input override:
+#                               ZSH_IOS_STUB_RESOLVE_EXIT  (default 0)
+#                               ZSH_IOS_STUB_RESOLVE_OUT   (stdout)
+#   ZSH_IOS_STUB_COMPLETE_OUT  — stdout for `complete`
+#   ZSH_IOS_STUB_STATUS_OUT    — stdout for `status` (defaults to a reasonable one)
+#
+# The real binary keeps the shell's state in a tree.msgpack; tests don't care
+# about that file, they only care that the binary emits the right signals.
+
+sub="$1"; shift
+
+if [[ -n "$ZSH_IOS_STUB_LOG" ]]; then
+    print -r -- "$sub|$*" >> "$ZSH_IOS_STUB_LOG"
+fi
+
+case "$sub" in
+    status)
+        if [[ -n "$ZSH_IOS_STUB_STATUS_OUT" ]]; then
+            print -r -- "$ZSH_IOS_STUB_STATUS_OUT"
+        else
+            # A well-formed status that parses to "tree not stale" so
+            # `_zsh_ios_build_if_stale` is a no-op in tests.
+            cat <<'EOS'
+zsh-ios status
+  Enabled:     yes
+  Config dir:  /tmp/zsio-test
+  Tree file:   /tmp/zsio-test/tree.msgpack
+  Pins file:   /tmp/zsio-test/pins.txt
+  Config file: /tmp/zsio-test/config.yaml (absent)
+  Stale threshold: 3600s
+  Learning:    enabled
+  Blocklist:   0
+  Tree:        not built yet
+  Pins:        none
+EOS
+        fi
+        exit 0
+        ;;
+    resolve)
+        [[ -n "$ZSH_IOS_STUB_RESOLVE_OUT" ]] && print -r -- "$ZSH_IOS_STUB_RESOLVE_OUT"
+        exit "${ZSH_IOS_STUB_RESOLVE_EXIT:-0}"
+        ;;
+    complete)
+        [[ -n "$ZSH_IOS_STUB_COMPLETE_OUT" ]] && print -r -- "$ZSH_IOS_STUB_COMPLETE_OUT"
+        exit 0
+        ;;
+    build|learn|pin|unpin)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac

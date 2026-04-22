@@ -15,6 +15,8 @@ cargo install --path .            # install to ~/.cargo/bin/
 cargo test                        # run all unit tests (scanner, history, pins, trie, path_resolve, resolve, completions)
 cargo test <name>                 # run a single test by name substring
 cargo test -p zsh-ios <module>::  # run tests in one module, e.g. `resolve::`
+bats tests/plugin/                # run Zsh plugin bats suite (picker, safe_eval, widget bypasses)
+bats tests/plugin/picker.bats     # run one bats file
 ./install.sh                      # full install (builds, copies plugin, edits ~/.zshrc)
 ./uninstall.sh                    # uninstall
 
@@ -84,5 +86,5 @@ The plugin spawns `zsh-ios learn` in the background after every command, which m
 - Edition 2024, no workspace — single crate.
 - No custom error type; `Result<T, Box<dyn Error>>` / `io::Result` are used directly.
 - YAML parsing uses `serde_yaml_ng` (drop-in for the now-unmaintained `serde_yaml`).
-- Tests live inline in each module under `#[cfg(test)] mod tests`. Prefer adding tests next to the function under test rather than in a separate file. End-to-end CLI tests live in `tests/cli.rs` and spawn the actual binary with an isolated `HOME`/`XDG_CONFIG_HOME` tempdir.
+- Tests live inline in each module under `#[cfg(test)] mod tests`. Prefer adding tests next to the function under test rather than in a separate file. End-to-end CLI tests live in `tests/cli.rs` and spawn the actual binary with an isolated `HOME`/`XDG_CONFIG_HOME` tempdir. Zsh plugin tests live in `tests/plugin/*.bats`; they source the plugin with ZLE stubbed (`zle` → records into `_zle_calls`), the binary replaced by `tests/plugin/helpers/zsh-ios-stub` (shapable via `ZSH_IOS_STUB_*` env vars), and the picker's `read`s redirected from `$_ZSH_IOS_TEST_INPUT_FD` instead of `/dev/tty`. Driver lives at `tests/plugin/helpers/run-in-zsh`; `tests/plugin/helpers/test_helper.bash` gives tests `keystrokes '...'` + `zsh_run '<snippet>'`.
 - Any test that mutates process-global state (`cwd`, `$PATH`) must take `crate::test_util::CWD_LOCK` for the duration of its work — the default parallel test runner will race otherwise. This is why `CommandTrie::save`-related tests use tempdirs but the cwd-touching ones explicitly lock.
