@@ -322,7 +322,10 @@ Removes the binary, offers to delete config directories (with confirmation), and
 src/
   main.rs               CLI entry point (clap subcommands)
   trie.rs               Prefix trie with MessagePack serialization; 16 arg type constants
-  resolve.rs            Core abbreviation resolution engine; ? key completion
+  resolve/              Abbreviation resolution subsystem:
+    engine.rs             Core trie walk, deep disambiguation, arg-spec, explain
+    complete.rs           `?` key completion path
+    escape.rs             Shell-quoting helpers for resolved paths
   path_resolve.rs       Filesystem path abbreviation with deep disambiguation
   runtime_complete.rs   Runtime resolvers: git branches/tags/remotes/files, users,
                         groups, hosts, signals, ports, network interfaces, locales
