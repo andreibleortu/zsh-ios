@@ -130,6 +130,25 @@ zsh-ios rebuild         # Rebuild the command trie (captures current aliases)
 zsh-ios pin "g ch" --to "git checkout"    # Save an abbreviation rule
 zsh-ios unpin "g ch"    # Remove a pin
 zsh-ios pins            # List all saved pins
+zsh-ios explain "gi br" # Trace step-by-step how an input would resolve
+```
+
+### Debugging resolution
+
+When `zsh-ios` expands something unexpectedly (or fails to), `zsh-ios explain` prints the full decision tree: pin lookup, trie walk per word, deep-disambiguation candidates and winner, arg-spec hits, and the final result. Example:
+
+```
+$ zsh-ios explain "gi br"
+
+Command: "gi br"
+  Pin lookup: no longest-prefix match
+  Trie: "gi" is ambiguous — 5 candidates: gids-tool, gio, git, git-shell, ...
+    Deep-disambiguate with next word "br":
+      git: branch
+      (4 other candidates had no "br" subcommand)
+    → winner: git
+
+Final: Resolved → git branch
 ```
 
 ### Pins file

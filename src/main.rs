@@ -86,6 +86,12 @@ enum Commands {
     Rebuild,
     /// Show status: enabled/disabled, tree stats, config paths
     Status,
+    /// Explain step-by-step how an input would resolve (for debugging)
+    Explain {
+        /// The abbreviated command line to trace
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        line: Vec<String>,
+    },
 }
 
 fn main() {
@@ -102,6 +108,7 @@ fn main() {
         Commands::Toggle => cmd_toggle(),
         Commands::Rebuild => cmd_rebuild(),
         Commands::Status => cmd_status(),
+        Commands::Explain { line } => cmd_explain(&line.join(" ")),
     }
 }
 
@@ -166,7 +173,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
-        "status",
+        "status", "explain",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }
@@ -458,6 +465,16 @@ fn cmd_status() {
     } else {
         println!("  Pins:        none");
     }
+}
+
+fn cmd_explain(line: &str) {
+    if line.trim().is_empty() {
+        eprintln!("Usage: zsh-ios explain <command line>");
+        process::exit(1);
+    }
+    let trie = load_trie();
+    let pin_store = pins::Pins::load(&config::pins_path());
+    println!("{}", resolve::explain(line, &trie, &pin_store));
 }
 
 fn load_trie() -> trie::CommandTrie {

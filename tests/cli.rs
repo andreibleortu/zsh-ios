@@ -358,6 +358,32 @@ fn rebuild_shells_out_to_zsh_and_refreshes_tree() {
 }
 
 #[test]
+fn explain_produces_narrative() {
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+    let (code, stdout, _) = run(cmd_in(td.path()).args(["explain", "gi br"]));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("zsh-ios explain:"), "got: {}", stdout);
+    assert!(stdout.contains("Final:"), "got: {}", stdout);
+}
+
+#[test]
+fn explain_bang_reports_bypass() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, stdout, _) = run(cmd_in(td.path()).args(["explain", "!foo"]));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("bypass"), "got: {}", stdout);
+}
+
+#[test]
+fn explain_with_empty_input_errors() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(cmd_in(td.path()).args(["explain", ""]));
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Usage"));
+}
+
+#[test]
 fn bang_prefixed_resolve_is_passthrough() {
     // User rule: a command starting with `!` is never touched by zsh-ios.
     // Run without a seeded trie to be sure there's no accidental side effect.

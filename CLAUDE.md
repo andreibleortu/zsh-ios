@@ -42,7 +42,7 @@ Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and futur
 
 ### Binary subcommands (src/main.rs)
 
-`build`, `resolve`, `complete`, `learn`, `pin`, `unpin`, `pins`, `toggle`, `rebuild`, `status`. `build` and `rebuild` differ only in that `rebuild` re-execs via `zsh -c 'alias | zsh-ios build --aliases-stdin'` so aliases from the user's interactive shell are captured (aliases can't be read from a child process otherwise).
+`build`, `resolve`, `complete`, `learn`, `pin`, `unpin`, `pins`, `toggle`, `rebuild`, `status`, `explain`. `build` and `rebuild` differ only in that `rebuild` re-execs via `zsh -c 'alias | zsh-ios build --aliases-stdin'` so aliases from the user's interactive shell are captured (aliases can't be read from a child process otherwise). `explain` is a debugging tool — `resolve::explain` walks the same primitives as `resolve_line` (wrapper detect → pin lookup → trie prefix search → deep disambiguation → arg-spec) and narrates each step, then prints the actual `resolve_line` result so any drift between narrator and engine is visible.
 
 ### Module responsibilities
 

@@ -1155,6 +1155,370 @@ fn has_filesystem_prefix_match(word: &str) -> bool {
     }
 }
 
+/// Produce a human-readable narrative of how `input` resolves against the
+/// trie and pins. Walks the same primitives as the real resolver (pins,
+/// wrapper detection, trie prefix search, deep disambiguation, arg-spec
+/// lookup) and then reports the actual `resolve_line` result so any
+/// discrepancy between the walk and the real engine is visible.
+pub fn explain(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
+    let mut out = Vec::<String>::new();
+    let push = |out: &mut Vec<String>, depth: usize, s: String| {
+        out.push(format!("{}{}", "  ".repeat(depth), s));
+    };
+
+    push(&mut out, 0, format!("zsh-ios explain: {:?}", input));
+    push(&mut out, 0, String::new());
+
+    // 1. Leading-! bypass
+    if starts_with_bang(input) {
+        push(
+            &mut out,
+            0,
+            "Leading-! bypass: buffer starts with '!' — run AS-IS, no resolution.".into(),
+        );
+        push(&mut out, 0, format!("Final: Passthrough → {}", input));
+        return out.join("\n");
+    }
+
+    // 2. Split on pipe/chain operators
+    let parts = split_on_operators(input);
+    let segments: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| match p {
+            LinePart::Command(c) => Some(c.as_str()),
+            _ => None,
+        })
+        .collect();
+    let has_op = parts.iter().any(|p| matches!(p, LinePart::Operator(_)));
+    if has_op {
+        push(
+            &mut out,
+            0,
+            format!(
+                "Pipe/chain split: {} command segment{}",
+                segments.len(),
+                if segments.len() == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    // 3. Per-segment narrative
+    for (i, seg) in segments.iter().enumerate() {
+        let trimmed = seg.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        push(&mut out, 0, String::new());
+        if has_op {
+            push(&mut out, 0, format!("Segment {}: {:?}", i + 1, trimmed));
+            explain_segment(&mut out, 1, trimmed, trie, pins);
+        } else {
+            push(&mut out, 0, format!("Command: {:?}", trimmed));
+            explain_segment(&mut out, 1, trimmed, trie, pins);
+        }
+    }
+
+    // 4. Real result
+    push(&mut out, 0, String::new());
+    match resolve_line(input, trie, pins) {
+        ResolveResult::Resolved(s) => {
+            push(&mut out, 0, format!("Final: Resolved → {}", s));
+        }
+        ResolveResult::Passthrough(s) => {
+            push(&mut out, 0, format!("Final: Passthrough → {}", s));
+            push(
+                &mut out,
+                0,
+                "  (no trie match; line returned unchanged)".into(),
+            );
+        }
+        ResolveResult::Ambiguous(info) => {
+            push(&mut out, 0, "Final: Ambiguous".into());
+            push(&mut out, 1, format!("ambiguous word : {:?}", info.word));
+            push(&mut out, 1, format!("longest common : {:?}", info.lcp));
+            push(&mut out, 1, format!("position       : {}", info.position));
+            if !info.resolved_prefix.is_empty() {
+                push(
+                    &mut out,
+                    1,
+                    format!("resolved prefix: {}", info.resolved_prefix.join(" ")),
+                );
+            }
+            if !info.remaining.is_empty() {
+                push(
+                    &mut out,
+                    1,
+                    format!("remaining      : {}", info.remaining.join(" ")),
+                );
+            }
+            push(
+                &mut out,
+                1,
+                format!("candidates     : {}", info.candidates.join(", ")),
+            );
+            if !info.deep_candidates.is_empty() {
+                push(&mut out, 1, "deep candidates:".into());
+                for dc in &info.deep_candidates {
+                    push(
+                        &mut out,
+                        2,
+                        format!("{}  (subs: {})", dc.command, dc.subcommand_matches.join(", ")),
+                    );
+                }
+            }
+        }
+        ResolveResult::PathAmbiguous(cands) => {
+            push(&mut out, 0, "Final: PathAmbiguous".into());
+            for c in &cands {
+                push(&mut out, 1, format!("• {}", c));
+            }
+        }
+    }
+
+    out.join("\n")
+}
+
+/// Internal narrator for a single command segment (no pipe/chain operators).
+/// Mirrors the decision tree of `resolve`: wrapper detect → pin lookup →
+/// first-word trie match → deep disambiguation if ambiguous → arg-spec lookup.
+fn explain_segment(
+    out: &mut Vec<String>,
+    depth: usize,
+    input: &str,
+    trie: &CommandTrie,
+    pins: &Pins,
+) {
+    let push = |out: &mut Vec<String>, d: usize, s: String| {
+        out.push(format!("{}{}", "  ".repeat(d), s));
+    };
+
+    let (word_strs, _) = split_words_quoted(input);
+    let words: Vec<String> = word_strs.iter().map(|s| s.to_string()).collect();
+    let word_refs: Vec<&str> = words.iter().map(String::as_str).collect();
+
+    if word_refs.is_empty() {
+        push(out, depth, "empty segment — no words to resolve".into());
+        return;
+    }
+
+    // Wrapper (sudo, env, xargs, watch, doas, nice, nohup, time, command)
+    if let Some(inner) = wrapper_inner_start(&word_refs) {
+        let wrapper_words: Vec<&str> = word_refs[..inner].to_vec();
+        push(
+            out,
+            depth,
+            format!(
+                "Wrapper: {} — pass through, resolve from word {}",
+                wrapper_words.join(" "),
+                inner + 1
+            ),
+        );
+        let inner_str = word_refs[inner..].join(" ");
+        if !inner_str.is_empty() {
+            push(out, depth, format!("Inner: {:?}", inner_str));
+            explain_segment(out, depth + 1, &inner_str, trie, pins);
+        }
+        return;
+    }
+
+    // Pin lookup (longest prefix)
+    match pins.longest_match(&word_refs) {
+        Some((consumed, expanded)) => {
+            push(
+                out,
+                depth,
+                format!(
+                    "Pin match: \"{}\" → \"{}\"  (consumes {} word{})",
+                    word_refs[..consumed].join(" "),
+                    expanded.join(" "),
+                    consumed,
+                    if consumed == 1 { "" } else { "s" }
+                ),
+            );
+            if consumed == words.len() {
+                return; // pin covers the whole input
+            }
+            push(
+                out,
+                depth,
+                format!(
+                    "Remaining after pin: {}",
+                    word_refs[consumed..].join(" ")
+                ),
+            );
+        }
+        None => {
+            push(out, depth, "Pin lookup: no longest-prefix match".into());
+        }
+    }
+
+    // First-word trie lookup
+    let first = &word_refs[0];
+    let first_matches = trie.root.prefix_search(first);
+    if first_matches.is_empty() {
+        push(
+            out,
+            depth,
+            format!("Trie: no commands with prefix {:?}", first),
+        );
+        return;
+    }
+    if first_matches.len() == 1 {
+        let name = first_matches[0].0;
+        if name == *first {
+            push(out, depth, format!("Trie: {:?} is an exact command", first));
+        } else {
+            push(
+                out,
+                depth,
+                format!("Trie: {:?} uniquely matches {:?}", first, name),
+            );
+        }
+    } else {
+        let names: Vec<&str> = first_matches.iter().map(|(n, _)| *n).collect();
+        push(
+            out,
+            depth,
+            format!(
+                "Trie: {:?} is ambiguous — {} candidates: {}",
+                first,
+                names.len(),
+                summarize_names(&names, 8)
+            ),
+        );
+
+        // Deep disambiguation using the next word, if any
+        if word_refs.len() > 1 {
+            let next = &word_refs[1];
+            push(
+                out,
+                depth + 1,
+                format!("Deep-disambiguate with next word {:?}:", next),
+            );
+            let mut survivors: Vec<(&str, Vec<&str>)> = Vec::new();
+            let mut nonmatch_count = 0usize;
+            for (name, node) in &first_matches {
+                let sub = node.prefix_search(next);
+                if sub.is_empty() {
+                    nonmatch_count += 1;
+                } else {
+                    let sub_names: Vec<&str> = sub.iter().map(|(n, _)| *n).collect();
+                    survivors.push((name, sub_names));
+                }
+            }
+            // Only show survivors in detail; summarize non-matches in one line
+            // so a 40-candidate case doesn't produce 40 "no match" lines.
+            for (name, sub_names) in &survivors {
+                push(
+                    out,
+                    depth + 2,
+                    format!("{}: {}", name, summarize_names(sub_names, 6)),
+                );
+            }
+            if nonmatch_count > 0 {
+                push(
+                    out,
+                    depth + 2,
+                    format!(
+                        "({} other candidate{} had no {:?} subcommand)",
+                        nonmatch_count,
+                        if nonmatch_count == 1 { "" } else { "s" },
+                        next
+                    ),
+                );
+            }
+            match survivors.len() {
+                0 => push(
+                    out,
+                    depth + 1,
+                    "→ no survivor — ambiguity stands".into(),
+                ),
+                1 => push(
+                    out,
+                    depth + 1,
+                    format!("→ winner: {}", survivors[0].0),
+                ),
+                n => push(
+                    out,
+                    depth + 1,
+                    format!("→ {} candidates survive — still ambiguous", n),
+                ),
+            }
+        }
+    }
+
+    // Arg-spec (per-position type metadata)
+    if word_refs.len() >= 2 {
+        let two = format!("{} {}", word_refs[0], word_refs[1]);
+        if let Some(spec) = trie.arg_specs.get(&two) {
+            push(out, depth, format!("ArgSpec: detailed spec for {:?}", two));
+            describe_spec(out, depth + 1, spec);
+        } else if let Some(spec) = trie.arg_specs.get(word_refs[0]) {
+            push(
+                out,
+                depth,
+                format!("ArgSpec: top-level spec for {:?}", word_refs[0]),
+            );
+            describe_spec(out, depth + 1, spec);
+        }
+    }
+}
+
+/// Render a name list, truncated with an ellipsis when there are more than
+/// `cap` entries. Keeps explain output readable even when `gr` matches 40
+/// commands on a developer box.
+fn summarize_names(names: &[&str], cap: usize) -> String {
+    if names.len() <= cap {
+        return names.join(", ");
+    }
+    let head = names[..cap].join(", ");
+    format!("{}, … ({} more)", head, names.len() - cap)
+}
+
+fn describe_spec(out: &mut Vec<String>, depth: usize, spec: &ArgSpec) {
+    let push = |out: &mut Vec<String>, d: usize, s: String| {
+        out.push(format!("{}{}", "  ".repeat(d), s));
+    };
+    if let Some(t) = spec.rest {
+        push(
+            out,
+            depth,
+            format!(
+                "positional rest: {} ({})",
+                t,
+                crate::runtime_complete::type_hint(t)
+            ),
+        );
+    }
+    for (pos, t) in &spec.positional {
+        push(
+            out,
+            depth,
+            format!(
+                "position {}: {} ({})",
+                pos,
+                t,
+                crate::runtime_complete::type_hint(*t)
+            ),
+        );
+    }
+    if !spec.flag_args.is_empty() {
+        let n = spec.flag_args.len();
+        push(
+            out,
+            depth,
+            format!("{} flag{} take typed values", n, if n == 1 { "" } else { "s" }),
+        );
+    }
+    if !spec.context_rules.is_empty() {
+        push(
+            out,
+            depth,
+            format!("{} context rule(s)", spec.context_rules.len()),
+        );
+    }
+}
+
 /// Generate completions for the `?` command.
 /// Returns a formatted list of matching commands/subcommands.
 /// Splits on pipe/chain operators and completes only the last segment.
@@ -3391,5 +3755,102 @@ mod tests {
         // can pick up COLUMNS env var — just non-empty.
         assert!(!out.is_empty());
         assert!(out.lines().count() >= 1);
+    }
+
+    // --- explain() ---
+
+    #[test]
+    fn explain_bang_reports_bypass() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let out = explain("!!", &trie, &pins);
+        assert!(out.contains("Leading-! bypass"), "got: {}", out);
+        assert!(out.contains("Passthrough"));
+    }
+
+    #[test]
+    fn explain_resolved_prints_trie_walk_and_winner() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // "ter ap" resolves uniquely via terraform apply. Narrative should
+        // include the unique-match line and the final Resolved.
+        let out = explain("ter ap", &trie, &pins);
+        assert!(out.contains("\"ter\""), "got: {}", out);
+        assert!(out.contains("Trie:"), "got: {}", out);
+        assert!(out.contains("Final: Resolved → terraform apply"), "got: {}", out);
+    }
+
+    #[test]
+    fn explain_ambiguous_shows_candidates_and_lcp() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let out = explain("g", &trie, &pins);
+        assert!(out.contains("Final: Ambiguous"), "got: {}", out);
+        assert!(out.contains("candidates"));
+        // Test trie has git/grep/go/gzip under "g" prefix
+        assert!(out.contains("git") && out.contains("grep"));
+    }
+
+    #[test]
+    fn explain_deep_disambig_shows_survivor_and_nonmatch_summary() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // "g push" — only git has a `push` subcommand; the explain trace
+        // must call out the survivor explicitly.
+        let out = explain("g push", &trie, &pins);
+        assert!(out.contains("Deep-disambiguate"), "got: {}", out);
+        assert!(out.contains("winner: git"), "got: {}", out);
+        assert!(out.contains("Final: Resolved → git push"));
+    }
+
+    #[test]
+    fn explain_pin_lookup_reports_hit() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["kubectl", "apply"]);
+        let pins = Pins {
+            entries: vec![Pin {
+                abbrev: vec!["k".into()],
+                expanded: vec!["kubectl".into()],
+            }],
+        };
+        let out = explain("k ap", &trie, &pins);
+        assert!(out.contains("Pin match"), "got: {}", out);
+        assert!(out.contains("k") && out.contains("kubectl"));
+        assert!(out.contains("Final: Resolved → kubectl apply"));
+    }
+
+    #[test]
+    fn explain_wrapper_drills_into_inner_command() {
+        let mut trie = build_test_trie();
+        trie.insert_command("sudo");
+        let pins = Pins::default();
+        let out = explain("sudo ter ap", &trie, &pins);
+        assert!(out.contains("Wrapper: sudo"), "got: {}", out);
+        assert!(out.contains("Inner: \"ter ap\""));
+        // The inner command is still resolved, so the final line reports
+        // the full sudo-prefixed result.
+        assert!(out.contains("sudo terraform apply") || out.contains("Resolved"));
+    }
+
+    #[test]
+    fn explain_pipe_chain_splits_and_narrates_each_segment() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let out = explain("gi st | gr foo", &trie, &pins);
+        assert!(out.contains("Pipe/chain split"), "got: {}", out);
+        assert!(out.contains("Segment 1"));
+        assert!(out.contains("Segment 2"));
+    }
+
+    #[test]
+    fn summarize_names_caps_long_lists() {
+        let many: Vec<String> = (0..20).map(|i| format!("n{}", i)).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let s = summarize_names(&refs, 5);
+        assert!(s.contains("n0"));
+        assert!(s.contains("… (15 more)"), "got: {}", s);
+        // Short list: no ellipsis
+        let s = summarize_names(&refs[..3], 5);
+        assert!(!s.contains("more"));
     }
 }
