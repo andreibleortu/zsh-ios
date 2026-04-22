@@ -321,6 +321,66 @@ pub fn git_tracked_files() -> Vec<String> {
     files
 }
 
+pub fn git_stash_list() -> Vec<String> {
+    git_query(&["stash", "list", "--format=%gd"])
+}
+
+pub fn git_worktree_list() -> Vec<String> {
+    git_query(&["worktree", "list", "--porcelain"])
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("worktree ").map(|s| s.to_string()))
+        .collect()
+}
+
+pub fn git_submodule_list() -> Vec<String> {
+    // Try the porcelain helper first; fall back to .gitmodules parsing.
+    let out = git_query(&["submodule--helper", "list"]);
+    if !out.is_empty() {
+        // Each line is: <mode> SP <hash> SP <stage> TAB <path>
+        return out
+            .into_iter()
+            .filter_map(|line| line.split_once('\t').map(|x| x.1.to_string()))
+            .collect();
+    }
+    // Fallback: parse .gitmodules via `git config --file .gitmodules --get-regexp path`
+    // Output lines look like: `submodule.<name>.path <path>`
+    git_query(&["config", "--file", ".gitmodules", "--get-regexp", "path"])
+        .into_iter()
+        .filter_map(|line| {
+            line.split_whitespace().nth(1).map(|s| s.to_string())
+        })
+        .collect()
+}
+
+pub fn git_config_keys() -> Vec<String> {
+    git_query(&["config", "--list", "--name-only"])
+}
+
+pub fn git_aliases() -> Vec<String> {
+    git_query(&["config", "--get-regexp", r"^alias\."])
+        .into_iter()
+        .filter_map(|line| {
+            // Line format: `alias.<name> <value>`
+            let key = line.split_whitespace().next()?;
+            key.strip_prefix("alias.").map(|s| s.to_string())
+        })
+        .collect()
+}
+
+pub fn git_commits() -> Vec<String> {
+    let full = git_query(&["log", "--format=%H", "--max-count=200"]);
+    let short = git_query(&["log", "--format=%h", "--max-count=200"]);
+    let mut combined = full;
+    combined.extend(short);
+    combined.sort();
+    combined.dedup();
+    combined
+}
+
+pub fn git_reflog_list() -> Vec<String> {
+    git_query(&["reflog", "--format=%gd", "--max-count=100"])
+}
+
 // --- _call_program dynamic runner ---
 
 /// Run an external command (from a Zsh `_call_program` spec) and return its
@@ -663,6 +723,97 @@ impl TypeResolver for UsersGroupsResolver {
     }
 }
 
+pub struct GitStashResolver;
+impl TypeResolver for GitStashResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_stash_list()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-stash"
+    }
+}
+
+pub struct GitWorktreeResolver;
+impl TypeResolver for GitWorktreeResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_worktree_list()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-worktree"
+    }
+}
+
+pub struct GitSubmoduleResolver;
+impl TypeResolver for GitSubmoduleResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_submodule_list()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "git-submodule"
+    }
+}
+
+pub struct GitConfigKeyResolver;
+impl TypeResolver for GitConfigKeyResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_config_keys()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "git-config-key"
+    }
+}
+
+pub struct GitAliasResolver;
+impl TypeResolver for GitAliasResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_aliases()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "git-alias"
+    }
+}
+
+pub struct GitCommitResolver;
+impl TypeResolver for GitCommitResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_commits()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "git-commit"
+    }
+}
+
+pub struct GitReflogResolver;
+impl TypeResolver for GitReflogResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_reflog_list()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "git-reflog"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -676,6 +827,13 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_GIT_REMOTES, Box::new(GitRemotesResolver));
     r.register(ARG_MODE_GIT_FILES, Box::new(GitFilesResolver));
     r.register(ARG_MODE_USERS_GROUPS, Box::new(UsersGroupsResolver));
+    r.register(ARG_MODE_GIT_STASH, Box::new(GitStashResolver));
+    r.register(ARG_MODE_GIT_WORKTREE, Box::new(GitWorktreeResolver));
+    r.register(ARG_MODE_GIT_SUBMODULE, Box::new(GitSubmoduleResolver));
+    r.register(ARG_MODE_GIT_CONFIG_KEY, Box::new(GitConfigKeyResolver));
+    r.register(ARG_MODE_GIT_ALIAS, Box::new(GitAliasResolver));
+    r.register(ARG_MODE_GIT_COMMIT, Box::new(GitCommitResolver));
+    r.register(ARG_MODE_GIT_REFLOG, Box::new(GitReflogResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -708,6 +866,13 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_GIT_FILES => "<tracked-file>",
         trie::ARG_MODE_URLS => "<url>",
         trie::ARG_MODE_LOCALES => "<locale>",
+        trie::ARG_MODE_GIT_STASH => "<stash>",
+        trie::ARG_MODE_GIT_WORKTREE => "<worktree>",
+        trie::ARG_MODE_GIT_SUBMODULE => "<submodule>",
+        trie::ARG_MODE_GIT_CONFIG_KEY => "<config-key>",
+        trie::ARG_MODE_GIT_ALIAS => "<alias>",
+        trie::ARG_MODE_GIT_COMMIT => "<commit>",
+        trie::ARG_MODE_GIT_REFLOG => "<reflog-entry>",
         _ => "<arg>",
     }
 }
@@ -982,6 +1147,220 @@ host prod staging !excluded
         let _ = git_tracked_files();
         if let Some(c) = cwd {
             let _ = std::env::set_current_dir(c);
+        }
+    }
+
+    // --- helpers for new git resolver tests ---
+
+    fn setup_git_repo() -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.com"][..],
+            &["config", "user.name", "T"][..],
+        ] {
+            std::process::Command::new("git").current_dir(p).args(args).output().unwrap();
+        }
+        std::fs::write(p.join("f.txt"), "hi").unwrap();
+        std::process::Command::new("git")
+            .current_dir(p)
+            .args(["add", "f.txt"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(p)
+            .args(["commit", "-q", "-m", "init"])
+            .output()
+            .unwrap();
+        td
+    }
+
+    // --- GitStashResolver ---
+
+    #[test]
+    fn git_stash_returns_expected() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        assert!(git_stash_list().is_empty(), "no stashes yet");
+
+        std::fs::write(td.path().join("f.txt"), "changed").unwrap();
+        std::process::Command::new("git").args(["stash"]).output().unwrap();
+        let stashes = git_stash_list();
+        assert_eq!(stashes.len(), 1);
+        assert!(stashes[0].starts_with("stash@{"), "unexpected: {}", stashes[0]);
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitWorktreeResolver ---
+
+    #[test]
+    fn git_worktree_non_repo_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        // Detailed worktree/submodule scenarios are covered in integration tests.
+        assert!(git_worktree_list().is_empty());
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    #[test]
+    fn git_worktree_returns_main_worktree_path() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let worktrees = git_worktree_list();
+        // The main worktree is always present.
+        assert!(!worktrees.is_empty(), "expected at least the main worktree");
+        // The first entry should be the repo root path.
+        assert!(
+            worktrees[0].contains(td.path().to_str().unwrap()),
+            "worktree path should include repo root: {:?}",
+            worktrees[0]
+        );
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitSubmoduleResolver ---
+
+    #[test]
+    fn git_submodule_no_submodules_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        // Detailed submodule scenarios are covered in integration tests.
+        assert!(git_submodule_list().is_empty());
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitConfigKeyResolver ---
+
+    #[test]
+    fn git_config_keys_contains_user_fields() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let keys = git_config_keys();
+        assert!(keys.contains(&"user.email".to_string()), "keys: {:?}", keys);
+        assert!(keys.contains(&"user.name".to_string()), "keys: {:?}", keys);
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitAliasResolver ---
+
+    #[test]
+    fn git_aliases_returns_configured_aliases() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        std::process::Command::new("git")
+            .current_dir(td.path())
+            .args(["config", "alias.co", "checkout"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(td.path())
+            .args(["config", "alias.br", "branch"])
+            .output()
+            .unwrap();
+
+        let aliases = git_aliases();
+        assert!(aliases.contains(&"co".to_string()), "aliases: {:?}", aliases);
+        assert!(aliases.contains(&"br".to_string()), "aliases: {:?}", aliases);
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitCommitResolver ---
+
+    #[test]
+    fn git_commits_returns_hashes_after_commit() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let commits = git_commits();
+        assert!(!commits.is_empty(), "expected at least one commit hash");
+        assert!(
+            commits.iter().all(|h| h.chars().next().is_some_and(|c| c.is_ascii_hexdigit())),
+            "all entries should be hex: {:?}",
+            commits
+        );
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- GitReflogResolver ---
+
+    #[test]
+    fn git_reflog_returns_entries_after_commit() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let entries = git_reflog_list();
+        assert!(!entries.is_empty(), "expected at least one reflog entry");
+        assert!(
+            entries[0].starts_with("HEAD@{"),
+            "unexpected reflog entry: {}",
+            entries[0]
+        );
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- new resolvers tolerate non-repo ---
+
+    #[test]
+    fn new_git_resolvers_tolerate_non_repo() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        // None of these may panic. Stash/worktree/submodule/commits/reflog
+        // return empty outside a repo; config keys may return global config
+        // entries even outside a repo — that is correct git behavior.
+        assert!(git_stash_list().is_empty());
+        assert!(git_worktree_list().is_empty());
+        assert!(git_submodule_list().is_empty());
+        let _ = git_config_keys(); // global config may be non-empty; must not panic
+        let _ = git_aliases();    // global aliases are valid to return
+        assert!(git_commits().is_empty());
+        assert!(git_reflog_list().is_empty());
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
         }
     }
 

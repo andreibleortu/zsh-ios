@@ -127,6 +127,13 @@ mod tests {
             ARG_MODE_GIT_REMOTES,
             ARG_MODE_GIT_FILES,
             ARG_MODE_USERS_GROUPS,
+            ARG_MODE_GIT_STASH,
+            ARG_MODE_GIT_WORKTREE,
+            ARG_MODE_GIT_SUBMODULE,
+            ARG_MODE_GIT_CONFIG_KEY,
+            ARG_MODE_GIT_ALIAS,
+            ARG_MODE_GIT_COMMIT,
+            ARG_MODE_GIT_REFLOG,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }
