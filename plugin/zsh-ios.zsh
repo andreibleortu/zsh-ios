@@ -99,8 +99,8 @@ precmd() {
 
 _zsh_ios_precmd() {
     local ec=${_zsh_ios_retval:-0}
-    if [[ $ec -eq 0 && -n "$_zsh_ios_pending_cmd" ]]; then
-        ("$ZSH_IOS_BIN" learn -- "$_zsh_ios_pending_cmd" &>/dev/null &)
+    if [[ -n "$_zsh_ios_pending_cmd" ]]; then
+        ("$ZSH_IOS_BIN" learn --exit-code "$ec" -- "$_zsh_ios_pending_cmd" &>/dev/null &)
     fi
     unset _zsh_ios_pending_cmd
     unset _zsh_ios_last_pin

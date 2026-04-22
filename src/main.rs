@@ -61,6 +61,9 @@ enum Commands {
     },
     /// Learn a single command (add to trie incrementally)
     Learn {
+        /// Exit code of the command (0 = success, non-zero = failure)
+        #[arg(long = "exit-code", default_value_t = 0)]
+        exit_code: i32,
         /// The full command that was executed
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -101,7 +104,7 @@ fn main() {
         Commands::Build { aliases_stdin } => cmd_build(aliases_stdin),
         Commands::Resolve { line } => cmd_resolve(&line.join(" ")),
         Commands::Complete { line } => cmd_complete(&line.join(" ")),
-        Commands::Learn { command } => cmd_learn(&command.join(" ")),
+        Commands::Learn { exit_code, command } => cmd_learn(&command.join(" "), exit_code),
         Commands::Pin { abbrev, expanded } => cmd_pin(&abbrev, &expanded),
         Commands::Unpin { abbrev } => cmd_unpin(&abbrev),
         Commands::Pins => cmd_list_pins(),
@@ -291,7 +294,7 @@ fn cmd_complete(line: &str) {
     print!("{}", output);
 }
 
-fn cmd_learn(command: &str) {
+fn cmd_learn(command: &str, exit_code: i32) {
     if command.trim().is_empty() {
         return;
     }
@@ -324,14 +327,35 @@ fn cmd_learn(command: &str) {
         _ => return,
     };
 
+    let now = current_unix_ts();
+    let mut dirty = false;
     for segment in history::split_command_segments(&to_learn) {
         let words: Vec<&str> = segment.split_whitespace().collect();
-        if !words.is_empty() && !trie.root.is_prefix_of_existing(words[0]) {
-            trie.insert(&words);
+        if words.is_empty() {
+            continue;
+        }
+        if exit_code == 0 {
+            if !trie.root.is_prefix_of_existing(words[0]) {
+                trie.root.insert_with_time(&words, now);
+                dirty = true;
+            }
+        } else {
+            if trie.root.record_failure(&words, now) {
+                dirty = true;
+            }
         }
     }
 
-    let _ = trie.save(&tree_path);
+    if dirty {
+        let _ = trie.save(&tree_path);
+    }
+}
+
+fn current_unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn cmd_pin(abbrev: &str, expanded: &str) {

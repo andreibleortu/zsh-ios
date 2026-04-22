@@ -534,3 +534,133 @@ fn disable_learning_makes_learn_noop() {
     let after = fs::metadata(&tree).unwrap().modified().unwrap();
     assert_eq!(before, after, "disable_learning should leave the trie file untouched");
 }
+
+/// Seed a minimal trie with specific word-path sequences.
+/// Unlike `seed_build`, this does not scan PATH, so there are no
+/// incidental `git-shell` / `git-receive-pack` siblings that would
+/// cause `is_prefix_of_existing` to block re-learning `git`.
+/// Each element of `paths` is a slice of words, e.g. `&["git", "status"]`.
+fn seed_trie_with(home: &Path, paths: &[&[&str]]) {
+    use zsh_ios::trie::CommandTrie;
+    let mut trie = CommandTrie::new();
+    for &words in paths {
+        trie.insert(words);
+    }
+    let tree = tree_path_of(home);
+    fs::create_dir_all(tree.parent().unwrap()).unwrap();
+    trie.save(&tree).unwrap();
+}
+
+#[test]
+fn learn_success_adds_and_bumps_count() {
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    // Seed a trie with only `git` so there are no git-prefixed siblings
+    // (git-shell, git-receive-pack) that would cause is_prefix_of_existing
+    // to block the learn.
+    seed_trie_with(td.path(), &[&["git"]]);
+
+    let tree = tree_path_of(td.path());
+    let before = CommandTrie::load(&tree).unwrap();
+    let count_before = before
+        .root
+        .get_child("git")
+        .map(|n| n.count)
+        .unwrap_or(0);
+
+    // Use an abbreviated form so resolve returns Resolved (not Passthrough).
+    // With only `git` in the trie and no git-* siblings, `gi` resolves uniquely.
+    let (code, _, stderr) =
+        run(cmd_in(td.path()).args(["learn", "--exit-code", "0", "--", "gi"]));
+    assert_eq!(code, 0, "learn stderr: {}", stderr);
+
+    let after = CommandTrie::load(&tree).unwrap();
+    let count_after = after.root.get_child("git").expect("git node").count;
+    assert!(
+        count_after > count_before,
+        "count should increase: before={} after={}",
+        count_before,
+        count_after
+    );
+}
+
+#[test]
+fn learn_failure_does_not_create_new_node() {
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    // Seed a trie with only `git` so `nonsense_xyz_abc` is absent.
+    seed_trie_with(td.path(), &[&["git"]]);
+
+    let (code, _, stderr) = run(
+        cmd_in(td.path()).args(["learn", "--exit-code", "1", "--", "nonsense_xyz_abc foo"]),
+    );
+    assert_eq!(code, 0, "learn stderr: {}", stderr);
+
+    let trie = CommandTrie::load(&tree_path_of(td.path())).unwrap();
+    assert!(
+        trie.root.get_child("nonsense_xyz_abc").is_none(),
+        "failure learn must not create a new node"
+    );
+}
+
+#[test]
+fn learn_failure_bumps_failures_on_existing() {
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    // Seed a trie with `git` and `git status` so the full path exists and
+    // record_failure can tally failures on the `git` node.
+    seed_trie_with(td.path(), &[&["git", "status"]]);
+
+    let tree = tree_path_of(td.path());
+    let before = CommandTrie::load(&tree).unwrap();
+    let count_before = before
+        .root
+        .get_child("git")
+        .map(|n| n.count)
+        .unwrap_or(0);
+    let failures_before = before
+        .root
+        .get_child("git")
+        .map(|n| n.failures)
+        .unwrap_or(0);
+
+    // Use an abbreviated form so resolve returns Resolved (not Passthrough).
+    // With only `["git", "status"]` in the trie, `gi stat` resolves uniquely.
+    let (code, _, stderr) =
+        run(cmd_in(td.path()).args(["learn", "--exit-code", "1", "--", "gi stat"]));
+    assert_eq!(code, 0, "learn stderr: {}", stderr);
+
+    let after = CommandTrie::load(&tree).unwrap();
+    let git = after.root.get_child("git").expect("git node");
+    assert_eq!(
+        git.count, count_before,
+        "failure learn must not bump count"
+    );
+    assert_eq!(
+        git.failures,
+        failures_before + 1,
+        "failure learn must increment failures"
+    );
+}
+
+#[test]
+fn learn_success_sets_last_used() {
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    // Seed a trie with only `git` so there are no git-prefixed siblings.
+    seed_trie_with(td.path(), &[&["git"]]);
+
+    // Use an abbreviated form so resolve returns Resolved (not Passthrough).
+    // With only `git` in the trie and no git-* siblings, `gi` resolves uniquely.
+    let (code, _, stderr) =
+        run(cmd_in(td.path()).args(["learn", "--exit-code", "0", "--", "gi"]));
+    assert_eq!(code, 0, "learn stderr: {}", stderr);
+
+    let trie = CommandTrie::load(&tree_path_of(td.path())).unwrap();
+    let last_used = trie.root.get_child("git").expect("git node").last_used;
+    assert!(last_used > 0, "last_used should be set after success learn");
+}
