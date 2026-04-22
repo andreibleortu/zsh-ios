@@ -101,7 +101,7 @@ alias | zsh-ios build --aliases-stdin
 | Key | Action |
 |-----|--------|
 | **Enter** | Resolve abbreviations and execute. If ambiguous, show a keystroke-driven picker (auto-accepts the moment your digits uniquely identify an option). |
-| **Tab** | Expand to longest common prefix. If already expanded, fall through to native Zsh completion. |
+| **Tab** | Expand to longest common prefix. If already expanded, fall through to native Zsh completion. On ambiguity, show the same numbered picker as Enter — selecting populates the buffer and returns to the prompt so you can edit or Enter, without executing. |
 | **?** | IOS-style help. Show completions for the current position — subcommands, flags with expected argument type, or live argument values (branches, hosts, signals, users, tracked files, ...). |
 | **Leading `!`** | Bypass zsh-ios entirely — the buffer runs exactly as typed (history expansion, literal-run). |
 

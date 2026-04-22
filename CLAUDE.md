@@ -63,7 +63,7 @@ Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and futur
 - The plugin also spawns a `zpty`-based **completion worker** (`_zsh_ios_worker_*`) that preloads `compinit` so generic Zsh completion can be queried cheaply from the `?` key. The worker sources this same plugin file but bails immediately via the `_ZSH_IOS_IS_WORKER` guard at the top — do not move that guard.
 - A stale-trie rebuild runs in the background on shell startup if `tree.msgpack` is >1h old.
 - **Leading-`!` bypass**: if `BUFFER` starts with `!`, Enter/Tab/`?` fall through to native zsh (history expansion, literal run). The Rust side mirrors this: `resolve_line` and `complete` short-circuit via `starts_with_bang` so the binary is safe to call directly on such input too.
-- **Ambiguous picker** is keystroke-driven: reads one digit at a time and auto-commits the moment the typed number uniquely identifies an option (i.e. no longer number `<=N` starts with the buffered digits). Out-of-range keystrokes are silently dropped; Enter force-commits or cancels on empty.
+- **Ambiguous picker** is keystroke-driven: reads one digit at a time and auto-commits the moment the typed number uniquely identifies an option (i.e. no longer number `<=N` starts with the buffered digits). Out-of-range keystrokes are silently dropped; Enter force-commits or cancels on empty. Used by both Enter and Tab via `_zsh_ios_handle_ambiguity <output> <mode>` where mode is `accept` (runs the selection — Enter path) or `expand` (populates BUFFER and `zle reset-prompt`s so the user can edit or re-Enter — Tab path). Both modes still pin the chosen mapping so the next invocation resolves without a prompt.
 
 ### Learning invariants
 

@@ -160,7 +160,7 @@ _zsh_ios_accept_line() {
             zle accept-line
             ;;
         1)
-            _zsh_ios_handle_ambiguity "$output"
+            _zsh_ios_handle_ambiguity "$output" accept
             ;;
         3)
             _zsh_ios_handle_path_ambiguity "$output" accept
@@ -198,30 +198,7 @@ _zsh_ios_expand_or_complete() {
             fi
             ;;
         1)
-            # Ambiguous -- parse shell vars from Rust output
-            local _zio_word _zio_lcp _zio_position _zio_resolved_prefix _zio_remaining
-            local -a _zio_candidates _zio_deep_display _zio_deep_items
-            _zsh_ios_safe_eval "$output"
-
-            # Expand buffer to LCP if longer than what was typed
-            if [[ -n "$_zio_lcp" && "$_zio_lcp" != "$_zio_word" ]]; then
-                if [[ -n "$_zio_resolved_prefix" ]]; then
-                    BUFFER="$_zio_resolved_prefix $_zio_lcp"
-                else
-                    BUFFER="$_zio_lcp"
-                fi
-                CURSOR=${#BUFFER}
-            fi
-
-            # Show candidates
-            if (( ${#_zio_candidates} > 0 )); then
-                local msg="% Ambiguous command: \"$_zio_word\""
-                local c
-                for c in "${_zio_candidates[@]}"; do
-                    msg+=$'\n'"  $c"
-                done
-                zle -M "$msg"
-            fi
+            _zsh_ios_handle_ambiguity "$output" expand
             ;;
         3)
             _zsh_ios_handle_path_ambiguity "$output" expand
@@ -396,7 +373,11 @@ _zsh_ios_help() {
 }
 
 # --- Ambiguity handler with interactive clarifier ---
+# Modes:
+#   accept — pick and run (Enter path)
+#   expand — pick, populate BUFFER, return to prompt so the user can edit or Enter (Tab path)
 _zsh_ios_handle_ambiguity() {
+    local mode="${2:-accept}"
     local _zio_word _zio_lcp _zio_position _zio_resolved_prefix _zio_remaining _zio_pins_path
     local -a _zio_candidates _zio_deep_display _zio_deep_items
     _zsh_ios_safe_eval "$1"
@@ -571,7 +552,13 @@ _zsh_ios_handle_ambiguity() {
     fi
 
     BUFFER="${full_cmd%% }"
-    zle accept-line
+    CURSOR=${#BUFFER}
+    if [[ "$mode" == "expand" ]]; then
+        # Redraw so the user can inspect / edit before pressing Enter.
+        zle reset-prompt
+    else
+        zle accept-line
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
