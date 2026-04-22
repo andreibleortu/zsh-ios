@@ -605,6 +605,128 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ("ip rule", &[], None, &[]),
         ("ip monitor", &[], None, &[]),
         ("ip netns", &[], None, &[]),
+
+        // --- Docker (rich arg types) ---
+        ("docker run", &[(1, ARG_MODE_DOCKER_IMAGE)], None, &[
+            ("--network", ARG_MODE_DOCKER_NETWORK),
+            ("--volumes-from", ARG_MODE_DOCKER_CONTAINER),
+        ]),
+        ("docker exec", &[(1, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker start", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker stop", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker restart", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker kill", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker rm", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker logs", &[(1, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker inspect", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker attach", &[(1, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker top", &[(1, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker pause", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker unpause", &[(1, ARG_MODE_DOCKER_CONTAINER)], Some(ARG_MODE_DOCKER_CONTAINER), &[]),
+        ("docker rmi", &[(1, ARG_MODE_DOCKER_IMAGE)], Some(ARG_MODE_DOCKER_IMAGE), &[]),
+        ("docker pull", &[(1, ARG_MODE_DOCKER_IMAGE)], None, &[]),
+        ("docker push", &[(1, ARG_MODE_DOCKER_IMAGE)], None, &[]),
+        ("docker tag", &[(1, ARG_MODE_DOCKER_IMAGE), (2, ARG_MODE_DOCKER_IMAGE)], None, &[]),
+        ("docker network inspect", &[(1, ARG_MODE_DOCKER_NETWORK)], Some(ARG_MODE_DOCKER_NETWORK), &[]),
+        ("docker network rm", &[(1, ARG_MODE_DOCKER_NETWORK)], Some(ARG_MODE_DOCKER_NETWORK), &[]),
+        ("docker network connect", &[(1, ARG_MODE_DOCKER_NETWORK), (2, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker network disconnect", &[(1, ARG_MODE_DOCKER_NETWORK), (2, ARG_MODE_DOCKER_CONTAINER)], None, &[]),
+        ("docker volume rm", &[(1, ARG_MODE_DOCKER_VOLUME)], Some(ARG_MODE_DOCKER_VOLUME), &[]),
+        ("docker volume inspect", &[(1, ARG_MODE_DOCKER_VOLUME)], Some(ARG_MODE_DOCKER_VOLUME), &[]),
+        ("docker compose up", &[], Some(ARG_MODE_DOCKER_COMPOSE_SERVICE), &[]),
+        ("docker compose down", &[], None, &[]),
+        ("docker compose logs", &[], Some(ARG_MODE_DOCKER_COMPOSE_SERVICE), &[]),
+        ("docker compose exec", &[(1, ARG_MODE_DOCKER_COMPOSE_SERVICE)], None, &[]),
+        ("docker compose run", &[(1, ARG_MODE_DOCKER_COMPOSE_SERVICE)], None, &[]),
+        ("docker compose restart", &[], Some(ARG_MODE_DOCKER_COMPOSE_SERVICE), &[]),
+        ("docker compose start", &[], Some(ARG_MODE_DOCKER_COMPOSE_SERVICE), &[]),
+        ("docker compose stop", &[], Some(ARG_MODE_DOCKER_COMPOSE_SERVICE), &[]),
+
+        // --- Kubernetes (kubectl) with rich arg types ---
+        ("kubectl config use-context", &[(1, ARG_MODE_K8S_CONTEXT)], None, &[]),
+        ("kubectl config delete-context", &[(1, ARG_MODE_K8S_CONTEXT)], None, &[]),
+        ("kubectl config rename-context", &[(1, ARG_MODE_K8S_CONTEXT), (2, ARG_MODE_K8S_CONTEXT)], None, &[]),
+        ("kubectl config set-context", &[(1, ARG_MODE_K8S_CONTEXT)], None, &[]),
+
+        // --- systemctl with SYSTEMD_UNIT ---
+        ("systemctl start", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl stop", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl restart", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl reload", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl status", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl enable", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl disable", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl mask", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl unmask", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl cat", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+        ("systemctl edit", &[(1, ARG_MODE_SYSTEMD_UNIT)], Some(ARG_MODE_SYSTEMD_UNIT), &[]),
+
+        // --- Homebrew with BREW_FORMULA / BREW_CASK ---
+        ("brew install", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew uninstall", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew upgrade", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew info", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew remove", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew reinstall", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew pin", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+        ("brew unpin", &[(1, ARG_MODE_BREW_FORMULA)], Some(ARG_MODE_BREW_FORMULA), &[]),
+
+        // --- Package managers with rich types ---
+        ("apt install", &[(1, ARG_MODE_APT_PACKAGE)], Some(ARG_MODE_APT_PACKAGE), &[]),
+        ("apt remove", &[(1, ARG_MODE_APT_PACKAGE)], Some(ARG_MODE_APT_PACKAGE), &[]),
+        ("apt purge", &[(1, ARG_MODE_APT_PACKAGE)], Some(ARG_MODE_APT_PACKAGE), &[]),
+        ("apt show", &[(1, ARG_MODE_APT_PACKAGE)], Some(ARG_MODE_APT_PACKAGE), &[]),
+        ("apt search", &[(1, ARG_MODE_APT_PACKAGE)], None, &[]),
+        ("dnf install", &[(1, ARG_MODE_DNF_PACKAGE)], Some(ARG_MODE_DNF_PACKAGE), &[]),
+        ("dnf remove", &[(1, ARG_MODE_DNF_PACKAGE)], Some(ARG_MODE_DNF_PACKAGE), &[]),
+        ("dnf info", &[(1, ARG_MODE_DNF_PACKAGE)], Some(ARG_MODE_DNF_PACKAGE), &[]),
+        ("pacman -S", &[(1, ARG_MODE_PACMAN_PACKAGE)], Some(ARG_MODE_PACMAN_PACKAGE), &[]),
+        ("pacman -R", &[(1, ARG_MODE_PACMAN_PACKAGE)], Some(ARG_MODE_PACMAN_PACKAGE), &[]),
+
+        // --- tmux / screen ---
+        ("tmux attach", &[], None, &[("-t", ARG_MODE_TMUX_SESSION)]),
+        ("tmux attach-session", &[], None, &[("-t", ARG_MODE_TMUX_SESSION)]),
+        ("tmux kill-session", &[], None, &[("-t", ARG_MODE_TMUX_SESSION)]),
+        ("tmux switch-client", &[], None, &[("-t", ARG_MODE_TMUX_SESSION)]),
+        ("tmux has-session", &[], None, &[("-t", ARG_MODE_TMUX_SESSION)]),
+        ("screen -r", &[(1, ARG_MODE_SCREEN_SESSION)], None, &[]),
+        ("screen -x", &[(1, ARG_MODE_SCREEN_SESSION)], None, &[]),
+
+        // --- npm / yarn / pnpm with project-scoped types ---
+        ("npm install", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("npm uninstall", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("npm run", &[(1, ARG_MODE_NPM_SCRIPT)], None, &[]),
+        ("npm run-script", &[(1, ARG_MODE_NPM_SCRIPT)], None, &[]),
+        ("yarn add", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("yarn remove", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("yarn run", &[(1, ARG_MODE_NPM_SCRIPT)], None, &[]),
+        ("pnpm add", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("pnpm remove", &[(1, ARG_MODE_NPM_PACKAGE)], Some(ARG_MODE_NPM_PACKAGE), &[]),
+        ("pnpm run", &[(1, ARG_MODE_NPM_SCRIPT)], None, &[]),
+
+        // --- pip ---
+        ("pip install", &[(1, ARG_MODE_PIP_PACKAGE)], Some(ARG_MODE_PIP_PACKAGE), &[("-r", ARG_MODE_PATHS)]),
+        ("pip uninstall", &[(1, ARG_MODE_PIP_PACKAGE)], Some(ARG_MODE_PIP_PACKAGE), &[]),
+        ("pip show", &[(1, ARG_MODE_PIP_PACKAGE)], Some(ARG_MODE_PIP_PACKAGE), &[]),
+        ("pip3 install", &[(1, ARG_MODE_PIP_PACKAGE)], Some(ARG_MODE_PIP_PACKAGE), &[("-r", ARG_MODE_PATHS)]),
+        ("pip3 uninstall", &[(1, ARG_MODE_PIP_PACKAGE)], Some(ARG_MODE_PIP_PACKAGE), &[]),
+
+        // --- make / just ---
+        ("make", &[], Some(ARG_MODE_MAKE_TARGET), &[("-f", ARG_MODE_PATHS), ("-C", ARG_MODE_DIRS_ONLY)]),
+        ("just", &[], Some(ARG_MODE_JUST_RECIPE), &[("-f", ARG_MODE_PATHS)]),
+
+        // --- git-advanced positional slots ---
+        ("git stash show", &[(1, ARG_MODE_GIT_STASH)], None, &[]),
+        ("git stash apply", &[(1, ARG_MODE_GIT_STASH)], None, &[]),
+        ("git stash pop", &[(1, ARG_MODE_GIT_STASH)], None, &[]),
+        ("git stash drop", &[(1, ARG_MODE_GIT_STASH)], None, &[]),
+        ("git worktree remove", &[(1, ARG_MODE_GIT_WORKTREE)], None, &[]),
+        ("git worktree move", &[(1, ARG_MODE_GIT_WORKTREE), (2, ARG_MODE_DIRS_ONLY)], None, &[]),
+        ("git cherry-pick", &[(1, ARG_MODE_GIT_COMMIT)], Some(ARG_MODE_GIT_COMMIT), &[]),
+        ("git revert", &[(1, ARG_MODE_GIT_COMMIT)], Some(ARG_MODE_GIT_COMMIT), &[]),
+        ("git show", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
+        ("git bisect good", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
+        ("git bisect bad", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
     ];
 
     // Commands whose rest/positional completions come from an external program.
