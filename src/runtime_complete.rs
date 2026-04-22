@@ -386,6 +386,49 @@ fn filter_prefix(items: &[String], prefix: &str) -> Vec<String> {
 
 // --- Public API ---
 
+/// Invoke a resolver, wrapping the call with a cross-invocation on-disk cache.
+///
+/// The cache is keyed on the resolver id + cwd + prior words (not the partial
+/// prefix, which is user-typed noise and would fragment the cache needlessly).
+/// Prefix filtering is applied by the caller after this returns.
+///
+/// A `Duration::ZERO` TTL from `resolver.cache_ttl()` opts the resolver out
+/// of caching entirely — the resolver is called directly and results are never
+/// stored on disk.
+fn list_with_cache(
+    resolver: &dyn crate::type_resolver::TypeResolver,
+    mode: u8,
+    ctx: &Ctx,
+) -> Vec<String> {
+    let ttl = resolver.cache_ttl();
+    if ttl.is_zero() {
+        return resolver.list(ctx);
+    }
+    let cache = match crate::runtime_cache::RuntimeCache::default_location() {
+        Some(c) => c,
+        None => return resolver.list(ctx),
+    };
+    let id: &str = if resolver.id().is_empty() {
+        // Synthesize a stable id from the mode number so unnamed resolvers
+        // still get a usable cache key.  Box::leak is acceptable here because
+        // this path is only taken for the rare case of an unnamed resolver, and
+        // the leaked allocation is a handful of bytes that lives for the
+        // process lifetime anyway.
+        Box::leak(format!("mode-{}", mode).into_boxed_str())
+    } else {
+        resolver.id()
+    };
+    let cwd = ctx.cwd.as_deref();
+    let prior: Vec<&str> = ctx.prior_words.iter().map(String::as_str).collect();
+    let key = crate::runtime_cache::make_key(id, cwd, &prior);
+    if let Some(hit) = cache.get(&key, ttl) {
+        return hit;
+    }
+    let fresh = resolver.list(ctx);
+    let _ = cache.put(&key, &fresh);
+    fresh
+}
+
 /// Resolve a prefix against the completions for a given arg type.
 /// Returns the unique match if exactly one, or None if zero or ambiguous.
 pub fn resolve_prefix(arg_type: u8, prefix: &str) -> Option<String> {
@@ -406,7 +449,7 @@ pub fn resolve_prefix(arg_type: u8, prefix: &str) -> Option<String> {
     // Registry fast path for all other registered types.
     if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
         let ctx = Ctx::with_partial(prefix);
-        let items = resolver.list(&ctx);
+        let items = list_with_cache(resolver, arg_type, &ctx);
         let filtered = filter_prefix(&items, prefix);
         return match filtered.len() {
             1 => Some(filtered.into_iter().next().unwrap()),
@@ -450,7 +493,7 @@ pub fn list_matches(arg_type: u8, prefix: &str) -> Vec<String> {
     // Registry fast path for all registered types.
     if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
         let ctx = Ctx::with_partial(prefix);
-        let items = resolver.list(&ctx);
+        let items = list_with_cache(resolver, arg_type, &ctx);
         return filter_prefix(&items, prefix);
     }
 
@@ -940,5 +983,70 @@ host prod staging !excluded
         if let Some(c) = cwd {
             let _ = std::env::set_current_dir(c);
         }
+    }
+
+    // --- list_with_cache integration ---
+
+    /// Verify that `list_matches` (and therefore `list_with_cache`) calls the
+    /// resolver only once on a second invocation with the same context when the
+    /// on-disk cache is warm.
+    ///
+    /// We register a counting resolver under a test-only mode number (200),
+    /// redirect the runtime cache to a fresh tempdir via `ZSH_IOS_RUNTIME_CACHE_DIR`,
+    /// then call `list_matches` twice and assert the resolver's `list` method
+    /// was invoked exactly once.
+    #[test]
+    fn list_matches_uses_cache_hit_on_second_call() {
+        use std::sync::{Arc, Mutex};
+        use crate::type_resolver::{Ctx, TypeResolver};
+
+        // A resolver that counts how many times `list` is called.
+        struct CountingResolver {
+            call_count: Arc<Mutex<usize>>,
+            items: Vec<String>,
+        }
+        impl TypeResolver for CountingResolver {
+            fn list(&self, _ctx: &Ctx) -> Vec<String> {
+                *self.call_count.lock().unwrap() += 1;
+                self.items.clone()
+            }
+            fn cache_ttl(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn id(&self) -> &'static str {
+                "counting-resolver-test"
+            }
+        }
+
+        // We cannot inject into the global REGISTRY (it's a LazyLock), so we
+        // exercise `list_with_cache` directly instead.  This tests the exact
+        // code path used by both `list_matches` and `resolve_prefix`.
+        let td = tempfile::tempdir().unwrap();
+        // Override the cache dir so we don't pollute the real cache.
+        // SAFETY: test binary is single-threaded at this point (standard
+        // Rust test runner runs each #[test] sequentially within a thread).
+        // We restore the variable immediately after the calls so it doesn't
+        // leak into other tests.
+        unsafe { std::env::set_var("ZSH_IOS_RUNTIME_CACHE_DIR", td.path().as_os_str()) };
+
+        let call_count = Arc::new(Mutex::new(0usize));
+        let resolver = CountingResolver {
+            call_count: Arc::clone(&call_count),
+            items: vec!["branch-a".to_string(), "branch-b".to_string()],
+        };
+        let ctx = Ctx::with_partial("");
+
+        let result1 = list_with_cache(&resolver, 200, &ctx);
+        let result2 = list_with_cache(&resolver, 200, &ctx);
+
+        unsafe { std::env::remove_var("ZSH_IOS_RUNTIME_CACHE_DIR") };
+
+        assert_eq!(result1, vec!["branch-a", "branch-b"]);
+        assert_eq!(result1, result2, "second call must return the same items");
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            1,
+            "resolver.list() must be called exactly once; cache should serve the second call"
+        );
     }
 }

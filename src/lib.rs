@@ -15,6 +15,7 @@ pub mod history;
 pub mod path_resolve;
 pub mod pins;
 pub mod resolve;
+pub mod runtime_cache;
 pub mod runtime_complete;
 pub mod scanner;
 pub mod trie;
