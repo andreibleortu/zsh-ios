@@ -253,4 +253,105 @@ mod tests {
         assert!(trie.root.get_child("cd").is_some());
         assert!(trie.root.get_child("echo").is_some());
     }
+
+    #[test]
+    fn test_parse_aliases_skips_invalid_lines() {
+        let input = b"\
+# a comment line
+just-a-word
+=leading-equals
+name with space=value
+ok='value'
+";
+        let cur = io::Cursor::new(input);
+        let mut trie = CommandTrie::new();
+        let count = parse_aliases(io::BufReader::new(cur), &mut trie);
+        assert_eq!(count, 1, "only `ok` is a valid alias line");
+        assert!(trie.root.get_child("ok").is_some());
+    }
+
+    #[test]
+    fn test_parse_aliases_strips_surrounding_quotes() {
+        let input = b"a='git status'\nb=\"git log\"\nc=git\\ status\n";
+        let cur = io::Cursor::new(input);
+        let mut trie = CommandTrie::new();
+        parse_aliases(io::BufReader::new(cur), &mut trie);
+        // Both quote styles should have taught `git status` and `git log`.
+        let git = trie.root.get_child("git").unwrap();
+        assert!(git.get_child("status").is_some());
+        assert!(git.get_child("log").is_some());
+    }
+
+    #[test]
+    fn test_parse_aliases_single_word_value_not_learned_as_sequence() {
+        // Single-word values shouldn't insert a sequence into the trie — only
+        // the alias name itself becomes a command.
+        let input = b"k=kubectl\n";
+        let cur = io::Cursor::new(input);
+        let mut trie = CommandTrie::new();
+        parse_aliases(io::BufReader::new(cur), &mut trie);
+        assert!(trie.root.get_child("k").is_some());
+        // kubectl is NOT added because it's the only word; the alias-value
+        // split requires 2+ words to become a trie sequence.
+        assert!(trie.root.get_child("kubectl").is_none());
+    }
+
+    #[test]
+    fn test_parse_aliases_with_pipe_chain() {
+        let input = b"x='ls -la | grep foo'\n";
+        let cur = io::Cursor::new(input);
+        let mut trie = CommandTrie::new();
+        parse_aliases(io::BufReader::new(cur), &mut trie);
+        // Each pipeline segment becomes its own sequence.
+        let ls = trie.root.get_child("ls").expect("ls learned");
+        assert!(ls.get_child("-la").is_some());
+        let grep = trie.root.get_child("grep").expect("grep learned");
+        assert!(grep.get_child("foo").is_some());
+    }
+
+    #[test]
+    fn test_scan_path_finds_executables_in_tmpdir() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        // Build a fake PATH pointing at a tempdir containing one executable.
+        let td = tempfile::tempdir().unwrap();
+        let exe = td.path().join("my-fake-cmd");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exe, perms).unwrap();
+
+        // Drop a hidden file and a non-executable file to confirm they're filtered.
+        std::fs::write(td.path().join(".hidden"), "#!/bin/sh\n").unwrap();
+        let ro = td.path().join("not-executable");
+        std::fs::write(&ro, "x").unwrap();
+        let mut p = std::fs::metadata(&ro).unwrap().permissions();
+        p.set_mode(0o644);
+        std::fs::set_permissions(&ro, p).unwrap();
+
+        // Take the lock on PATH; tests can run in parallel but we restore
+        // the original PATH before scan returns so interleaving is fine —
+        // we just need our dir visible for this process during scan_path.
+        //
+        // SAFETY: set_var is `unsafe` in recent Rust editions because other
+        // threads may read PATH concurrently. The test binary is a
+        // controlled single-threaded call site here.
+        let orig = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("PATH", td.path());
+        }
+
+        let mut trie = CommandTrie::new();
+        let count = scan_path(&mut trie);
+
+        // SAFETY: restore for the rest of the process.
+        unsafe {
+            std::env::set_var("PATH", &orig);
+        }
+
+        assert_eq!(count, 1, "only the one executable file should be counted");
+        assert!(trie.root.get_child("my-fake-cmd").is_some());
+        assert!(trie.root.get_child(".hidden").is_none());
+        assert!(trie.root.get_child("not-executable").is_none());
+    }
 }

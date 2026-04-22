@@ -278,14 +278,29 @@ impl CommandTrie {
         self.root.insert_command(name);
     }
 
-    /// Serialize to MessagePack and write to file.
-    /// Uses named (map) encoding so the format survives field additions.
+    /// Serialize to MessagePack and write to file atomically.
+    /// Writes to a sibling tempfile and renames into place so concurrent
+    /// `learn` processes (spawned in the background by the Zsh plugin)
+    /// cannot observe or produce a truncated file.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let data = rmp_serde::to_vec_named(self)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, data)?;
+        let tmp = match path.file_name() {
+            Some(name) => {
+                let mut s = name.to_os_string();
+                s.push(format!(".tmp.{}", std::process::id()));
+                path.with_file_name(s)
+            }
+            None => return Err("invalid tree path".into()),
+        };
+        fs::write(&tmp, data)?;
+        // rename is atomic on the same filesystem on Unix.
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(Box::new(e));
+        }
         Ok(())
     }
 
@@ -362,5 +377,203 @@ mod tests {
         assert!(trie.root.is_prefix_of_existing("te")); // prefix of both
         assert!(!trie.root.is_prefix_of_existing("terraform")); // exact, not strict prefix
         assert!(!trie.root.is_prefix_of_existing("xyz")); // prefix of nothing
+    }
+
+    #[test]
+    fn test_insert_empty_is_noop() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&[]);
+        assert_eq!(trie.root.children.len(), 0);
+    }
+
+    #[test]
+    fn test_prefix_search_empty_prefix_returns_all() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("alpha");
+        trie.insert_command("beta");
+        trie.insert_command("gamma");
+        let all = trie.root.prefix_search("");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_marks_terminal_not_intermediate() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        let git = trie.root.get_child("git").unwrap();
+        assert!(!git.is_leaf, "intermediate 'git' should not be marked leaf by bare insert");
+        let checkout = git.get_child("checkout").unwrap();
+        assert!(checkout.is_leaf);
+    }
+
+    #[test]
+    fn test_insert_command_then_subcommand() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+        trie.insert(&["git", "checkout"]);
+        let git = trie.root.get_child("git").unwrap();
+        assert!(git.is_leaf, "insert_command marks top-level leaf");
+        assert!(git.get_child("checkout").unwrap().is_leaf);
+    }
+
+    #[test]
+    fn test_insert_increments_count() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["foo"]);
+        trie.insert(&["foo"]);
+        trie.insert(&["foo"]);
+        assert_eq!(trie.root.get_child("foo").unwrap().count, 3);
+    }
+
+    #[test]
+    fn test_arg_spec_type_at_positional_and_rest() {
+        let mut spec = ArgSpec::default();
+        spec.positional.insert(1, ARG_MODE_EXECS_ONLY);
+        spec.rest = Some(ARG_MODE_PATHS);
+        assert_eq!(spec.type_at(1), Some(ARG_MODE_EXECS_ONLY));
+        // Falls back to `rest` for unspecified positions.
+        assert_eq!(spec.type_at(2), Some(ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn test_arg_spec_type_after_flag_with_equals() {
+        let mut spec = ArgSpec::default();
+        spec.flag_args.insert("--output".into(), ARG_MODE_PATHS);
+        assert_eq!(spec.type_after_flag("--output"), Some(ARG_MODE_PATHS));
+        // `--output=` should strip the trailing `=` and match.
+        assert_eq!(spec.type_after_flag("--output="), Some(ARG_MODE_PATHS));
+        assert_eq!(spec.type_after_flag("--unknown"), None);
+    }
+
+    #[test]
+    fn test_arg_spec_flag_takes_value_sources() {
+        let mut spec = ArgSpec::default();
+        spec.flag_args.insert("-a".into(), ARG_MODE_PATHS);
+        spec.flag_call_programs
+            .insert("-b".into(), ("tag".into(), vec!["echo".into()]));
+        spec.flag_static_lists.insert("-c".into(), vec!["one".into()]);
+        assert!(spec.flag_takes_value("-a"));
+        assert!(spec.flag_takes_value("-b"));
+        assert!(spec.flag_takes_value("-c"));
+        assert!(!spec.flag_takes_value("-z"));
+    }
+
+    #[test]
+    fn test_arg_spec_is_empty() {
+        let spec = ArgSpec::default();
+        assert!(spec.is_empty());
+        let spec = ArgSpec {
+            rest: Some(ARG_MODE_PATHS),
+            ..Default::default()
+        };
+        assert!(!spec.is_empty());
+    }
+
+    #[test]
+    fn test_arg_spec_merge_gap_fills_only() {
+        let mut a = ArgSpec {
+            rest: Some(ARG_MODE_PATHS),
+            ..Default::default()
+        };
+        a.flag_args.insert("-x".into(), ARG_MODE_HOSTS);
+
+        let mut b = ArgSpec {
+            rest: Some(ARG_MODE_DIRS_ONLY), // should be ignored (a has rest)
+            ..Default::default()
+        };
+        b.flag_args.insert("-x".into(), ARG_MODE_USERS); // ignored
+        b.flag_args.insert("-y".into(), ARG_MODE_GROUPS); // filled
+        b.positional.insert(1, ARG_MODE_EXECS_ONLY); // filled (a had none)
+
+        a.merge(&b);
+        assert_eq!(a.rest, Some(ARG_MODE_PATHS));
+        assert_eq!(a.flag_args.get("-x"), Some(&ARG_MODE_HOSTS));
+        assert_eq!(a.flag_args.get("-y"), Some(&ARG_MODE_GROUPS));
+        assert_eq!(a.positional.get(&1), Some(&ARG_MODE_EXECS_ONLY));
+    }
+
+    #[test]
+    fn test_arg_spec_merge_context_rules() {
+        let mut a = ArgSpec {
+            context_rules: vec![ContextRule {
+                trigger_flags: vec!["-b".into()],
+                override_type: ARG_MODE_GIT_BRANCHES,
+            }],
+            ..Default::default()
+        };
+        let b = ArgSpec {
+            context_rules: vec![
+                ContextRule {
+                    trigger_flags: vec!["-b".into()],
+                    override_type: ARG_MODE_HOSTS,
+                }, // duplicate trigger → dropped
+                ContextRule {
+                    trigger_flags: vec!["-u".into()],
+                    override_type: ARG_MODE_USERS,
+                }, // unique trigger → kept
+            ],
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.context_rules.len(), 2);
+        assert_eq!(a.context_rules[0].override_type, ARG_MODE_GIT_BRANCHES);
+        assert_eq!(a.context_rules[1].override_type, ARG_MODE_USERS);
+    }
+
+    #[test]
+    fn save_writes_atomically_and_round_trips() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("nested").join("tree.msgpack");
+
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        trie.arg_modes.insert("cat".into(), ARG_MODE_PATHS);
+
+        trie.save(&path).expect("save");
+        // Atomic rename leaves no .tmp file behind.
+        let parent = path.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tempfile leaked: {:?}", leftovers);
+
+        let loaded = CommandTrie::load(&path).expect("load");
+        assert!(loaded.root.get_child("git").is_some());
+        assert_eq!(loaded.arg_modes.get("cat"), Some(&ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn load_errors_on_missing_file() {
+        let td = tempfile::tempdir().unwrap();
+        let err = CommandTrie::load(&td.path().join("does-not-exist.msgpack"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn load_errors_on_garbage() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("garbage.msgpack");
+        std::fs::write(&p, b"not messagepack").unwrap();
+        assert!(CommandTrie::load(&p).is_err());
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("t.msgpack");
+
+        let mut t1 = CommandTrie::new();
+        t1.insert_command("first");
+        t1.save(&path).unwrap();
+
+        let mut t2 = CommandTrie::new();
+        t2.insert_command("second");
+        t2.save(&path).unwrap();
+
+        let loaded = CommandTrie::load(&path).unwrap();
+        assert!(loaded.root.get_child("second").is_some());
+        assert!(loaded.root.get_child("first").is_none());
     }
 }

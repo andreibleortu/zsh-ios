@@ -151,7 +151,7 @@ mod tests {
         writeln!(f, "# comment line").unwrap();
         writeln!(f, "g ch -> git checkout").unwrap();
         writeln!(f, "tf -> terraform").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
 
         let pins = Pins::load(&path);
         assert_eq!(pins.entries.len(), 2);

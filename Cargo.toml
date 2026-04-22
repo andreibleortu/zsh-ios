@@ -11,9 +11,13 @@ categories = ["command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 rmp-serde = "1"
 dirs = "6"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

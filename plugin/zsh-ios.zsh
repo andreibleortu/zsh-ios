@@ -52,8 +52,22 @@ _zsh_ios_preexec() {
 }
 
 # Capture exit code before any other precmd hook can modify it.
-_zsh_ios_save_retval() {
+#
+# zsh invokes the `precmd` magic function BEFORE the precmd_functions array,
+# so wrapping `precmd` catches $? even if third-party plugins prepend their
+# own entry to precmd_functions after us. We preserve any user-defined
+# `precmd` by chaining through a renamed copy.
+if (( ! ${+functions[_zsh_ios_orig_precmd]} )); then
+    if (( ${+functions[precmd]} )); then
+        functions[_zsh_ios_orig_precmd]="${functions[precmd]}"
+    else
+        _zsh_ios_orig_precmd() { :; }
+    fi
+fi
+
+precmd() {
     _zsh_ios_retval=$?
+    _zsh_ios_orig_precmd "$@"
 }
 
 _zsh_ios_precmd() {
@@ -68,8 +82,6 @@ _zsh_ios_precmd() {
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec _zsh_ios_preexec
 add-zsh-hook precmd _zsh_ios_precmd
-# Ensure retval capture runs FIRST (before all other precmd hooks)
-precmd_functions=(_zsh_ios_save_retval "${(@)precmd_functions:#_zsh_ios_save_retval}")
 
 # --- Safe eval: validates output contains only expected _zio_ assignments ---
 _zsh_ios_safe_eval() {
@@ -104,6 +116,14 @@ _zsh_ios_accept_line() {
     fi
 
     if [[ "$BUFFER" == \#* ]]; then
+        zle accept-line
+        return
+    fi
+
+    # Leading `!` bypass: anything starting with ! is run as-is. Lets zsh's
+    # history expansion (!!, !$, !string) and explicit "run the literal
+    # command" usage pass through without zsh-ios touching the buffer.
+    if [[ "$BUFFER" == \!* ]]; then
         zle accept-line
         return
     fi
@@ -154,6 +174,12 @@ _zsh_ios_accept_line() {
 # --- ZLE Widget: Tab key (resolve + expand, no execute) ---
 _zsh_ios_expand_or_complete() {
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
+        zle expand-or-complete
+        return
+    fi
+
+    # Leading `!` bypass: fall through to native Zsh completion, untouched.
+    if [[ "$BUFFER" == \!* ]]; then
         zle expand-or-complete
         return
     fi
@@ -272,6 +298,13 @@ _zsh_ios_handle_path_ambiguity() {
 # a background Zsh process with the full completion system loaded.
 _zsh_ios_help() {
     if _zsh_ios_is_disabled; then
+        zle self-insert
+        return
+    fi
+
+    # Leading `!` bypass: `?` should be a literal self-insert so the user can
+    # edit their `!`-prefixed command without zsh-ios popping the help menu.
+    if [[ "$BUFFER" == \!* ]]; then
         zle self-insert
         return
     fi
@@ -422,43 +455,81 @@ _zsh_ios_handle_ambiguity() {
 
     echo ""
     echo "% Ambiguous command: \"$abbrev_str\""
-    local cancel_hint
-    (( ${#menu_display} <= 9 )) && cancel_hint="any other key" || cancel_hint="Enter"
-    echo "  Pick a number to save as shorthand ($cancel_hint to cancel):"
+    echo "  Pick a number to save as shorthand (Enter to cancel):"
     local i=1
     for item in "${menu_display[@]}"; do
         echo "    $i) $item"
         (( i++ ))
     done
 
-    local choice
     echo -n "  > "
-    if (( ${#menu_display} <= 9 )); then
-        read -r -k 1 choice </dev/tty
-        echo ""
-    else
-        read -r choice </dev/tty
-    fi
 
-    if [[ -z "$choice" || "$choice" == $'\n' ]]; then
+    # Keystroke-by-keystroke picker. Accept as soon as the digits typed so
+    # far uniquely identify an option — no Enter needed. For a 5-option menu
+    # that means `5` fires immediately; for a 20-option menu `3` fires
+    # immediately (no 30+ to extend to) but `1` waits for a second digit
+    # because 10-19 are all still reachable. Enter cancels when the buffer
+    # is empty or force-accepts the current digits.
+    local choice=""
+    local max=${#menu_display}
+    local key trial extendable k sk
+    while true; do
+        read -r -k 1 key </dev/tty
+        case "$key" in
+            $'\n'|$'\r')
+                # Enter: commit whatever's buffered, or cancel if empty.
+                echo ""
+                break
+                ;;
+            $'\x7f'|$'\b')
+                # Backspace: erase one digit from both buffer and display.
+                if [[ -n "$choice" ]]; then
+                    choice="${choice%?}"
+                    echo -n $'\b \b'
+                fi
+                ;;
+            [0-9])
+                trial="$choice$key"
+                # Is any option number strictly longer than `trial` that
+                # starts with `trial`? If yes, we must wait for more input.
+                extendable=0
+                for (( k = 1; k <= max; k++ )); do
+                    sk="$k"
+                    if (( ${#sk} > ${#trial} )) && [[ "$sk" == "$trial"* ]]; then
+                        extendable=1
+                        break
+                    fi
+                done
+                # `trial` itself must either equal a valid option or be a
+                # prefix of one. Anything else (e.g. `6` with only 5 options,
+                # `0` at any time) is a typo and gets silently dropped.
+                if (( trial >= 1 && trial <= max )) || (( extendable )); then
+                    choice="$trial"
+                    echo -n "$key"
+                    if (( !extendable )); then
+                        echo ""
+                        break
+                    fi
+                fi
+                ;;
+            *)
+                # Any non-digit, non-enter, non-backspace cancels.
+                echo ""
+                choice=""
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z "$choice" ]]; then
         zle reset-prompt
         return
     fi
 
     local selected_display selected_expanded
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#menu_display} )); then
+    if (( choice >= 1 && choice <= ${#menu_display} )); then
         selected_display="${menu_display[$choice]}"
         selected_expanded="${menu_expanded[$choice]}"
-    else
-        local idx=1
-        for item in "${menu_display[@]}"; do
-            if [[ "$item" == "$choice"* ]]; then
-                selected_display="$item"
-                selected_expanded="${menu_expanded[$idx]}"
-                break
-            fi
-            (( idx++ ))
-        done
     fi
 
     if [[ -z "$selected_display" ]]; then

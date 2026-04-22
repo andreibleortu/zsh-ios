@@ -8,8 +8,48 @@ mod runtime_complete;
 mod scanner;
 mod trie;
 
+#[cfg(test)]
+pub(crate) mod test_util {
+    //! Cross-module test helpers.
+    //!
+    //! The unit test suite touches process-global state — current working
+    //! directory, `PATH` — that rustc's default parallel runner will race on.
+    //! Any test that mutates `cwd` or `$PATH` must take `CWD_LOCK` for the
+    //! duration of its work.
+    use std::sync::Mutex;
+
+    pub static CWD_LOCK: Mutex<()> = Mutex::new(());
+}
+
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::process;
+
+/// Acquire an exclusive advisory lock on a sibling `.lock` file for the
+/// given path. The lock is released when the returned file handle drops.
+/// Used to serialize concurrent `learn` / `build` / `pin` writers that the
+/// Zsh plugin spawns in the background after every command.
+fn lock_for(path: &Path) -> Option<std::fs::File> {
+    let lock_path = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".lock");
+        std::path::PathBuf::from(s)
+    };
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    file.lock_exclusive().ok()?;
+    Some(file)
+}
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +132,9 @@ fn cmd_build(aliases_stdin: bool) {
         eprintln!("Error creating config dir: {}", e);
         process::exit(1);
     });
+
+    // Serialize against concurrent `learn` writers.
+    let _lock = lock_for(&config::tree_path());
 
     let mut ct = trie::CommandTrie::new();
 
@@ -247,7 +290,14 @@ fn cmd_learn(command: &str) {
         return;
     }
 
+    if config::ensure_config_dir().is_err() {
+        return;
+    }
+
     let tree_path = config::tree_path();
+    // Hold a lock across load-mutate-save so background `learn` processes
+    // spawned in rapid succession don't race and truncate the trie file.
+    let _lock = lock_for(&tree_path);
     let mut trie = match trie::CommandTrie::load(&tree_path) {
         Ok(t) => t,
         Err(_) => return,
@@ -288,6 +338,8 @@ fn cmd_pin(abbrev: &str, expanded: &str) {
         process::exit(1);
     });
 
+    let _lock = lock_for(&pins_path);
+
     // Remove existing pin for this abbreviation first
     let _ = pins::Pins::remove(&pins_path, &abbrev_words);
 
@@ -302,6 +354,7 @@ fn cmd_pin(abbrev: &str, expanded: &str) {
 fn cmd_unpin(abbrev: &str) {
     let abbrev_words: Vec<&str> = abbrev.split_whitespace().collect();
     let pins_path = config::pins_path();
+    let _lock = lock_for(&pins_path);
 
     match pins::Pins::remove(&pins_path, &abbrev_words) {
         Ok(true) => eprintln!("Removed pin: {}", abbrev),
@@ -333,17 +386,35 @@ fn cmd_list_pins() {
 }
 
 fn cmd_toggle() {
+    config::ensure_config_dir().unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    });
     let state_path = config::config_dir().join("disabled");
-    if state_path.exists() {
-        let _ = std::fs::remove_file(&state_path);
-        println!("zsh-ios: enabled");
-    } else {
-        config::ensure_config_dir().unwrap_or_else(|e| {
+    // Race-free toggle: try exclusive-create; if it already exists, remove it.
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&state_path)
+    {
+        Ok(_) => println!("zsh-ios: disabled"),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::remove_file(&state_path) {
+                Ok(_) => println!("zsh-ios: enabled"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Lost the race to another toggle; treat as enabled.
+                    println!("zsh-ios: enabled");
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
             eprintln!("Error: {}", e);
             process::exit(1);
-        });
-        let _ = std::fs::write(&state_path, "");
-        println!("zsh-ios: disabled");
+        }
     }
 }
 
@@ -413,9 +484,26 @@ fn cmd_status() {
 
 fn load_trie() -> trie::CommandTrie {
     let tree_path = config::tree_path();
-    trie::CommandTrie::load(&tree_path).unwrap_or_else(|_| {
-        eprintln!("Warning: No command tree found. Run `zsh-ios build` first.");
-        eprintln!("Tip: source the zsh-ios plugin or run: alias | zsh-ios build --aliases-stdin");
-        trie::CommandTrie::new()
-    })
+    match trie::CommandTrie::load(&tree_path) {
+        Ok(t) => t,
+        Err(e) => {
+            if tree_path.exists() {
+                // File is present but won't decode: surface the actual cause
+                // (likely corruption from a pre-atomic-save crash, or a stale
+                // format). Silently falling back to an empty trie hid this.
+                eprintln!(
+                    "zsh-ios: failed to load command tree at {}: {}",
+                    tree_path.display(),
+                    e
+                );
+                eprintln!("zsh-ios: run `zsh-ios rebuild` to regenerate it.");
+            } else {
+                eprintln!("Warning: No command tree found. Run `zsh-ios build` first.");
+                eprintln!(
+                    "Tip: source the zsh-ios plugin or run: alias | zsh-ios build --aliases-stdin"
+                );
+            }
+            trie::CommandTrie::new()
+        }
+    }
 }

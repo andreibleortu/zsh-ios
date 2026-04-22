@@ -55,7 +55,7 @@ fn load_descriptions(trie: &mut CommandTrie, fpath_dirs: &[String]) {
     // Step 1: Load YAML fallback descriptions (bundled at compile time)
     let yaml_str = include_str!("../data/descriptions.yaml");
     let yaml_map: HashMap<String, HashMap<String, String>> =
-        serde_yaml::from_str(yaml_str).unwrap_or_default();
+        serde_yaml_ng::from_str(yaml_str).unwrap_or_default();
 
     // Insert YAML descriptions as the base layer
     for (parent, subs) in yaml_map {
@@ -674,13 +674,12 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
             }
             // Rest override only for commands without a completion file —
             // the parser handles rest for commands that have one.
-            if !has_completions {
-                if let Some(r) = rest
+            if !has_completions
+                && let Some(r) = rest
                     && (spec.rest.is_none() || spec.rest == Some(ARG_MODE_PATHS))
                 {
                     spec.rest = Some(r);
                 }
-            }
         }
 
         // Flag specs are always applied (gap-fill only — won't overwrite a
@@ -741,15 +740,16 @@ fn completion_dirs() -> Vec<String> {
     dirs
 }
 
-/// Extract subcommands and per-position argument specs from completion files.
-/// Returns (command -> subcommands, command -> ArgSpec).
-fn extract_from_dirs(
-    dirs: &[String],
-) -> (
+/// Result of scanning completion directories: (subcommands-per-command,
+/// arg-spec-per-command, commands-that-had-a-completion-file).
+type ExtractedCompletions = (
     HashMap<String, Vec<String>>,
     HashMap<String, ArgSpec>,
     HashSet<String>,
-) {
+);
+
+/// Extract subcommands and per-position argument specs from completion files.
+fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
     let mut subcmds: HashMap<String, Vec<String>> = HashMap::new();
     let mut arg_specs: HashMap<String, ArgSpec> = HashMap::new();
     let mut cmds_with_completions: HashSet<String> = HashSet::new();
@@ -3456,7 +3456,7 @@ _arguments \
         let mut result = HashMap::new();
         extract_desc_entries("add:''", "git", &mut result);
         // Empty description should be skipped
-        assert!(result.get("git").is_none());
+        assert!(!result.contains_key("git"));
     }
 
     #[test]

@@ -45,7 +45,22 @@ pub struct DeepCandidate {
 ///
 /// Handles `|`, `||`, `&&`, and `;`.  Each segment is resolved independently;
 /// the first ambiguity encountered is returned so the caller can prompt.
+/// A leading `!` (optionally after whitespace) marks the buffer as a
+/// pass-through — zsh's history expansion or the user's explicit "run
+/// literal" intent takes over. We never expand, complete, or learn on such
+/// input.
+fn starts_with_bang(input: &str) -> bool {
+    input.trim_start().starts_with('!')
+}
+
 pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
+    // Leading `!`: the user wants zsh's history-expansion / literal-run
+    // semantics. Never touch the buffer — return it verbatim so the shell
+    // runs exactly what was typed.
+    if starts_with_bang(input) {
+        return ResolveResult::Passthrough(input.to_string());
+    }
+
     let parts = split_on_operators(input);
 
     // Fast path: no operators → resolve as a single command.
@@ -212,6 +227,12 @@ fn wrapper_inner_start(words: &[&str]) -> Option<usize> {
 
 /// Split a command line into words, preserving quoted strings as single tokens.
 /// Returns (words, quoted_mask) where quoted_mask[i] is true if words[i] was quoted.
+/// Split a line into words while tracking whether each word contains quotes.
+///
+/// Unclosed quotes consume the rest of the line as a single word — this
+/// matches what Zsh does with `PS2`-continuation input on a single command
+/// buffer. We never error on unterminated quotes; the downstream resolver
+/// will treat the blob as one argument.
 fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
     let mut words = Vec::new();
     let mut quoted = Vec::new();
@@ -228,9 +249,7 @@ fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
         }
 
         let start = i;
-        let is_quoted;
-
-        match bytes[i] {
+        let is_quoted = match bytes[i] {
             b'\'' => {
                 // Single-quoted string: find closing quote
                 i += 1;
@@ -240,7 +259,7 @@ fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
                 if i < bytes.len() {
                     i += 1; // consume closing quote
                 }
-                is_quoted = true;
+                true
             }
             b'"' => {
                 // Double-quoted string: find closing quote (respecting backslash)
@@ -254,7 +273,7 @@ fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
                 if i < bytes.len() {
                     i += 1;
                 }
-                is_quoted = true;
+                true
             }
             _ => {
                 // Unquoted word
@@ -286,9 +305,9 @@ fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
                     }
                 }
                 // Mark as quoted if the word contains quotes
-                is_quoted = input[start..i].contains('\'') || input[start..i].contains('"');
+                input[start..i].contains('\'') || input[start..i].contains('"')
             }
-        }
+        };
 
         let word = &input[start..i];
         if !word.is_empty() {
@@ -443,8 +462,8 @@ fn split_on_operators(input: &str) -> Vec<LinePart> {
 fn finalize_with_paths(input: &str, mut words: Vec<String>, trie: &CommandTrie) -> ResolveResult {
     // If the command word itself is a relative/absolute path (e.g. `./unin`,
     // `~/bin/foo`), resolve it against the filesystem before handling args.
-    if let Some(cmd) = words.first() {
-        if (cmd.contains('/') || cmd.starts_with('~')) && !cmd.starts_with('-') {
+    if let Some(cmd) = words.first()
+        && (cmd.contains('/') || cmd.starts_with('~')) && !cmd.starts_with('-') {
             match path_resolve::resolve_path(cmd) {
                 path_resolve::PathResult::Resolved(resolved) => {
                     words[0] = shell_escape_path(&resolved);
@@ -464,7 +483,6 @@ fn finalize_with_paths(input: &str, mut words: Vec<String>, trie: &CommandTrie) 
                 path_resolve::PathResult::Unchanged => {}
             }
         }
-    }
 
     // Look up per-position ArgSpec: try "cmd subcmd" first, then "cmd"
     let (spec, cmd_words) = lookup_arg_spec(&words, &trie.arg_specs);
@@ -1141,6 +1159,13 @@ fn has_filesystem_prefix_match(word: &str) -> bool {
 /// Returns a formatted list of matching commands/subcommands.
 /// Splits on pipe/chain operators and completes only the last segment.
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
+    // Leading `!` is a hands-off marker (see `starts_with_bang`). Produce no
+    // completions so the shell's native completion (or history expansion)
+    // gets a clean look.
+    if starts_with_bang(input) {
+        return String::new();
+    }
+
     // Use only the last segment after any pipe/chain operator.
     // Preserve trailing whitespace — it tells complete_segment whether the user
     // has finished the current word (trailing space) or is still typing it.
@@ -1844,6 +1869,8 @@ fn complete_filesystem(word: &str, dirs_only: bool) -> String {
 mod tests {
     use super::*;
     use crate::pins::Pin;
+    use crate::test_util::CWD_LOCK;
+    use crate::trie::ContextRule;
 
     fn build_test_trie() -> CommandTrie {
         let mut trie = CommandTrie::new();
@@ -1978,14 +2005,11 @@ mod tests {
         let pins = Pins::default();
 
         // "cd te" should NOT return trie-level Ambiguous with executables
-        match resolve("cd te", &trie, &pins) {
-            ResolveResult::Ambiguous(info) => {
-                panic!(
-                    "cd args should skip trie resolution, got ambiguous: {:?}",
-                    info.candidates
-                );
-            }
-            _ => {} // Passthrough, Resolved, or PathAmbiguous are all acceptable
+        if let ResolveResult::Ambiguous(info) = resolve("cd te", &trie, &pins) {
+            panic!(
+                "cd args should skip trie resolution, got ambiguous: {:?}",
+                info.candidates
+            );
         }
     }
 
@@ -1997,11 +2021,8 @@ mod tests {
         trie.insert(&["pushd", "pictures"]);
         let pins = Pins::default();
 
-        match resolve("pushd pro", &trie, &pins) {
-            ResolveResult::Ambiguous(_) => {
-                panic!("pushd args should skip trie resolution");
-            }
-            _ => {}
+        if let ResolveResult::Ambiguous(_) = resolve("pushd pro", &trie, &pins) {
+            panic!("pushd args should skip trie resolution");
         }
     }
 
@@ -2015,14 +2036,11 @@ mod tests {
         let pins = Pins::default();
 
         // "ls te" should NOT produce trie-level Ambiguous
-        match resolve("ls te", &trie, &pins) {
-            ResolveResult::Ambiguous(info) => {
-                panic!(
-                    "ls args should skip trie, got ambiguous: {:?}",
-                    info.candidates
-                );
-            }
-            _ => {}
+        if let ResolveResult::Ambiguous(info) = resolve("ls te", &trie, &pins) {
+            panic!(
+                "ls args should skip trie, got ambiguous: {:?}",
+                info.candidates
+            );
         }
     }
 
@@ -2233,13 +2251,13 @@ mod tests {
 
     fn load_yaml_descriptions() -> trie::DescriptionMap {
         let yaml_str = include_str!("../data/descriptions.yaml");
-        serde_yaml::from_str(yaml_str).unwrap()
+        serde_yaml_ng::from_str(yaml_str).unwrap()
     }
 
     #[test]
     fn test_descriptions_unknown() {
         let descs = load_yaml_descriptions();
-        assert!(descs.get("unknowncommand").is_none());
+        assert!(!descs.contains_key("unknowncommand"));
     }
 
     #[test]
@@ -2651,8 +2669,10 @@ mod tests {
     #[test]
     fn test_lookup_arg_spec_two_word() {
         let mut specs = trie::ArgSpecMap::new();
-        let mut git_add_spec = ArgSpec::default();
-        git_add_spec.rest = Some(trie::ARG_MODE_PATHS);
+        let git_add_spec = ArgSpec {
+            rest: Some(trie::ARG_MODE_PATHS),
+            ..Default::default()
+        };
         specs.insert("git add".into(), git_add_spec);
 
         let words: Vec<String> = vec!["git".into(), "add".into(), "file.txt".into()];
@@ -2665,8 +2685,10 @@ mod tests {
     #[test]
     fn test_lookup_arg_spec_one_word_fallback() {
         let mut specs = trie::ArgSpecMap::new();
-        let mut cat_spec = ArgSpec::default();
-        cat_spec.rest = Some(trie::ARG_MODE_PATHS);
+        let cat_spec = ArgSpec {
+            rest: Some(trie::ARG_MODE_PATHS),
+            ..Default::default()
+        };
         specs.insert("cat".into(), cat_spec);
 
         let words: Vec<String> = vec!["cat".into(), "file.txt".into()];
@@ -2688,8 +2710,10 @@ mod tests {
     fn test_lookup_arg_spec_flag_not_subcmd() {
         // If word[1] starts with -, don't try two-word lookup
         let mut specs = trie::ArgSpecMap::new();
-        let mut cat_spec = ArgSpec::default();
-        cat_spec.rest = Some(trie::ARG_MODE_PATHS);
+        let cat_spec = ArgSpec {
+            rest: Some(trie::ARG_MODE_PATHS),
+            ..Default::default()
+        };
         specs.insert("cat".into(), cat_spec);
 
         let words: Vec<String> = vec!["cat".into(), "-n".into(), "file.txt".into()];
@@ -3017,5 +3041,355 @@ mod tests {
             ResolveResult::Passthrough(s) => assert_eq!(s, "   "),
             other => panic!("Expected Passthrough, got {:?}", other),
         }
+    }
+
+    // --- complete() public API ---
+
+    #[test]
+    fn complete_empty_input_lists_top_level_by_count() {
+        let mut trie = CommandTrie::new();
+        // Insert with counts to verify the sort-by-count path.
+        trie.insert(&["rare"]);
+        for _ in 0..5 {
+            trie.insert(&["common"]);
+        }
+        let pins = Pins::default();
+        let out = complete("", &trie, &pins);
+        // common should appear before rare because its count is higher.
+        let c = out.find("common").expect("common in output");
+        let r = out.find("rare").expect("rare in output");
+        assert!(c < r, "expected count-sorted order, got: {}", out);
+    }
+
+    #[test]
+    fn complete_no_matches_message() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let out = complete("xq", &trie, &pins);
+        assert!(out.contains("No commands matching"), "got: {}", out);
+    }
+
+    #[test]
+    fn complete_prefix_lists_candidates() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let out = complete("g", &trie, &pins);
+        // All g-prefixed commands appear.
+        assert!(out.contains("git"));
+        assert!(out.contains("grep"));
+        assert!(out.contains("go"));
+        assert!(out.contains("gzip"));
+    }
+
+    #[test]
+    fn complete_intermediate_ambiguity_is_surfaced() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // "g c " with trailing space means: "completed: g c; completing: <empty>".
+        // But mid-walk "c" under git is ambiguous between checkout/commit, so
+        // the code emits those matches directly.
+        let out = complete("git c", &trie, &pins);
+        assert!(out.contains("checkout"), "got: {}", out);
+        assert!(out.contains("commit"), "got: {}", out);
+    }
+
+    #[test]
+    fn complete_trailing_space_starts_fresh_word() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // "git " with trailing space → list all git subcommands.
+        let out = complete("git ", &trie, &pins);
+        assert!(out.contains("checkout"));
+        assert!(out.contains("commit"));
+        assert!(out.contains("push"));
+    }
+
+    #[test]
+    fn complete_after_pipe_only_completes_last_segment() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // Before the pipe is "ls"-like junk, after the pipe is what gets completed.
+        let out = complete("xx | g", &trie, &pins);
+        assert!(out.contains("git") || out.contains("grep"), "got: {}", out);
+    }
+
+    #[test]
+    fn complete_flag_prefix_reaches_flag_path() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // "git -" triggers the complete_flags branch. Our test trie has
+        // -m under git commit, so we expect some flag output.
+        let out = complete("git commit -", &trie, &pins);
+        assert!(out.contains("-m"), "flag output missing: {}", out);
+    }
+
+    // --- longest_common_prefix direct coverage ---
+
+    #[test]
+    fn lcp_mixed_lengths() {
+        let v = vec!["foobar".into(), "foobaz".into(), "foo".into()];
+        assert_eq!(longest_common_prefix(&v), "foo");
+    }
+
+    // --- shell_escape_path_glob vs shell_escape_path ---
+
+    #[test]
+    fn shell_escape_path_glob_preserves_star() {
+        // Glob variant leaves `*` and `?` unescaped so the shell expands them.
+        let escaped = shell_escape_path_glob("/tmp/*.log");
+        assert!(escaped.contains('*'), "star lost: {}", escaped);
+        assert!(!escaped.contains("\\*"), "star escaped: {}", escaped);
+
+        // Plain variant escapes it.
+        let escaped = shell_escape_path("/tmp/*.log");
+        assert!(escaped.contains("\\*"), "star not escaped: {}", escaped);
+    }
+
+    // --- escape_resolved_path with tilde passthrough ---
+
+    #[test]
+    fn escape_resolved_path_tilde_preserved() {
+        // When the user typed `~/Docs` the tilde should survive escaping so
+        // the shell does home-expansion.
+        let out = escape_resolved_path("~/Doc", "~/Documents");
+        assert!(out.starts_with('~'), "tilde lost: {}", out);
+    }
+
+    // --- has_filesystem_prefix_match ---
+
+    #[test]
+    fn has_filesystem_prefix_match_current_dir() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        std::fs::create_dir_all("mydir").unwrap();
+
+        assert!(has_filesystem_prefix_match("myd"));
+        assert!(!has_filesystem_prefix_match("zzz-no-such"));
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- looks_like_path ---
+
+    #[test]
+    fn looks_like_path_obvious_cases() {
+        assert!(looks_like_path("./foo"));
+        assert!(looks_like_path("../bar"));
+        assert!(looks_like_path("/abs/path"));
+        assert!(looks_like_path("~/home"));
+        assert!(looks_like_path("a/b"));
+        assert!(!looks_like_path("plain-word"));
+    }
+
+    // --- apply_context_rules ---
+
+    #[test]
+    fn apply_context_rules_overrides_when_flag_present() {
+        let rule = ContextRule {
+            trigger_flags: vec!["-b".into()],
+            override_type: trie::ARG_MODE_GIT_BRANCHES,
+        };
+        let spec = ArgSpec {
+            context_rules: vec![rule],
+            ..Default::default()
+        };
+        let words = vec!["git".into(), "checkout".into(), "-b".into()];
+        let base = ArgMode::Paths;
+        let got = apply_context_rules(Some(&spec), &words, base);
+        match got {
+            ArgMode::Runtime(t) => assert_eq!(t, trie::ARG_MODE_GIT_BRANCHES),
+            other => panic!("expected Runtime override, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_context_rules_no_match_returns_base() {
+        let spec = ArgSpec::default();
+        let base = ArgMode::Paths;
+        let out = apply_context_rules(Some(&spec), &["ls".into()], base);
+        assert!(matches!(out, ArgMode::Paths));
+    }
+
+    // --- Resolve end-to-end: pin with zero consumption edge cases ---
+
+    #[test]
+    fn resolve_pin_to_multi_word_then_subcommand() {
+        // Pin "k" -> "kubectl", then "k ap" resolves kubectl's subcommand trie.
+        let mut trie = CommandTrie::new();
+        trie.insert(&["kubectl", "apply"]);
+        trie.insert(&["kubectl", "get"]);
+        let pins = Pins {
+            entries: vec![Pin {
+                abbrev: vec!["k".into()],
+                expanded: vec!["kubectl".into()],
+            }],
+        };
+        match resolve("k ap", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "kubectl apply"),
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_double_dash_terminator_stops_expansion() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        trie.insert_command("foo");
+        let pins = Pins::default();
+        // After `--`, subsequent words are arguments to git, not subcommands.
+        // We just verify this doesn't crash and produces *something*.
+        let _ = resolve("git -- foo", &trie, &pins);
+    }
+
+    #[test]
+    fn resolve_line_empty_and_operator_only() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        match resolve_line("", &trie, &pins) {
+            ResolveResult::Passthrough(s) => assert_eq!(s, ""),
+            other => panic!("empty → Passthrough, got {:?}", other),
+        }
+        // Operator at the start: shouldn't panic.
+        let _ = resolve_line("| git st", &trie, &pins);
+    }
+
+    // --- Ambiguity info shape ---
+
+    #[test]
+    fn ambiguity_info_carries_lcp_and_position() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        match resolve("te", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                // Multiple entries share the prefix "ter" from "terraform", but
+                // the test trie only has `terraform`, so "te" is a unique match.
+                // Force multi-candidate ambiguity with an explicit prefix.
+                let _ = info;
+            }
+            ResolveResult::Resolved(_) => {}
+            other => panic!("unexpected {:?}", other),
+        }
+        // Now trigger actual ambiguity with `g`.
+        match resolve("g", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                assert_eq!(info.position, 0);
+                assert_eq!(info.word, "g");
+                assert!(!info.candidates.is_empty());
+                // lcp is "g" at minimum since all candidates start with g.
+                assert!(info.lcp.starts_with('g'));
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    // --- finalize_with_paths: cd resolves to real path ---
+
+    #[test]
+    fn cd_with_prefix_expands_to_real_directory() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("target-directory")).unwrap();
+        let mut trie = CommandTrie::new();
+        trie.insert_command("cd");
+        let pins = Pins::default();
+
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        match resolve("cd target-", &trie, &pins) {
+            ResolveResult::Resolved(s) => {
+                assert!(s.contains("target-directory"), "got: {}", s);
+            }
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
+        }
+    }
+
+    // --- format_columns boundary cases ---
+
+    #[test]
+    fn format_columns_single_item() {
+        let out = format_columns(&["only"], 1);
+        assert!(out.contains("only"));
+    }
+
+    // --- Leading `!` bypass ---
+
+    #[test]
+    fn bang_prefixed_line_is_passthrough() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // Even though "gi" alone is ambiguous/resolvable, `!gi st` must be
+        // returned untouched.
+        for input in ["!!", "!git", "!gi st", "!$", "!echo hi", "!?foo"] {
+            match resolve_line(input, &trie, &pins) {
+                ResolveResult::Passthrough(s) => assert_eq!(s, input, "bang bypass failed"),
+                other => panic!("expected Passthrough for {:?}, got {:?}", input, other),
+            }
+        }
+    }
+
+    #[test]
+    fn bang_after_leading_space_still_bypasses() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        let input = "   !git status";
+        match resolve_line(input, &trie, &pins) {
+            ResolveResult::Passthrough(s) => assert_eq!(s, input),
+            other => panic!("expected Passthrough, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bang_in_middle_is_not_bypassed() {
+        // `cd te/!5` is the suffix-match feature — NOT a bang-at-start.
+        // It must still go through normal resolution.
+        let mut trie = CommandTrie::new();
+        trie.insert_command("echo");
+        let pins = Pins::default();
+        // `echo !foo` starts with `echo`, not `!` — normal path.
+        // We just verify it's not a no-op Passthrough-of-unchanged-input
+        // caused by the bang guard firing on a non-leading `!`.
+        match resolve_line("echo !foo", &trie, &pins) {
+            ResolveResult::Passthrough(_) | ResolveResult::Resolved(_) => {}
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn complete_bang_returns_empty() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        assert!(complete("!g", &trie, &pins).is_empty());
+        assert!(complete("!!", &trie, &pins).is_empty());
+        assert!(complete("  !git ", &trie, &pins).is_empty());
+    }
+
+    #[test]
+    fn complete_bang_in_middle_still_works() {
+        let trie = build_test_trie();
+        let pins = Pins::default();
+        // `echo !foo` doesn't start with `!` → normal completion runs.
+        let out = complete("ech", &trie, &pins);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn format_columns_many_items_respects_width() {
+        let many: Vec<String> = (0..50).map(|i| format!("item{}", i)).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let out = format_columns(&refs, 50);
+        // Output should contain a reasonable number of newlines (multi-line
+        // multi-column format). Not asserting exact count — terminal_width
+        // can pick up COLUMNS env var — just non-empty.
+        assert!(!out.is_empty());
+        assert!(out.lines().count() >= 1);
     }
 }

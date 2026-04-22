@@ -399,6 +399,7 @@ mod tests {
 
     #[test]
     fn test_exact_match_wins() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("zsh-ios-test-path");
         let _ = fs::create_dir_all(dir.join("foo"));
         let _ = fs::create_dir_all(dir.join("foobar"));
@@ -663,5 +664,186 @@ mod tests {
         let remaining = vec!["".to_string()];
         let result = deep_filter(Path::new("/tmp"), &candidates, &remaining, false);
         assert_eq!(result, candidates);
+    }
+
+    // --- parse_path_parts ---
+
+    #[test]
+    fn parse_path_parts_absolute() {
+        let (base, comps, prefix) = parse_path_parts("/usr/local/bin");
+        assert_eq!(base, PathBuf::from("/"));
+        assert_eq!(comps, vec!["usr", "local", "bin"]);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn parse_path_parts_tilde_only() {
+        let (_, comps, prefix) = parse_path_parts("~");
+        assert!(comps.is_empty());
+        assert_eq!(prefix, "~");
+    }
+
+    #[test]
+    fn parse_path_parts_tilde_with_path() {
+        let (_, comps, prefix) = parse_path_parts("~/Documents/foo");
+        assert_eq!(comps, vec!["Documents", "foo"]);
+        assert_eq!(prefix, "~");
+    }
+
+    #[test]
+    fn parse_path_parts_relative() {
+        let (_, comps, prefix) = parse_path_parts("src/main.rs");
+        assert_eq!(comps, vec!["src", "main.rs"]);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn parse_path_parts_empty_component_between_slashes() {
+        // "a//b" produces an empty middle component; we don't collapse — the
+        // downstream resolver sees it.
+        let (_, comps, _) = parse_path_parts("a//b");
+        assert_eq!(comps, vec!["a", "", "b"]);
+    }
+
+    // --- resolve_path end-to-end with tempdirs ---
+
+    #[test]
+    fn resolve_path_absolute_prefix_expansion() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("application")).unwrap();
+        let abbrev = format!("{}/appl", td.path().display());
+        match resolve_path(&abbrev) {
+            PathResult::Resolved(s) => {
+                assert!(s.ends_with("/application"), "got: {}", s);
+            }
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_deep_disambiguation_picks_branch() {
+        // Two top-level dirs share a prefix, but only one has a matching
+        // subdirectory further down — deep lookahead should pick it.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("Application Support/zsh-ios")).unwrap();
+        std::fs::create_dir_all(td.path().join("Application Scripts/other")).unwrap();
+        let abbrev = format!("{}/Appli/zsh-", td.path().display());
+        match resolve_path(&abbrev) {
+            PathResult::Resolved(s) => {
+                assert!(s.contains("Application Support"), "branched wrong: {}", s);
+                assert!(s.ends_with("zsh-ios"), "didn't complete leaf: {}", s);
+            }
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_dirs_only_surfaces_ambiguous_on_final_component() {
+        // For cd/pushd (dirs_only=true), a final-component ambiguous prefix
+        // is surfaced as Ambiguous so the Zsh plugin can show a picker.
+        // Non-dirs-only commands deliberately return Unchanged and leave
+        // the disambiguation to the shell.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("apple")).unwrap();
+        std::fs::create_dir_all(td.path().join("application")).unwrap();
+        let abbrev = format!("{}/app", td.path().display());
+        match resolve_path_dirs_only(&abbrev) {
+            PathResult::Ambiguous(paths) => {
+                assert_eq!(paths.len(), 2);
+                assert!(paths.iter().any(|p| p.ends_with("/apple")));
+                assert!(paths.iter().any(|p| p.ends_with("/application")));
+            }
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+        // Same input in non-dirs-only mode: Unchanged (caller handles it).
+        match resolve_path(&abbrev) {
+            PathResult::Unchanged => {}
+            other => panic!("expected Unchanged for plain resolve, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_preserves_trailing_slash() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("targetdir")).unwrap();
+        let abbrev = format!("{}/target/", td.path().display());
+        match resolve_path(&abbrev) {
+            PathResult::Resolved(s) => assert!(s.ends_with('/'), "lost trailing slash: {}", s),
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_dirs_only_rejects_file_prefix_match() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("only-a-file"), "").unwrap();
+        let abbrev = format!("{}/only", td.path().display());
+        match resolve_path_dirs_only(&abbrev) {
+            PathResult::Unchanged => {}
+            // Allow Resolved only if the platform for some reason creates
+            // a matching dir — in our tempdir we only made a file.
+            other => panic!("expected Unchanged, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_suffix_mode_end_to_end() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("tests")).unwrap();
+        std::fs::create_dir_all(td.path().join("tests/test-1")).unwrap();
+        std::fs::create_dir_all(td.path().join("tests/test-5")).unwrap();
+        let abbrev = format!("{}/tests/!5", td.path().display());
+        match resolve_path(&abbrev) {
+            PathResult::Resolved(s) => assert!(s.ends_with("test-5"), "got: {}", s),
+            other => panic!("expected Resolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_path_double_star_turns_into_literal_glob() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("a.py"), "").unwrap();
+        std::fs::write(td.path().join("b.py"), "").unwrap();
+        let abbrev = format!("{}/**.py", td.path().display());
+        match resolve_path(&abbrev) {
+            PathResult::Resolved(s) => assert!(s.ends_with("/*.py"), "got: {}", s),
+            // It is also valid for this to be Unchanged if the path already
+            // starts with "*/*.py" after joining — but our tempdir abbrev
+            // ensures ** is the second component.
+            other => panic!("expected Resolved with literal glob, got {:?}", other),
+        }
+    }
+
+    // --- deep_filter with a real filesystem ---
+
+    #[test]
+    fn deep_filter_narrows_on_next_component() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path();
+        std::fs::create_dir_all(base.join("apple/a-specific")).unwrap();
+        std::fs::create_dir_all(base.join("application/other-name")).unwrap();
+
+        let candidates = vec!["apple".to_string(), "application".to_string()];
+        // Next component "a-" only matches under "apple/"
+        let remaining = vec!["a-".to_string()];
+        let kept = deep_filter(base, &candidates, &remaining, false);
+        assert_eq!(kept, vec!["apple".to_string()]);
+    }
+
+    // --- list_dir ---
+
+    #[test]
+    fn list_dir_filters_to_dirs_only() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("somedir")).unwrap();
+        std::fs::write(td.path().join("somefile"), "").unwrap();
+
+        let all = list_dir(td.path(), false);
+        assert!(all.contains(&"somedir".to_string()));
+        assert!(all.contains(&"somefile".to_string()));
+
+        let dirs = list_dir(td.path(), true);
+        assert!(dirs.contains(&"somedir".to_string()));
+        assert!(!dirs.contains(&"somefile".to_string()));
     }
 }
