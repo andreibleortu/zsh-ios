@@ -5,29 +5,91 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrieNode {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub children: BTreeMap<String, TrieNode>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub count: u32,
-    /// Whether this node represents a real command/subcommand (not just an intermediate)
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub last_used: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_leaf: bool,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl TrieNode {
-    /// Insert a command sequence (e.g., ["git", "checkout", "main"]) into the trie.
-    /// Each word becomes a level in the trie.
     pub fn insert(&mut self, words: &[&str]) {
+        self.insert_with_time(words, 0);
+    }
+
+    pub fn insert_with_time(&mut self, words: &[&str], unix_ts: u64) {
         if words.is_empty() {
             return;
         }
         let child = self.children.entry(words[0].to_string()).or_default();
         child.count += 1;
-        // Only mark as leaf if this is the terminal word in the sequence.
-        // Intermediate nodes get is_leaf from insert_command() or from being
-        // the terminal word in a different insertion.
+        if unix_ts > child.last_used {
+            child.last_used = unix_ts;
+        }
         if words.len() == 1 {
             child.is_leaf = true;
         }
         if words.len() > 1 {
-            child.insert(&words[1..]);
+            child.insert_with_time(&words[1..], unix_ts);
+        }
+    }
+
+    /// Tally a failed (non-zero-exit) invocation along an existing trie path.
+    /// Does NOT create new nodes — a command that doesn't exist in the trie
+    /// is ignored (we don't learn junk from failures).
+    /// Returns true if all path nodes existed and were tallied; false otherwise.
+    pub fn record_failure(&mut self, words: &[&str], unix_ts: u64) -> bool {
+        if words.is_empty() {
+            return true;
+        }
+        match self.children.get_mut(words[0]) {
+            Some(child) => {
+                child.failures += 1;
+                if unix_ts > child.last_used {
+                    child.last_used = unix_ts;
+                }
+                if words.len() > 1 {
+                    child.record_failure(&words[1..], unix_ts)
+                } else {
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Heuristic success rate. Returns `None` if we have no data
+    /// (`count == 0 && failures == 0`). Otherwise `count / (count + failures)`.
+    pub fn success_rate(&self) -> Option<f32> {
+        let total = self.count as u64 + self.failures as u64;
+        if total == 0 {
+            None
+        } else {
+            Some(self.count as f32 / total as f32)
+        }
+    }
+
+    /// Seconds since last recorded use, relative to `now`. `None` if never used.
+    pub fn age_seconds(&self, now: u64) -> Option<u64> {
+        if self.last_used == 0 {
+            None
+        } else {
+            Some(now.saturating_sub(self.last_used))
         }
     }
 
@@ -523,7 +585,7 @@ mod tests {
         trie.insert(&["git", "checkout"]);
         trie.insert(&["terraform", "apply"]);
 
-        let data = rmp_serde::to_vec(&trie).unwrap();
+        let data = rmp_serde::to_vec_named(&trie).unwrap();
         let loaded: CommandTrie = rmp_serde::from_slice(&data).unwrap();
 
         assert_eq!(loaded.root.children.len(), 2);
@@ -768,6 +830,145 @@ mod tests {
             labels.len(),
             "duplicate label found among modes 1..=72"
         );
+    }
+
+    #[test]
+    fn insert_does_not_set_last_used_without_ts() {
+        let mut root = TrieNode::default();
+        root.insert(&["git"]);
+        assert_eq!(root.children["git"].last_used, 0);
+    }
+
+    #[test]
+    fn insert_with_time_sets_last_used() {
+        let mut root = TrieNode::default();
+        root.insert_with_time(&["git"], 12345);
+        assert_eq!(root.children["git"].last_used, 12345);
+    }
+
+    #[test]
+    fn insert_with_time_keeps_max_ts() {
+        let mut root = TrieNode::default();
+        root.insert_with_time(&["git"], 100);
+        root.insert_with_time(&["git"], 50);
+        assert_eq!(root.children["git"].last_used, 100);
+    }
+
+    #[test]
+    fn record_failure_increments_existing() {
+        let mut root = TrieNode::default();
+        root.insert(&["git", "push"]);
+        let ok = root.record_failure(&["git", "push"], 500);
+        assert!(ok);
+        let git = &root.children["git"];
+        assert_eq!(git.failures, 1);
+        assert_eq!(git.last_used, 500);
+        let push = &git.children["push"];
+        assert_eq!(push.failures, 1);
+        assert_eq!(push.last_used, 500);
+    }
+
+    #[test]
+    fn record_failure_missing_returns_false() {
+        let mut root = TrieNode::default();
+        let ok = root.record_failure(&["nope", "there"], 0);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn record_failure_partial_path_returns_false() {
+        let mut root = TrieNode::default();
+        root.insert(&["git"]);
+        let ok = root.record_failure(&["git", "notasub"], 0);
+        assert!(!ok);
+        let git = &root.children["git"];
+        assert_eq!(git.count, 1);
+        assert_eq!(git.failures, 1);
+    }
+
+    #[test]
+    fn success_rate_handles_empty() {
+        let node = TrieNode::default();
+        assert_eq!(node.success_rate(), None);
+    }
+
+    #[test]
+    fn success_rate_zero_failures_is_one() {
+        let node = TrieNode {
+            count: 5,
+            ..Default::default()
+        };
+        assert_eq!(node.success_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn success_rate_mixed() {
+        let node = TrieNode {
+            count: 3,
+            failures: 1,
+            ..Default::default()
+        };
+        assert_eq!(node.success_rate(), Some(0.75));
+    }
+
+    #[test]
+    fn age_seconds_never_used() {
+        let node = TrieNode::default();
+        assert_eq!(node.age_seconds(9999), None);
+    }
+
+    #[test]
+    fn age_seconds_basic() {
+        let node = TrieNode {
+            last_used: 100,
+            ..Default::default()
+        };
+        assert_eq!(node.age_seconds(150), Some(50));
+        assert_eq!(node.age_seconds(50), Some(0));
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_new_fields() {
+        let mut root = TrieNode::default();
+        root.insert_with_time(&["git", "push"], 9999);
+        root.record_failure(&["git", "push"], 8000);
+
+        let data = rmp_serde::to_vec_named(&root).unwrap();
+        let loaded: TrieNode = rmp_serde::from_slice(&data).unwrap();
+
+        let git = &loaded.children["git"];
+        assert_eq!(git.last_used, 9999);
+        assert_eq!(git.failures, 1);
+        let push = &git.children["push"];
+        assert_eq!(push.last_used, 9999);
+        assert_eq!(push.failures, 1);
+    }
+
+    #[test]
+    fn old_tree_deserializes_with_zero_defaults() {
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct LegacyNode {
+            children: BTreeMap<String, LegacyNode>,
+            count: u32,
+            is_leaf: bool,
+        }
+
+        let legacy = LegacyNode {
+            children: BTreeMap::new(),
+            count: 7,
+            is_leaf: true,
+        };
+        let mut buf = Vec::new();
+        let mut se = rmp_serde::Serializer::new(&mut buf).with_struct_map();
+        legacy.serialize(&mut se).unwrap();
+
+        let node: TrieNode = rmp_serde::from_slice(&buf).unwrap();
+        assert_eq!(node.count, 7);
+        assert!(node.is_leaf);
+        assert_eq!(node.failures, 0);
+        assert_eq!(node.last_used, 0);
     }
 
     #[test]
