@@ -167,6 +167,15 @@ mod tests {
             ARG_MODE_NPM_PACKAGE,
             ARG_MODE_PIP_PACKAGE,
             ARG_MODE_CARGO_CRATE,
+            // project-local script / task resolvers
+            ARG_MODE_NPM_SCRIPT,
+            ARG_MODE_MAKE_TARGET,
+            ARG_MODE_JUST_RECIPE,
+            ARG_MODE_CARGO_TASK,
+            ARG_MODE_POETRY_SCRIPT,
+            ARG_MODE_COMPOSER_SCRIPT,
+            ARG_MODE_GRADLE_TASK,
+            ARG_MODE_RAKE_TASK,
             // Shell introspection
             ARG_MODE_SHELL_FUNCTION,
             ARG_MODE_SHELL_ALIAS,

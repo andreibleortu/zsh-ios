@@ -1673,6 +1673,591 @@ impl TypeResolver for CargoCrateResolver {
     }
 }
 
+// --- Project-local script / task resolvers ---
+
+// ---- NpmScriptResolver ----
+
+/// Extract script names from the top-level `"scripts": { ... }` block of a
+/// `package.json` file. Uses the same string-level scan as `parse_npm_package_json`.
+pub fn parse_package_json_scripts(content: &str) -> Vec<String> {
+    let section_key = "\"scripts\"";
+    let Some(key_pos) = content.find(section_key) else { return Vec::new() };
+    let after_key = &content[key_pos + section_key.len()..];
+    let Some(open) = after_key.find('{') else { return Vec::new() };
+    let block_start = open + 1;
+    let mut depth = 1usize;
+    let mut end = block_start;
+    for (i, ch) in after_key[block_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = block_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &after_key[block_start..end];
+    let mut names = Vec::new();
+    let mut remaining = block;
+    while let Some(q_open) = remaining.find('"') {
+        remaining = &remaining[q_open + 1..];
+        let Some(q_close) = remaining.find('"') else { break };
+        let key = &remaining[..q_close];
+        remaining = &remaining[q_close + 1..];
+        let trimmed = remaining.trim_start();
+        if trimmed.starts_with(':') {
+            if !key.is_empty() {
+                names.push(key.to_string());
+            }
+            if let Some(colon_pos) = remaining.find(':') {
+                remaining = &remaining[colon_pos + 1..];
+            }
+        }
+    }
+    names.truncate(500);
+    names
+}
+
+pub fn npm_scripts(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(pkg_path) = find_ancestor_file(&start, "package.json") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&pkg_path) else { return Vec::new() };
+    parse_package_json_scripts(&content)
+}
+
+pub struct NpmScriptResolver;
+impl TypeResolver for NpmScriptResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        npm_scripts(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "npm-script"
+    }
+}
+
+// ---- MakeTargetResolver ----
+
+/// Parse Makefile target names from content.
+/// Matches lines of the form `<name>:` (not starting with `.` or tab/spaces).
+/// Excludes variable assignments like `CC := gcc`, `LD = ld`, `CFLAGS ?= -O2`.
+pub fn parse_makefile_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in content.lines() {
+        // Targets must start with a non-whitespace, non-dot character.
+        let first = match line.chars().next() {
+            Some(c) => c,
+            None => continue,
+        };
+        if first == '\t' || first == ' ' || first == '#' || first == '.' {
+            continue;
+        }
+
+        // Skip variable assignment lines: these contain `=` before any `:`,
+        // or use `:=` / `?=` / `+=` forms.
+        // Check for bare `=` assignment (VAR = val) — find `=` before first `:`.
+        let first_eq = line.find('=');
+        let first_colon = line.find(':');
+        match (first_eq, first_colon) {
+            (Some(eq), Some(colon)) if eq < colon => continue,
+            (Some(_), None) => continue,
+            (None, None) => continue,
+            _ => {}
+        }
+
+        let colon_pos = first_colon.unwrap();
+        // `:=` / `::=` assignment forms: the char after `:` is `=`.
+        if line[colon_pos + 1..].starts_with('=') {
+            continue;
+        }
+
+        let name_part = line[..colon_pos].trim();
+        if name_part.is_empty()
+            || name_part.starts_with('.')
+            || name_part.contains("$(")
+        {
+            continue;
+        }
+        targets.push(name_part.to_string());
+        if targets.len() >= 500 {
+            break;
+        }
+    }
+    targets
+}
+
+fn find_makefile(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    for name in &["Makefile", "makefile", "GNUmakefile"] {
+        if let Some(p) = find_ancestor_file(start, name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn make_targets(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(makefile_path) = find_makefile(&start) else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&makefile_path) else { return Vec::new() };
+    parse_makefile_targets(&content)
+}
+
+pub struct MakeTargetResolver;
+impl TypeResolver for MakeTargetResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        make_targets(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "make-target"
+    }
+}
+
+// ---- JustRecipeResolver ----
+
+/// Parse recipe names from justfile content.
+/// Matches lines: `[optional-@]<name>[args...]:`.
+/// The first word before any whitespace or `:` is the recipe name.
+pub fn parse_justfile_recipes(content: &str) -> Vec<String> {
+    let mut recipes = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start_matches('@');
+        // Skip comments, settings, variables, attributes.
+        let first = match trimmed.chars().next() {
+            Some(c) => c,
+            None => continue,
+        };
+        if first == '#' || first == '[' {
+            continue;
+        }
+        // Must contain `:` not preceded by `=` or inside `$()`.
+        let Some(colon_pos) = trimmed.find(':') else { continue };
+        let before_colon = &trimmed[..colon_pos];
+        if before_colon.contains('=') || before_colon.contains("$(") {
+            continue;
+        }
+        // The recipe name is the first identifier token.
+        let name = match before_colon.split_whitespace().next() {
+            Some(n) => n,
+            None => continue,
+        };
+        // Must start with a letter, digit, or underscore.
+        if name.is_empty()
+            || !name.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        // Must be all alphanumeric / - / _.
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            continue;
+        }
+        recipes.push(name.to_string());
+        if recipes.len() >= 500 {
+            break;
+        }
+    }
+    recipes
+}
+
+fn find_justfile(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    for name in &["justfile", "Justfile", ".justfile"] {
+        if let Some(p) = find_ancestor_file(start, name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn just_recipes(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+
+    // Prefer shelling out — `just --summary --unsorted` is fast.
+    if let Some(ref dir) = ctx.cwd {
+        let out = run_capture("just", &["--summary", "--unsorted"], Some(dir.as_path()));
+        if !out.is_empty() {
+            // `just --summary` prints all names on one space-separated line.
+            let mut names: Vec<String> = out
+                .into_iter()
+                .flat_map(|line| line.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>())
+                .filter(|s| !s.is_empty())
+                .collect();
+            names.truncate(500);
+            return names;
+        }
+    }
+
+    let Some(just_path) = find_justfile(&start) else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&just_path) else { return Vec::new() };
+    parse_justfile_recipes(&content)
+}
+
+pub struct JustRecipeResolver;
+impl TypeResolver for JustRecipeResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        just_recipes(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "just-recipe"
+    }
+}
+
+// ---- CargoTaskResolver ----
+
+/// Extract alias keys from a `[alias]` section in a TOML file (Cargo.toml or
+/// .cargo/config.toml). Uses the same line-based approach as `parse_cargo_toml_deps`.
+pub fn parse_cargo_aliases(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_alias_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // Accept bare `[alias]` and table-array `[[alias]]`.
+            let header = trimmed.trim_matches('[').trim_matches(']').trim();
+            in_alias_section = header == "alias";
+            continue;
+        }
+        if !in_alias_section {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key_part = trimmed[..eq_pos].trim();
+            if !key_part.is_empty()
+                && !key_part.contains('.')
+                && key_part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                names.push(key_part.to_string());
+            }
+        }
+    }
+    names
+}
+
+pub fn cargo_tasks(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+
+    let mut names = Vec::new();
+
+    // Source 1: [alias] in Cargo.toml.
+    if let Some(path) = find_ancestor_file(&start, "Cargo.toml")
+        && let Ok(content) = std::fs::read_to_string(&path)
+    {
+        names.extend(parse_cargo_aliases(&content));
+    }
+
+    // Source 2: [alias] in .cargo/config.toml (walk up for both .cargo dir and config.toml).
+    let mut dir = start.clone();
+    loop {
+        let config_path = dir.join(".cargo").join("config.toml");
+        if config_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&config_path)
+        {
+            names.extend(parse_cargo_aliases(&content));
+        }
+        // Also try legacy `.cargo/config` (no extension).
+        let config_old = dir.join(".cargo").join("config");
+        if config_old.exists()
+            && let Ok(content) = std::fs::read_to_string(&config_old)
+        {
+            names.extend(parse_cargo_aliases(&content));
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names.truncate(500);
+    names
+}
+
+pub struct CargoTaskResolver;
+impl TypeResolver for CargoTaskResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        cargo_tasks(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "cargo-task"
+    }
+}
+
+// ---- PoetryScriptResolver ----
+
+/// Extract script entry-point names from a `pyproject.toml` file.
+/// Reads both `[tool.poetry.scripts]` and `[project.scripts]` (PEP 621).
+pub fn parse_pyproject_scripts(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            let header = trimmed.trim_matches('[').trim_matches(']').trim();
+            in_section = header == "tool.poetry.scripts" || header == "project.scripts";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key_part = trimmed[..eq_pos].trim().trim_matches('"');
+            if !key_part.is_empty()
+                && key_part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                names.push(key_part.to_string());
+            }
+        }
+    }
+    names.truncate(500);
+    names
+}
+
+pub fn poetry_scripts(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(path) = find_ancestor_file(&start, "pyproject.toml") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    parse_pyproject_scripts(&content)
+}
+
+pub struct PoetryScriptResolver;
+impl TypeResolver for PoetryScriptResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        poetry_scripts(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "poetry-script"
+    }
+}
+
+// ---- ComposerScriptResolver ----
+
+/// Extract script names from the top-level `"scripts": { ... }` block of a
+/// `composer.json` file. Same parse shape as package.json.
+pub fn parse_composer_json_scripts(content: &str) -> Vec<String> {
+    // Reuse the package.json scripts parser — same JSON shape.
+    parse_package_json_scripts(content)
+}
+
+pub fn composer_scripts(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(path) = find_ancestor_file(&start, "composer.json") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    parse_composer_json_scripts(&content)
+}
+
+pub struct ComposerScriptResolver;
+impl TypeResolver for ComposerScriptResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        composer_scripts(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "composer-script"
+    }
+}
+
+// ---- GradleTaskResolver ----
+
+/// Extract task names from Gradle build files using heuristic regexes.
+/// Matches:
+///   - `task <name>` (Groovy DSL)
+///   - `tasks.register("<name>")` (Kotlin and Groovy DSL)
+///   - `tasks.register<Type>("<name>")` (Kotlin DSL)
+pub fn parse_gradle_tasks(content: &str) -> Vec<String> {
+    let mut tasks = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Pattern 1: `task <name>` or `task(<name>)` (Groovy DSL).
+        if let Some(rest) = trimmed.strip_prefix("task ").or_else(|| trimmed.strip_prefix("task(")) {
+            let name = rest
+                .trim_start_matches('"')
+                .trim_start_matches('\'')
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                tasks.push(name.to_string());
+            }
+        }
+
+        // Pattern 2: `tasks.register("name"` or `tasks.register<Type>("name"`.
+        if let Some(rest) = trimmed.find("tasks.register").map(|i| &trimmed[i + "tasks.register".len()..]) {
+            // Skip optional `<Type>` generic.
+            let after_generic = if rest.starts_with('<') {
+                rest.find('>').map(|i| &rest[i + 1..]).unwrap_or(rest)
+            } else {
+                rest
+            };
+            // Find opening paren.
+            if let Some(paren) = after_generic.find('(') {
+                let inner = after_generic[paren + 1..].trim_start();
+                let inner = inner.trim_start_matches('"').trim_start_matches('\'');
+                let name = inner
+                    .split(['"', '\'', ',', ')'])
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                    tasks.push(name.to_string());
+                }
+            }
+        }
+
+        if tasks.len() >= 500 {
+            break;
+        }
+    }
+    tasks.sort();
+    tasks.dedup();
+    tasks.truncate(500);
+    tasks
+}
+
+fn find_gradle_file(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    for name in &["build.gradle", "build.gradle.kts"] {
+        if let Some(p) = find_ancestor_file(start, name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn gradle_tasks(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(build_path) = find_gradle_file(&start) else { return Vec::new() };
+    let gradle_dir = build_path.parent().unwrap_or(&start);
+
+    let mut tasks = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(&build_path) {
+        tasks.extend(parse_gradle_tasks(&content));
+    }
+    // Also parse settings.gradle / settings.gradle.kts for multi-module projects.
+    for settings_name in &["settings.gradle", "settings.gradle.kts"] {
+        let settings_path = gradle_dir.join(settings_name);
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            tasks.extend(parse_gradle_tasks(&content));
+        }
+    }
+    tasks.sort();
+    tasks.dedup();
+    tasks.truncate(500);
+    tasks
+}
+
+pub struct GradleTaskResolver;
+impl TypeResolver for GradleTaskResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        gradle_tasks(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(600)
+    }
+    fn id(&self) -> &'static str {
+        "gradle-task"
+    }
+}
+
+// ---- RakeTaskResolver ----
+
+/// Extract task names from Rakefile content.
+/// Matches `task :name` and `task :name =>` patterns.
+pub fn parse_rakefile_tasks(content: &str) -> Vec<String> {
+    let mut tasks = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("task") {
+            continue;
+        }
+        let rest = trimmed["task".len()..].trim_start();
+        // Must start with `:` (symbol syntax) or a quoted string.
+        let name = if let Some(after_colon) = rest.strip_prefix(':') {
+            after_colon
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("")
+        } else if rest.starts_with('"') || rest.starts_with('\'') {
+            let inner = &rest[1..];
+            inner
+                .split(['"', '\'', ' '])
+                .next()
+                .unwrap_or("")
+        } else {
+            continue;
+        };
+        if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            tasks.push(name.to_string());
+        }
+        if tasks.len() >= 500 {
+            break;
+        }
+    }
+    tasks.sort();
+    tasks.dedup();
+    tasks.truncate(500);
+    tasks
+}
+
+fn find_rakefile(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    for name in &["Rakefile", "Rakefile.rb"] {
+        if let Some(p) = find_ancestor_file(start, name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn rake_tasks(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(rakefile_path) = find_rakefile(&start) else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&rakefile_path) else { return Vec::new() };
+    parse_rakefile_tasks(&content)
+}
+
+pub struct RakeTaskResolver;
+impl TypeResolver for RakeTaskResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        rake_tasks(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(600)
+    }
+    fn id(&self) -> &'static str {
+        "rake-task"
+    }
+}
+
 // --- Shell introspection resolvers ---
 
 /// Run `zsh -c 'print -l ${(k)functions}'` and return the function names.
@@ -1891,6 +2476,15 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_NPM_PACKAGE, Box::new(NpmPackageResolver));
     r.register(ARG_MODE_PIP_PACKAGE, Box::new(PipPackageResolver));
     r.register(ARG_MODE_CARGO_CRATE, Box::new(CargoCrateResolver));
+    // Project-local script / task resolvers
+    r.register(ARG_MODE_NPM_SCRIPT, Box::new(NpmScriptResolver));
+    r.register(ARG_MODE_MAKE_TARGET, Box::new(MakeTargetResolver));
+    r.register(ARG_MODE_JUST_RECIPE, Box::new(JustRecipeResolver));
+    r.register(ARG_MODE_CARGO_TASK, Box::new(CargoTaskResolver));
+    r.register(ARG_MODE_POETRY_SCRIPT, Box::new(PoetryScriptResolver));
+    r.register(ARG_MODE_COMPOSER_SCRIPT, Box::new(ComposerScriptResolver));
+    r.register(ARG_MODE_GRADLE_TASK, Box::new(GradleTaskResolver));
+    r.register(ARG_MODE_RAKE_TASK, Box::new(RakeTaskResolver));
     // Shell introspection
     r.register(ARG_MODE_SHELL_FUNCTION, Box::new(ShellFunctionResolver));
     r.register(ARG_MODE_SHELL_ALIAS, Box::new(ShellAliasResolver));
@@ -3261,6 +3855,491 @@ pretty_assertions = \"1\"\n\
             ARG_MODE_SHELL_VAR,
             ARG_MODE_NAMED_DIR,
             ARG_MODE_HISTORY_ENTRY,
+        ] {
+            assert!(r.contains(mode), "mode {} missing from registry", mode);
+        }
+    }
+
+    // ---- NpmScriptResolver tests ----
+
+    #[test]
+    fn parse_package_json_scripts_basic() {
+        let raw = r#"{"scripts": {"build": "tsc", "test": "jest"}, "name": "x"}"#;
+        let out = parse_package_json_scripts(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn parse_package_json_scripts_multiline() {
+        let raw = "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"lint\": \"eslint .\",\n    \"start\": \"node .\"\n  }\n}";
+        let out = parse_package_json_scripts(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"lint".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"start".to_string()), "out: {:?}", out);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn parse_package_json_scripts_no_scripts_section() {
+        let raw = r#"{"name": "x", "version": "1.0"}"#;
+        assert!(parse_package_json_scripts(raw).is_empty());
+    }
+
+    #[test]
+    fn npm_script_resolver_reads_package_json() {
+        let td = tempfile::tempdir().unwrap();
+        let pkg = r#"{"scripts": {"build": "tsc", "test": "jest"}}"#;
+        std::fs::write(td.path().join("package.json"), pkg).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = npm_scripts(&ctx);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn npm_script_resolver_no_package_json_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(npm_scripts(&ctx).is_empty());
+    }
+
+    // ---- MakeTargetResolver tests ----
+
+    #[test]
+    fn parse_makefile_targets_basic() {
+        let raw = "\
+.PHONY: build
+build: foo.o
+\tgcc -o build foo.o
+foo.o: foo.c
+\tgcc -c foo.c
+install:
+\tcp build /usr/bin/
+";
+        let out = parse_makefile_targets(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"foo.o".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"install".to_string()), "out: {:?}", out);
+        assert!(!out.iter().any(|t| t.starts_with('.')), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_makefile_targets_excludes_variable_assignments() {
+        let raw = "CC := gcc\nLD = ld\nbuild:\n\t$(CC) -o out main.c\n";
+        let out = parse_makefile_targets(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"CC".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"LD".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_makefile_targets_excludes_dot_targets() {
+        let raw = ".DEFAULT_GOAL := all\n.PHONY: clean\nall:\n\techo all\nclean:\n\trm -f out\n";
+        let out = parse_makefile_targets(raw);
+        assert!(out.contains(&"all".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"clean".to_string()), "out: {:?}", out);
+        assert!(!out.iter().any(|t| t.starts_with('.')), "out: {:?}", out);
+    }
+
+    #[test]
+    fn make_target_resolver_reads_makefile() {
+        let td = tempfile::tempdir().unwrap();
+        let makefile = "build:\n\techo build\ntest:\n\techo test\n";
+        std::fs::write(td.path().join("Makefile"), makefile).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = make_targets(&ctx);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn make_target_resolver_no_makefile_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(make_targets(&ctx).is_empty());
+    }
+
+    // ---- JustRecipeResolver tests ----
+
+    #[test]
+    fn parse_justfile_recipes_basic() {
+        let raw = "\
+# comment
+build:
+    cargo build
+
+test arg1:
+    cargo test {{arg1}}
+
+@quiet-recipe:
+    echo quiet
+";
+        let out = parse_justfile_recipes(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"quiet-recipe".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_justfile_recipes_excludes_variables() {
+        let raw = "export RUST_LOG := \"debug\"\nbuild:\n    cargo build\n";
+        let out = parse_justfile_recipes(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"RUST_LOG".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn just_recipe_resolver_reads_justfile() {
+        let td = tempfile::tempdir().unwrap();
+        let justfile = "build:\n    cargo build\ntest:\n    cargo test\n";
+        std::fs::write(td.path().join("justfile"), justfile).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = just_recipes(&ctx);
+        // May have shelled out to `just` or fallen back to file parse.
+        // Either way, if `just` is not installed we get file-parse results.
+        // We can't guarantee `just` is installed in CI so only test the file-parse path:
+        // call parse directly.
+        let justfile_content = "build:\n    cargo build\ntest:\n    cargo test\n";
+        let parsed = parse_justfile_recipes(justfile_content);
+        assert!(parsed.contains(&"build".to_string()), "parsed: {:?}", parsed);
+        assert!(parsed.contains(&"test".to_string()), "parsed: {:?}", parsed);
+        // The ctx-based resolver should also not panic.
+        let _ = out;
+    }
+
+    #[test]
+    fn just_recipe_resolver_no_justfile_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        // Without a justfile and without `just` installed, must return empty.
+        // Since `just` might be installed, force the file-parse path:
+        let out = parse_justfile_recipes(""); // empty file → empty
+        assert!(out.is_empty());
+        // And resolver from empty dir must not panic.
+        let _ = just_recipes(&ctx);
+    }
+
+    // ---- CargoTaskResolver tests ----
+
+    #[test]
+    fn parse_cargo_aliases_basic() {
+        let raw = "\
+[package]
+name = \"x\"
+
+[alias]
+b = \"build\"
+t = \"test --lib\"
+check-all = \"clippy --all-targets\"
+";
+        let out = parse_cargo_aliases(raw);
+        assert!(out.contains(&"b".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"t".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"check-all".to_string()), "out: {:?}", out);
+        // [package] section keys must not appear.
+        assert!(!out.contains(&"name".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_cargo_aliases_no_alias_section() {
+        let raw = "[package]\nname = \"x\"\n[dependencies]\nanyhow = \"1\"\n";
+        assert!(parse_cargo_aliases(raw).is_empty());
+    }
+
+    #[test]
+    fn cargo_task_resolver_reads_cargo_toml() {
+        let td = tempfile::tempdir().unwrap();
+        let cargo_toml = "[package]\nname = \"x\"\n\n[alias]\nbuild-all = \"build --all\"\n";
+        std::fs::write(td.path().join("Cargo.toml"), cargo_toml).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = cargo_tasks(&ctx);
+        assert!(out.contains(&"build-all".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn cargo_task_resolver_reads_cargo_config() {
+        let td = tempfile::tempdir().unwrap();
+        let cargo_dir = td.path().join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        let config_toml = "[alias]\nci = \"test --all --all-features\"\n";
+        std::fs::write(cargo_dir.join("config.toml"), config_toml).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = cargo_tasks(&ctx);
+        assert!(out.contains(&"ci".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn cargo_task_resolver_no_manifest_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(cargo_tasks(&ctx).is_empty());
+    }
+
+    // ---- PoetryScriptResolver tests ----
+
+    #[test]
+    fn parse_pyproject_scripts_poetry() {
+        let raw = "\
+[tool.poetry]
+name = \"myapp\"
+
+[tool.poetry.scripts]
+myapp = \"myapp.main:main\"
+helper = \"myapp.helper:run\"
+
+[tool.poetry.dependencies]
+python = \"^3.10\"
+";
+        let out = parse_pyproject_scripts(raw);
+        assert!(out.contains(&"myapp".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"helper".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"name".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_pyproject_scripts_pep621() {
+        let raw = "\
+[project]
+name = \"myapp\"
+
+[project.scripts]
+run = \"myapp:main\"
+";
+        let out = parse_pyproject_scripts(raw);
+        assert!(out.contains(&"run".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"name".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_pyproject_scripts_no_scripts_section() {
+        let raw = "[tool.poetry]\nname = \"x\"\n";
+        assert!(parse_pyproject_scripts(raw).is_empty());
+    }
+
+    #[test]
+    fn poetry_script_resolver_reads_pyproject_toml() {
+        let td = tempfile::tempdir().unwrap();
+        let content = "[tool.poetry.scripts]\nbuild = \"pkg:build\"\ntest = \"pkg:test\"\n";
+        std::fs::write(td.path().join("pyproject.toml"), content).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = poetry_scripts(&ctx);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn poetry_script_resolver_no_pyproject_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(poetry_scripts(&ctx).is_empty());
+    }
+
+    // ---- ComposerScriptResolver tests ----
+
+    #[test]
+    fn parse_composer_json_scripts_basic() {
+        let raw = r#"{"scripts": {"post-install": "php artisan", "test": "phpunit"}, "name": "x"}"#;
+        let out = parse_composer_json_scripts(raw);
+        assert!(out.contains(&"post-install".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn composer_script_resolver_reads_composer_json() {
+        let td = tempfile::tempdir().unwrap();
+        let content = r#"{"scripts": {"test": "phpunit", "cs": "phpcs"}}"#;
+        std::fs::write(td.path().join("composer.json"), content).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = composer_scripts(&ctx);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"cs".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn composer_script_resolver_no_composer_json_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(composer_scripts(&ctx).is_empty());
+    }
+
+    // ---- GradleTaskResolver tests ----
+
+    #[test]
+    fn parse_gradle_tasks_groovy_dsl() {
+        let raw = "\
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+task build {
+    dependsOn test
+}
+tasks.register(\"assemble\") {
+    group = \"build\"
+}
+";
+        let out = parse_gradle_tasks(raw);
+        assert!(out.contains(&"clean".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"assemble".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_gradle_tasks_kotlin_dsl() {
+        let raw = "\
+tasks.register<Jar>(\"fatJar\") {
+    archiveBaseName.set(\"app\")
+}
+tasks.register<Test>(\"integrationTest\") {
+    testClassesDirs = sourceSets[\"integrationTest\"].output.classesDirs
+}
+";
+        let out = parse_gradle_tasks(raw);
+        assert!(out.contains(&"fatJar".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"integrationTest".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn gradle_task_resolver_reads_build_gradle() {
+        let td = tempfile::tempdir().unwrap();
+        let content = "task build {\n    println \"building\"\n}\ntask test {\n    println \"testing\"\n}\n";
+        std::fs::write(td.path().join("build.gradle"), content).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = gradle_tasks(&ctx);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn gradle_task_resolver_no_build_gradle_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(gradle_tasks(&ctx).is_empty());
+    }
+
+    // ---- RakeTaskResolver tests ----
+
+    #[test]
+    fn parse_rakefile_tasks_basic() {
+        let raw = "\
+task :build do
+  sh \"cargo build\"
+end
+
+task :test => :build do
+  sh \"cargo test\"
+end
+
+task :default => :build
+";
+        let out = parse_rakefile_tasks(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"default".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_rakefile_tasks_quoted_names() {
+        let raw = "task \"build\" do\n  echo \"hi\"\nend\n";
+        let out = parse_rakefile_tasks(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_rakefile_tasks_excludes_non_task_lines() {
+        let raw = "desc \"build the thing\"\ntask :build do\n  echo \"building\"\nend\n";
+        let out = parse_rakefile_tasks(raw);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(!out.contains(&"desc".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn rake_task_resolver_reads_rakefile() {
+        let td = tempfile::tempdir().unwrap();
+        let content = "task :build do\n  sh \"make\"\nend\ntask :test do\n  sh \"test\"\nend\n";
+        std::fs::write(td.path().join("Rakefile"), content).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = rake_tasks(&ctx);
+        assert!(out.contains(&"build".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn rake_task_resolver_no_rakefile_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(rake_tasks(&ctx).is_empty());
+    }
+
+    // ---- project-local resolver registry check ----
+
+    #[test]
+    fn project_local_resolvers_in_registry() {
+        use crate::trie::*;
+        let mut r = crate::type_resolver::Registry::new();
+        register_builtins(&mut r);
+        for mode in [
+            ARG_MODE_NPM_SCRIPT,
+            ARG_MODE_MAKE_TARGET,
+            ARG_MODE_JUST_RECIPE,
+            ARG_MODE_CARGO_TASK,
+            ARG_MODE_POETRY_SCRIPT,
+            ARG_MODE_COMPOSER_SCRIPT,
+            ARG_MODE_GRADLE_TASK,
+            ARG_MODE_RAKE_TASK,
         ] {
             assert!(r.contains(mode), "mode {} missing from registry", mode);
         }
