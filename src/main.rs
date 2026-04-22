@@ -1,25 +1,4 @@
-mod completions;
-mod config;
-mod history;
-mod path_resolve;
-mod pins;
-mod resolve;
-mod runtime_complete;
-mod scanner;
-mod trie;
-
-#[cfg(test)]
-pub(crate) mod test_util {
-    //! Cross-module test helpers.
-    //!
-    //! The unit test suite touches process-global state — current working
-    //! directory, `PATH` — that rustc's default parallel runner will race on.
-    //! Any test that mutates `cwd` or `$PATH` must take `CWD_LOCK` for the
-    //! duration of its work.
-    use std::sync::Mutex;
-
-    pub static CWD_LOCK: Mutex<()> = Mutex::new(());
-}
+use zsh_ios::*;
 
 use clap::{Parser, Subcommand};
 use std::fs::OpenOptions;

@@ -128,7 +128,7 @@ fn extract_descriptions_from_dirs(dirs: &[String]) -> HashMap<String, HashMap<St
 /// Parse subcommand descriptions from the content of a single Zsh completion file.
 ///
 /// Recognizes the `command:'description'` pattern used in Zsh arrays like:
-/// ```
+/// ```zsh
 /// commands=(
 ///   add:'add file contents to index'
 ///   commit:'record changes to repository'

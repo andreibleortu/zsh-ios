@@ -36,6 +36,10 @@ There is no separate lint step; rely on `cargo build` / `cargo clippy` and `carg
 
 The binary exit codes are the plugin's signal: `0` = resolved (stdout is the new buffer), `1` = ambiguous command (stdout is `_zio_*` assignments for the picker), `2` = passthrough (run as-is), `3` = path ambiguous.
 
+### Crate layout
+
+Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and future library consumers can link against the core, and `src/main.rs` is a thin CLI on top (`use zsh_ios::*;`, clap parser, subcommand dispatch, `cmd_*` handlers, lock helpers, and the `_zio_*` shell-serialization functions). The `test_util::CWD_LOCK` mutex lives in `lib.rs` under `#[cfg(test)]`.
+
 ### Binary subcommands (src/main.rs)
 
 `build`, `resolve`, `complete`, `learn`, `pin`, `unpin`, `pins`, `toggle`, `rebuild`, `status`. `build` and `rebuild` differ only in that `rebuild` re-execs via `zsh -c 'alias | zsh-ios build --aliases-stdin'` so aliases from the user's interactive shell are captured (aliases can't be read from a child process otherwise).
