@@ -22,11 +22,13 @@ pub fn scan_path(trie: &mut CommandTrie) -> u32 {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
+            // fs::metadata (unlike DirEntry::metadata) traverses symlinks, so
+            // `cargo -> rustup` and friends — extremely common in cargo/rustup
+            // bin dirs — resolve to their executable target rather than being
+            // dismissed as not-a-file.
+            let Ok(meta) = fs::metadata(entry.path()) else {
                 continue;
             };
-            // entry.metadata() follows symlinks — symlinks to executable files
-            // are caught by is_file(); broken symlinks fail at metadata() above.
             if !meta.is_file() {
                 continue;
             }
