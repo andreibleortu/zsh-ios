@@ -22,6 +22,8 @@ If an abbreviation is ambiguous, you're told -- just like IOS. Pick a number and
   In ~/Library/Application Support/zsh-ios/pins.txt
 ```
 
+Selection is keystroke-driven — the moment your digits uniquely identify an option, it fires without Enter. So in a 3-option menu, typing `2` picks immediately; with 20 options, typing `1` waits (because 10-19 are still reachable) but `13` fires on the `3`. Enter force-commits the current digits; Enter on an empty buffer cancels.
+
 ## How it works
 
 zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, and Zsh completion definitions. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
@@ -98,9 +100,10 @@ alias | zsh-ios build --aliases-stdin
 
 | Key | Action |
 |-----|--------|
-| **Enter** | Resolve abbreviations and execute. If ambiguous, show interactive picker. |
+| **Enter** | Resolve abbreviations and execute. If ambiguous, show a keystroke-driven picker (auto-accepts the moment your digits uniquely identify an option). |
 | **Tab** | Expand to longest common prefix. If already expanded, fall through to native Zsh completion. |
 | **?** | IOS-style help. Show completions for the current position — subcommands, flags with expected argument type, or live argument values (branches, hosts, signals, users, tracked files, ...). |
+| **Leading `!`** | Bypass zsh-ios entirely — the buffer runs exactly as typed (history expansion, literal-run). |
 
 The `?` key is position and context-aware:
 
@@ -216,7 +219,9 @@ $ cd \!imp        →  cd !important         (literal !, not suffix mode)
 $ ls \*star       →  ls *starred           (literal *, not contains mode)
 ```
 
-### Pipes and chains
+### Bypass with `!`
+
+A leading `!` means "don't touch this line." Enter, Tab, and `?` all fall through to native Zsh so history expansion (`!!`, `!$`, `!string`) and explicit literal-run semantics work untouched. zsh-ios never resolves, completes, or learns anything about a `!`-prefixed buffer. A `!` that follows a `/` (as in `cd te/!5`) is still the path suffix-match operator — only a leading `!` triggers bypass.
 
 Each segment of a pipeline or chain is resolved independently:
 

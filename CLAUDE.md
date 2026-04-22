@@ -55,16 +55,28 @@ The binary exit codes are the plugin's signal: `0` = resolved (stdout is the new
 
 ### Plugin internals worth knowing
 
-- `_zsh_ios_precmd` learns the previous command *only if exit code was 0*. `_zsh_ios_save_retval` is force-inserted as the **first** `precmd_functions` entry so other hooks can't clobber `$?` before it's captured.
+- Retval capture runs in the `precmd` magic function (which zsh invokes **before** `precmd_functions`), chaining through any user-defined `precmd` so third-party hooks can't displace it. `_zsh_ios_precmd` then learns the previous command only if `$?` was 0.
 - The plugin also spawns a `zpty`-based **completion worker** (`_zsh_ios_worker_*`) that preloads `compinit` so generic Zsh completion can be queried cheaply from the `?` key. The worker sources this same plugin file but bails immediately via the `_ZSH_IOS_IS_WORKER` guard at the top — do not move that guard.
 - A stale-trie rebuild runs in the background on shell startup if `tree.msgpack` is >1h old.
+- **Leading-`!` bypass**: if `BUFFER` starts with `!`, Enter/Tab/`?` fall through to native zsh (history expansion, literal run). The Rust side mirrors this: `resolve_line` and `complete` short-circuit via `starts_with_bang` so the binary is safe to call directly on such input too.
+- **Ambiguous picker** is keystroke-driven: reads one digit at a time and auto-commits the moment the typed number uniquely identifies an option (i.e. no longer number `<=N` starts with the buffered digits). Out-of-range keystrokes are silently dropped; Enter force-commits or cancels on empty.
 
 ### Learning invariants
 
 Commands are only added to the trie after they exit successfully, **after being resolved to their expanded form** — so the trie learns `git branch`, not `gi br`. `is_prefix_of_existing` prevents junk prefixes like `terr` from being inserted when `terraform` already exists. During `build`, history entries are also filtered against PATH/builtins/aliases.
 
+### Concurrency safety
+
+The plugin spawns `zsh-ios learn` in the background after every command, which means multiple load-mutate-save cycles can overlap. Two invariants protect `tree.msgpack`:
+- `CommandTrie::save` writes to `tree.msgpack.tmp.$pid` then renames — readers never see a partial file.
+- `cmd_build`, `cmd_learn`, `cmd_pin`, `cmd_unpin` hold an exclusive `fs2` advisory flock on a sibling `.lock` file across the full load-mutate-save cycle.
+
+`cmd_toggle` uses `O_CREAT|O_EXCL` to avoid an analogous race on the `disabled` marker file. `load_trie` distinguishes missing-file from decode-failure and prints the error with a rebuild hint; do not silence it — that was a real regression we fixed.
+
 ## Conventions
 
 - Edition 2024, no workspace — single crate.
 - No custom error type; `Result<T, Box<dyn Error>>` / `io::Result` are used directly.
-- Tests live inline in each module under `#[cfg(test)] mod tests`. Prefer adding tests next to the function under test rather than in a separate file.
+- YAML parsing uses `serde_yaml_ng` (drop-in for the now-unmaintained `serde_yaml`).
+- Tests live inline in each module under `#[cfg(test)] mod tests`. Prefer adding tests next to the function under test rather than in a separate file. End-to-end CLI tests live in `tests/cli.rs` and spawn the actual binary with an isolated `HOME`/`XDG_CONFIG_HOME` tempdir.
+- Any test that mutates process-global state (`cwd`, `$PATH`) must take `crate::test_util::CWD_LOCK` for the duration of its work — the default parallel test runner will race otherwise. This is why `CommandTrie::save`-related tests use tempdirs but the cwd-touching ones explicitly lock.
