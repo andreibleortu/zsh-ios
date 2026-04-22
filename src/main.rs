@@ -548,6 +548,22 @@ fn cmd_status() {
     } else {
         println!("  Pins:        none");
     }
+
+    // Runtime cache stats — one line with entry count and total bytes.
+    if let Some(cache) = runtime_cache::RuntimeCache::default_location() {
+        let (n, bytes) = cache.stats();
+        println!("  Cache:       {} entries, {} bytes", n, bytes);
+    }
+
+    // Registered resolvers by count per ARG_MODE — gives a pulse on which
+    // data sources the build has hooked up.
+    let registered: Vec<u8> = (1u8..=72u8)
+        .filter(|m| type_resolver::REGISTRY.contains(*m))
+        .collect();
+    println!(
+        "  Resolvers:   {} registered",
+        registered.len(),
+    );
 }
 
 fn cmd_explain(line: &str) {
