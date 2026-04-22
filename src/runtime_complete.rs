@@ -1366,6 +1366,313 @@ impl TypeResolver for ScreenSessionResolver {
     }
 }
 
+// --- Package manager resolvers ---
+
+// Helper: walk from `start` up the directory tree and return the path of the
+// first file named `name` found, or `None`.
+fn find_ancestor_file(start: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let p = dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+// --- Homebrew ---
+
+pub fn brew_formula() -> Vec<String> {
+    run_capture("brew", &["list", "--formula", "-1"], None)
+}
+
+pub struct BrewFormulaResolver;
+impl TypeResolver for BrewFormulaResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        brew_formula()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "brew-formula"
+    }
+}
+
+pub fn brew_cask() -> Vec<String> {
+    run_capture("brew", &["list", "--cask", "-1"], None)
+}
+
+pub struct BrewCaskResolver;
+impl TypeResolver for BrewCaskResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        brew_cask()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "brew-cask"
+    }
+}
+
+// --- APT ---
+
+pub fn apt_packages() -> Vec<String> {
+    run_capture("apt-cache", &["pkgnames"], None)
+}
+
+pub struct AptPackageResolver;
+impl TypeResolver for AptPackageResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        apt_packages()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "apt-package"
+    }
+}
+
+// --- DNF ---
+
+fn parse_dnf_repoquery(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = raw
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn dnf_packages() -> Vec<String> {
+    let raw = run_capture("dnf", &["repoquery", "--qf=%{name}", "--quiet"], None);
+    parse_dnf_repoquery(&raw)
+}
+
+pub struct DnfPackageResolver;
+impl TypeResolver for DnfPackageResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        dnf_packages()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "dnf-package"
+    }
+}
+
+// --- Pacman ---
+
+pub fn pacman_packages() -> Vec<String> {
+    run_capture("pacman", &["-Ssq"], None)
+}
+
+pub struct PacmanPackageResolver;
+impl TypeResolver for PacmanPackageResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        pacman_packages()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "pacman-package"
+    }
+}
+
+// --- npm ---
+
+/// Extract dependency keys from a minimal `package.json` fragment.
+/// Handles both `"dependencies"` and `"devDependencies"` sections.
+/// Uses a simple string-level scan — no full JSON parser needed.
+fn parse_npm_package_json(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    // Locate each deps block by looking for the key then scanning the `{...}`.
+    for section_key in ["\"dependencies\"", "\"devDependencies\""] {
+        let Some(key_pos) = content.find(section_key) else { continue };
+        let after_key = &content[key_pos + section_key.len()..];
+        // Find the opening `{` for the value.
+        let Some(open) = after_key.find('{') else { continue };
+        let block_start = open + 1;
+        // Find matching closing `}`.
+        let mut depth = 1usize;
+        let mut end = block_start;
+        for (i, ch) in after_key[block_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &after_key[block_start..end];
+        // Extract `"<name>"` keys: the first quoted string on each `"key": value` pair.
+        let mut remaining = block;
+        while let Some(q_open) = remaining.find('"') {
+            remaining = &remaining[q_open + 1..];
+            let Some(q_close) = remaining.find('"') else { break };
+            let key = &remaining[..q_close];
+            remaining = &remaining[q_close + 1..];
+            // Skip over the colon + value to avoid treating values as keys.
+            // A key is followed (possibly with whitespace) by `:`.
+            let trimmed = remaining.trim_start();
+            if trimmed.starts_with(':') {
+                if !key.is_empty() {
+                    names.push(key.to_string());
+                }
+                // Advance past the colon.
+                if let Some(colon_pos) = remaining.find(':') {
+                    remaining = &remaining[colon_pos + 1..];
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub fn npm_packages(ctx: &Ctx) -> Vec<String> {
+    // Try nearest package.json first (fast, no network, no process spawn).
+    if let Some(dir) = ctx.cwd.as_deref()
+        && let Some(pkg_path) = find_ancestor_file(dir, "package.json")
+        && let Ok(content) = std::fs::read_to_string(&pkg_path)
+    {
+        let names = parse_npm_package_json(&content);
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    // Fallback: npm ls --depth=0 --json.
+    let raw = run_capture("npm", &["ls", "--depth=0", "--json", "--parseable=false"], None);
+    let joined = raw.join("\n");
+    parse_npm_package_json(&joined)
+}
+
+pub struct NpmPackageResolver;
+impl TypeResolver for NpmPackageResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        npm_packages(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "npm-package"
+    }
+}
+
+// --- pip ---
+
+fn parse_pip_freeze(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|l| l.split_once("==").map(|(n, _)| n.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+pub fn pip_packages() -> Vec<String> {
+    // Try pip3 first; fall back to pip.
+    let mut out = run_capture("pip3", &["list", "--format=freeze"], None);
+    if out.is_empty() {
+        out = run_capture("pip", &["list", "--format=freeze"], None);
+    }
+    parse_pip_freeze(&out.join("\n"))
+}
+
+pub struct PipPackageResolver;
+impl TypeResolver for PipPackageResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        pip_packages()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "pip-package"
+    }
+}
+
+// --- Cargo ---
+
+/// Extract crate names from `[dependencies]` and `[dev-dependencies]` sections
+/// of a `Cargo.toml` file. Uses a line-based parser — no `toml` crate needed.
+fn parse_cargo_toml_deps(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_dep_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // Section header.
+            in_dep_section = trimmed == "[dependencies]"
+                || trimmed == "[dev-dependencies]"
+                || trimmed == "[build-dependencies]";
+            continue;
+        }
+        if !in_dep_section {
+            continue;
+        }
+        // Skip comments and blank lines.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A dependency line looks like:
+        //   name = "version"
+        //   name = { version = "1", ... }
+        //   name.workspace = true
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key_part = trimmed[..eq_pos].trim();
+            // The key is a bare Rust identifier (alphanumeric + `_` + `-`).
+            // Reject lines where the key contains `.` (e.g. `name.workspace`).
+            if !key_part.contains('.')
+                && key_part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                && !key_part.is_empty()
+            {
+                names.push(key_part.to_string());
+            }
+        }
+    }
+    names
+}
+
+pub fn cargo_crates(ctx: &Ctx) -> Vec<String> {
+    let start = match ctx.cwd.as_deref() {
+        Some(d) => d.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let Some(path) = find_ancestor_file(&start, "Cargo.toml") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    parse_cargo_toml_deps(&content)
+}
+
+pub struct CargoCrateResolver;
+impl TypeResolver for CargoCrateResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        cargo_crates(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "cargo-crate"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -1410,6 +1717,15 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_TMUX_PANE, Box::new(TmuxPaneResolver));
     // screen
     r.register(ARG_MODE_SCREEN_SESSION, Box::new(ScreenSessionResolver));
+    // Package managers
+    r.register(ARG_MODE_BREW_FORMULA, Box::new(BrewFormulaResolver));
+    r.register(ARG_MODE_BREW_CASK, Box::new(BrewCaskResolver));
+    r.register(ARG_MODE_APT_PACKAGE, Box::new(AptPackageResolver));
+    r.register(ARG_MODE_DNF_PACKAGE, Box::new(DnfPackageResolver));
+    r.register(ARG_MODE_PACMAN_PACKAGE, Box::new(PacmanPackageResolver));
+    r.register(ARG_MODE_NPM_PACKAGE, Box::new(NpmPackageResolver));
+    r.register(ARG_MODE_PIP_PACKAGE, Box::new(PipPackageResolver));
+    r.register(ARG_MODE_CARGO_CRATE, Box::new(CargoCrateResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -1468,6 +1784,14 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_TMUX_WINDOW => "<window>",
         trie::ARG_MODE_TMUX_PANE => "<pane>",
         trie::ARG_MODE_SCREEN_SESSION => "<screen-session>",
+        trie::ARG_MODE_BREW_FORMULA => "<formula>",
+        trie::ARG_MODE_BREW_CASK => "<cask>",
+        trie::ARG_MODE_APT_PACKAGE => "<package>",
+        trie::ARG_MODE_DNF_PACKAGE => "<package>",
+        trie::ARG_MODE_PACMAN_PACKAGE => "<package>",
+        trie::ARG_MODE_NPM_PACKAGE => "<package>",
+        trie::ARG_MODE_PIP_PACKAGE => "<package>",
+        trie::ARG_MODE_CARGO_CRATE => "<crate>",
         _ => "<arg>",
     }
 }
@@ -2436,5 +2760,216 @@ There are screens on:\n\
                 std::env::remove_var("PATH");
             }
         }
+    }
+
+    // --- Package manager tests ---
+
+    // Shared helper: clear PATH to an empty dir and return the original value.
+    // Callers must hold CWD_LOCK before calling this.
+    fn empty_path_dir() -> (tempfile::TempDir, Option<std::ffi::OsString>) {
+        let orig = std::env::var_os("PATH");
+        let td = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", td.path()); }
+        (td, orig)
+    }
+
+    fn restore_path(orig: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    // --- BrewFormulaResolver ---
+
+    #[test]
+    fn brew_formula_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(brew_formula(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- BrewCaskResolver ---
+
+    #[test]
+    fn brew_cask_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(brew_cask(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- AptPackageResolver ---
+
+    #[test]
+    fn apt_package_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(apt_packages(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- DnfPackageResolver ---
+
+    #[test]
+    fn parse_dnf_repoquery_extracts_names() {
+        let raw = vec![
+            "bash".to_string(),
+            "glibc".to_string(),
+            "bash".to_string(), // duplicate
+            "".to_string(),     // blank
+        ];
+        let result = parse_dnf_repoquery(&raw);
+        assert!(result.contains(&"bash".to_string()));
+        assert!(result.contains(&"glibc".to_string()));
+        // dedup
+        assert_eq!(result.iter().filter(|s| s.as_str() == "bash").count(), 1);
+    }
+
+    #[test]
+    fn dnf_package_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(dnf_packages(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- PacmanPackageResolver ---
+
+    #[test]
+    fn pacman_package_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(pacman_packages(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- PipPackageResolver ---
+
+    #[test]
+    fn parse_pip_freeze_extracts_names() {
+        let raw = "foo==1.0\nbar-baz==2.3\n";
+        let result = parse_pip_freeze(raw);
+        assert_eq!(result, vec!["foo".to_string(), "bar-baz".to_string()]);
+    }
+
+    #[test]
+    fn parse_pip_freeze_skips_lines_without_eq_eq() {
+        let raw = "Requirement already satisfied\nfoo==1.0\nignored-line\n";
+        let result = parse_pip_freeze(raw);
+        assert_eq!(result, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn pip_package_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(pip_packages(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    // --- NpmPackageResolver ---
+
+    #[test]
+    fn parse_npm_package_json_extracts_all_dep_keys() {
+        let content = r#"{"dependencies": {"lodash": "^4", "react": "^18"}, "devDependencies": {"typescript": "^5"}}"#;
+        let mut result = parse_npm_package_json(content);
+        result.sort();
+        assert!(result.contains(&"lodash".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"react".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"typescript".to_string()), "result: {:?}", result);
+    }
+
+    #[test]
+    fn npm_packages_reads_package_json_from_cwd() {
+        let td = tempfile::tempdir().unwrap();
+        let pkg_json = r#"{"dependencies": {"lodash": "^4", "react": "^18"}, "devDependencies": {"typescript": "^5"}}"#;
+        std::fs::write(td.path().join("package.json"), pkg_json).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = npm_packages(&ctx);
+        assert!(result.contains(&"lodash".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"react".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"typescript".to_string()), "result: {:?}", result);
+    }
+
+    #[test]
+    fn npm_package_no_package_json_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let (empty_td, orig) = empty_path_dir();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = npm_packages(&ctx);
+        assert!(result.is_empty(), "result: {:?}", result);
+        drop(empty_td);
+        restore_path(orig);
+    }
+
+    // --- CargoCrateResolver ---
+
+    #[test]
+    fn parse_cargo_toml_deps_extracts_dep_names() {
+        let content = "\
+[package]\n\
+name = \"x\"\n\
+\n\
+[dependencies]\n\
+anyhow = \"1\"\n\
+clap = { version = \"4\" }\n\
+\n\
+[dev-dependencies]\n\
+pretty_assertions = \"1\"\n\
+";
+        let result = parse_cargo_toml_deps(content);
+        assert!(result.contains(&"anyhow".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"clap".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"pretty_assertions".to_string()), "result: {:?}", result);
+        // `name` is under [package], not a deps section — must not appear.
+        assert!(!result.contains(&"name".to_string()), "result: {:?}", result);
+    }
+
+    #[test]
+    fn cargo_crates_reads_cargo_toml_from_cwd() {
+        let td = tempfile::tempdir().unwrap();
+        let cargo_toml = "\
+[package]\n\
+name = \"x\"\n\
+\n\
+[dependencies]\n\
+anyhow = \"1\"\n\
+clap = { version = \"4\" }\n\
+\n\
+[dev-dependencies]\n\
+pretty_assertions = \"1\"\n\
+";
+        std::fs::write(td.path().join("Cargo.toml"), cargo_toml).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = cargo_crates(&ctx);
+        assert!(result.contains(&"anyhow".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"clap".to_string()), "result: {:?}", result);
+        assert!(result.contains(&"pretty_assertions".to_string()), "result: {:?}", result);
+        assert!(!result.contains(&"name".to_string()), "result: {:?}", result);
+    }
+
+    #[test]
+    fn cargo_crate_no_cargo_toml_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(cargo_crates(&ctx), Vec::<String>::new());
     }
 }

@@ -158,6 +158,15 @@ mod tests {
             ARG_MODE_TMUX_PANE,
             // screen
             ARG_MODE_SCREEN_SESSION,
+            // package managers
+            ARG_MODE_BREW_FORMULA,
+            ARG_MODE_BREW_CASK,
+            ARG_MODE_APT_PACKAGE,
+            ARG_MODE_DNF_PACKAGE,
+            ARG_MODE_PACMAN_PACKAGE,
+            ARG_MODE_NPM_PACKAGE,
+            ARG_MODE_PIP_PACKAGE,
+            ARG_MODE_CARGO_CRATE,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }
