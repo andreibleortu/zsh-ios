@@ -11,6 +11,7 @@
 
 pub mod completions;
 pub mod config;
+pub mod fish_completions;
 pub mod history;
 pub mod path_resolve;
 pub mod pins;

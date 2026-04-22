@@ -173,6 +173,16 @@ fn cmd_build(aliases_stdin: bool) {
             .count()
     );
 
+    // 5b. Supplement with Fish completion data (additive — Zsh wins on conflicts)
+    let (fish_cmds, fish_subs, fish_flags) =
+        fish_completions::scan_fish_completions(&mut ct);
+    if fish_cmds > 0 {
+        eprintln!(
+            "Enriched {} commands with Fish completion data ({} subs, {} flags)",
+            fish_cmds, fish_subs, fish_flags,
+        );
+    }
+
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
