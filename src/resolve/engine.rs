@@ -670,6 +670,16 @@ pub(super) fn resolve_from_node(
                     deep_raw
                 };
 
+                // Flag-match narrowing — runs after arg-type narrowing,
+                // before the stats tiebreaker.  Uses flag evidence in `rest`
+                // to discriminate candidates whose arg-types didn't differ.
+                if deep.len() > 1 {
+                    let narrowed = narrow_by_flag_match(&deep, result, rest, arg_specs);
+                    if narrowed.len() < deep.len() {
+                        deep = narrowed;
+                    }
+                }
+
                 // Phase 5.2: if still ambiguous after arg-type narrowing,
                 // try the statistical tiebreaker (frequency + recency + success rate).
                 if deep.len() > 1
@@ -738,7 +748,30 @@ pub(super) fn resolve_from_node(
                     remaining: rest.iter().map(|s| s.to_string()).collect(),
                 }))
             } else {
-                let cands: Vec<String> = matches.iter().map(|(s, _)| s.to_string()).collect();
+                // rest is empty OR rest[0] starts with '-' (a flag).
+                // Try flag-match narrowing before surfacing ambiguity.
+                let mut pool = matches.to_vec();
+                if !rest.is_empty() && pool.len() > 1 {
+                    let narrowed = narrow_by_flag_match(&pool, result, rest, arg_specs);
+                    if narrowed.len() < pool.len() {
+                        pool = narrowed;
+                    }
+                }
+
+                if pool.len() == 1 {
+                    let (full_name, child_node) = pool[0];
+                    result.push(full_name.to_string());
+                    if !child_node.children.is_empty() {
+                        return resolve_from_node(rest, child_node, result, modes, arg_specs);
+                    } else {
+                        for w in rest {
+                            result.push(w.to_string());
+                        }
+                        return Ok(());
+                    }
+                }
+
+                let cands: Vec<String> = pool.iter().map(|(s, _)| s.to_string()).collect();
                 let lcp = longest_common_prefix(&cands);
                 Err(Box::new(AmbiguityInfo {
                     word: word.to_string(),
@@ -877,6 +910,64 @@ pub(super) fn narrow_by_arg_type<'a>(
     } else {
         candidates.to_vec()
     }
+}
+
+/// Use flags in `rest` (the portion of the command line following the
+/// ambiguous word) as disambiguation evidence. A candidate gains evidence
+/// for every flag in `rest` that appears in its ArgSpec's `flag_args`
+/// OR `flag_call_programs` OR `flag_static_lists`. Candidates with strictly
+/// MORE flag hits than the minimum win; ties at the max are preserved.
+///
+/// If no candidate has evidence (nobody recognizes any flag) OR all have
+/// the same count, returns the input unchanged — nothing to narrow on.
+pub(super) fn narrow_by_flag_match<'a>(
+    candidates: &[(&'a str, &'a TrieNode)],
+    prefix_chain: &[String],
+    rest: &[&str],
+    arg_specs: &ArgSpecMap,
+) -> Vec<(&'a str, &'a TrieNode)> {
+    let flags: Vec<&str> = rest
+        .iter()
+        .filter(|w| w.starts_with('-') && w.len() > 1)
+        .copied()
+        .collect();
+    if flags.is_empty() {
+        return candidates.to_vec();
+    }
+
+    let scored: Vec<(usize, (&'a str, &'a TrieNode))> = candidates
+        .iter()
+        .map(|&(name, node)| {
+            let mut full: Vec<&str> = prefix_chain.iter().map(String::as_str).collect();
+            full.push(name);
+            let key = full.join(" ");
+            let hits = match arg_specs.get(&key) {
+                Some(spec) => flags
+                    .iter()
+                    .filter(|f| {
+                        let bare = f.split_once('=').map(|(k, _)| k).unwrap_or(f);
+                        spec.flag_args.contains_key(bare)
+                            || spec.flag_call_programs.contains_key(bare)
+                            || spec.flag_static_lists.contains_key(bare)
+                    })
+                    .count(),
+                None => 0,
+            };
+            (hits, (name, node))
+        })
+        .collect();
+
+    let max = scored.iter().map(|(h, _)| *h).max().unwrap_or(0);
+    let min = scored.iter().map(|(h, _)| *h).min().unwrap_or(0);
+    if max == 0 || max == min {
+        return candidates.to_vec();
+    }
+
+    scored
+        .into_iter()
+        .filter(|(h, _)| *h == max)
+        .map(|(_, c)| c)
+        .collect()
 }
 
 /// When arg-type narrowing is indecisive, pick by statistical evidence:
@@ -3887,6 +3978,181 @@ mod tests {
         if std::path::Path::new("/usr/share/zoneinfo/UTC").is_file() {
             assert!(word_matches_type("UTC", ARG_MODE_TIMEZONE));
             assert!(!word_matches_type("NotReal/Zone", ARG_MODE_TIMEZONE));
+        }
+    }
+
+    // --- narrow_by_flag_match tests ---
+
+    #[test]
+    fn narrow_by_flag_match_picks_candidate_with_flag() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "cherry"]);
+        t.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        // cherry has no flag_args
+        let git_node = t.root.get_child("git").unwrap();
+        let checkout_node = git_node.get_child("checkout").unwrap();
+        let cherry_node = git_node.get_child("cherry").unwrap();
+        let candidates = vec![("checkout", checkout_node), ("cherry", cherry_node)];
+        let prefix = vec!["git".to_string()];
+        let narrowed =
+            narrow_by_flag_match(&candidates, &prefix, &["-p", "main"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 1, "expected 1, got {:?}", narrowed.iter().map(|(n, _)| n).collect::<Vec<_>>());
+        assert_eq!(narrowed[0].0, "checkout");
+    }
+
+    #[test]
+    fn narrow_by_flag_match_preserves_ties() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "cherry"]);
+        t.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        t.arg_specs.insert(
+            "git cherry".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_GIT_BRANCHES)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let git_node = t.root.get_child("git").unwrap();
+        let checkout_node = git_node.get_child("checkout").unwrap();
+        let cherry_node = git_node.get_child("cherry").unwrap();
+        let candidates = vec![("checkout", checkout_node), ("cherry", cherry_node)];
+        let prefix = vec!["git".to_string()];
+        let narrowed =
+            narrow_by_flag_match(&candidates, &prefix, &["-p", "main"], &t.arg_specs);
+        // Both have 1 hit — max == min, no discrimination.
+        assert_eq!(narrowed.len(), 2);
+    }
+
+    #[test]
+    fn narrow_by_flag_match_no_flags_in_rest() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "cherry"]);
+        t.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let git_node = t.root.get_child("git").unwrap();
+        let checkout_node = git_node.get_child("checkout").unwrap();
+        let cherry_node = git_node.get_child("cherry").unwrap();
+        let candidates = vec![("checkout", checkout_node), ("cherry", cherry_node)];
+        let prefix = vec!["git".to_string()];
+        // No flags in rest — returns unchanged.
+        let narrowed = narrow_by_flag_match(&candidates, &prefix, &["main"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 2);
+    }
+
+    #[test]
+    fn narrow_by_flag_match_handles_equals_form() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "cherry"]);
+        t.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("--color".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let git_node = t.root.get_child("git").unwrap();
+        let checkout_node = git_node.get_child("checkout").unwrap();
+        let cherry_node = git_node.get_child("cherry").unwrap();
+        let candidates = vec![("checkout", checkout_node), ("cherry", cherry_node)];
+        let prefix = vec!["git".to_string()];
+        // --color=always should match spec key "--color"
+        let narrowed =
+            narrow_by_flag_match(&candidates, &prefix, &["--color=always"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].0, "checkout");
+    }
+
+    #[test]
+    fn narrow_by_flag_match_considers_call_programs() {
+        let mut t = CommandTrie::new();
+        t.insert(&["ssh", "add"]);
+        t.insert(&["ssh", "apply"]);
+        // "add" has --cipher in flag_call_programs; "apply" does not.
+        t.arg_specs.insert(
+            "ssh add".into(),
+            ArgSpec {
+                flag_call_programs: [(
+                    "--cipher".into(),
+                    ("openssl".into(), vec!["ciphers".into()]),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        let ssh_node = t.root.get_child("ssh").unwrap();
+        let add_node = ssh_node.get_child("add").unwrap();
+        let apply_node = ssh_node.get_child("apply").unwrap();
+        let candidates = vec![("add", add_node), ("apply", apply_node)];
+        let prefix = vec!["ssh".to_string()];
+        let narrowed =
+            narrow_by_flag_match(&candidates, &prefix, &["--cipher"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].0, "add");
+    }
+
+    #[test]
+    fn narrow_by_flag_match_no_evidence_returns_input() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "cherry"]);
+        // No arg_specs for either candidate.
+        let git_node = t.root.get_child("git").unwrap();
+        let checkout_node = git_node.get_child("checkout").unwrap();
+        let cherry_node = git_node.get_child("cherry").unwrap();
+        let candidates = vec![("checkout", checkout_node), ("cherry", cherry_node)];
+        let prefix = vec!["git".to_string()];
+        // Neither candidate has any spec, so all score 0 — max == 0 → return input.
+        let narrowed =
+            narrow_by_flag_match(&candidates, &prefix, &["--verbose"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 2, "must not return empty — input unchanged when no evidence");
+    }
+
+    #[test]
+    fn resolve_flag_narrows_integration() {
+        // Build a trie with two commands under "git": checkout and cherry.
+        // Only checkout has -p in its flag_args.
+        // "git ch -p main" should resolve to "git checkout -p main".
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        trie.insert(&["git", "cherry"]);
+        trie.insert_command("git");
+        trie.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                flag_args: [("-p".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        // cherry has no flag_args — no positional that matches "-p" either
+        let pins = Pins::default();
+        match resolve_line("git ch -p main", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "git checkout -p main"),
+            ResolveResult::Ambiguous(info) => {
+                panic!("still ambiguous: {:?}", info.candidates)
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 }
