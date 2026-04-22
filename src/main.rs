@@ -183,6 +183,14 @@ fn cmd_build(aliases_stdin: bool) {
         );
     }
 
+    // 5c. Import user-defined shell functions so they're resolvable as commands.
+    // We run `zsh -ic` (interactive) so .zshrc runs and user's functions are
+    // visible. Cheap because the result only needs to be fetched at build time.
+    let fn_count = import_shell_functions(&mut ct);
+    if fn_count > 0 {
+        eprintln!("Imported {} shell functions", fn_count);
+    }
+
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
@@ -203,6 +211,37 @@ fn cmd_build(aliases_stdin: bool) {
         tree_path.display(),
         ct.root.len()
     );
+}
+
+/// Ask an interactive Zsh to print its function names, one per line, and
+/// insert non-underscore-prefixed ones into the trie as leaf commands.
+///
+/// Returns the number of functions actually inserted.  Missing zsh,
+/// .zshrc errors, or an empty result all quietly yield 0.
+fn import_shell_functions(trie: &mut trie::CommandTrie) -> u32 {
+    let mut cmd = std::process::Command::new("zsh");
+    cmd.args(["-ic", "print -l ${(k)functions}"]);
+    cmd.stderr(std::process::Stdio::null());
+    let output = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    let mut n = 0u32;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('_') || name.contains(char::is_whitespace) {
+            continue;
+        }
+        // Skip anything the trie already knows — we don't want to displace
+        // a real executable with a same-named function entry (both work;
+        // first one wins for descriptions).
+        if trie.root.get_child(name).is_some() {
+            continue;
+        }
+        trie.insert_command(name);
+        n += 1;
+    }
+    n
 }
 
 fn cmd_resolve(line: &str) {
