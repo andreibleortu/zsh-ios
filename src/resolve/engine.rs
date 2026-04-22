@@ -693,8 +693,21 @@ pub(super) fn resolve_from_node(
                     }
                 }
 
+                // When arg-type or stats narrowing already trimmed the
+                // candidate pool, surface the NARROWED set in the ambiguity
+                // report — otherwise the picker ends up showing the
+                // pre-narrowing list, defeating the whole purpose of the
+                // signals.  Fall back to `matches` when narrowing didn't
+                // reduce the set (preserves the original output for pure
+                // prefix-only ambiguity).
+                let report: Vec<(&str, &TrieNode)> = if !deep.is_empty() && deep.len() < matches.len() {
+                    deep.iter().map(|(n, nd)| (*n, *nd)).collect()
+                } else {
+                    matches.iter().map(|(n, nd)| (*n, *nd)).collect()
+                };
+
                 // Build deep candidate info for the ambiguity report
-                let deep_candidates: Vec<DeepCandidate> = matches
+                let deep_candidates: Vec<DeepCandidate> = report
                     .iter()
                     .filter_map(|(name, node)| {
                         let sub_matches: Vec<String> = node
@@ -713,7 +726,7 @@ pub(super) fn resolve_from_node(
                     })
                     .collect();
 
-                let cands: Vec<String> = matches.iter().map(|(s, _)| s.to_string()).collect();
+                let cands: Vec<String> = report.iter().map(|(s, _)| s.to_string()).collect();
                 let lcp = longest_common_prefix(&cands);
                 Err(Box::new(AmbiguityInfo {
                     word: word.to_string(),
