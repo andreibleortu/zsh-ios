@@ -1142,6 +1142,105 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
         return Some(trie::ARG_MODE_LOCALES);
     }
 
+    // systemd — `_wanted systemd-units`, `__systemctl list-units`
+    if action.contains("systemd-units") || action.contains("__systemctl list-units") {
+        return Some(trie::ARG_MODE_SYSTEMD_UNIT);
+    }
+    if action.contains("__systemctl list-timers") {
+        return Some(trie::ARG_MODE_SYSTEMD_TIMER);
+    }
+
+    // Docker — completion functions use `__docker_complete_*` / `__docker_*` prefixes
+    if action.contains("__docker_complete_containers")
+        || action.contains("__docker_containers_all")
+        || action.contains("__docker_complete_running_containers")
+        || action.contains("__docker_complete_stopped_containers")
+    {
+        return Some(trie::ARG_MODE_DOCKER_CONTAINER);
+    }
+    if action.contains("__docker_complete_images") || action.contains("__docker_images") {
+        return Some(trie::ARG_MODE_DOCKER_IMAGE);
+    }
+    if action.contains("__docker_complete_networks") || action.contains("__docker_networks") {
+        return Some(trie::ARG_MODE_DOCKER_NETWORK);
+    }
+    if action.contains("__docker_complete_volumes") || action.contains("__docker_volumes") {
+        return Some(trie::ARG_MODE_DOCKER_VOLUME);
+    }
+    if action.contains("__docker_complete_services") || action.contains("__docker_compose_services") {
+        return Some(trie::ARG_MODE_DOCKER_COMPOSE_SERVICE);
+    }
+
+    // kubectl — the generated completion uses `__kubectl_*` helpers.
+    if action.contains("__kubectl_get_pods") || action.contains("__kubectl_pod_names") {
+        return Some(trie::ARG_MODE_K8S_POD);
+    }
+    if action.contains("__kubectl_get_namespaces") || action.contains("__kubectl_namespaces") {
+        return Some(trie::ARG_MODE_K8S_NAMESPACE);
+    }
+    if action.contains("__kubectl_get_contexts") || action.contains("__kubectl_config_get-contexts") {
+        return Some(trie::ARG_MODE_K8S_CONTEXT);
+    }
+    if action.contains("__kubectl_get_deployments") {
+        return Some(trie::ARG_MODE_K8S_DEPLOYMENT);
+    }
+    if action.contains("__kubectl_get_services") {
+        return Some(trie::ARG_MODE_K8S_SERVICE);
+    }
+
+    // Homebrew
+    if action.contains("_brew_formulae") || action.contains("__brew_installed_formulae") {
+        return Some(trie::ARG_MODE_BREW_FORMULA);
+    }
+    if action.contains("_brew_casks") || action.contains("__brew_installed_casks") {
+        return Some(trie::ARG_MODE_BREW_CASK);
+    }
+
+    // tmux — session list helpers
+    if action.contains("__tmux-sessions") || action.contains("__tmux_session_names") {
+        return Some(trie::ARG_MODE_TMUX_SESSION);
+    }
+    if action.contains("__tmux-windows") {
+        return Some(trie::ARG_MODE_TMUX_WINDOW);
+    }
+    if action.contains("__tmux-panes") {
+        return Some(trie::ARG_MODE_TMUX_PANE);
+    }
+
+    // Git — additional helpers
+    if action.contains("__git_stashes") || action.contains("__git_recent_stashes") {
+        return Some(trie::ARG_MODE_GIT_STASH);
+    }
+    if action.contains("__git_worktrees") {
+        return Some(trie::ARG_MODE_GIT_WORKTREE);
+    }
+    if action.contains("__git_submodules") {
+        return Some(trie::ARG_MODE_GIT_SUBMODULE);
+    }
+    if action.contains("__git_config_vars") || action.contains("__git_config_get-regexp") {
+        return Some(trie::ARG_MODE_GIT_CONFIG_KEY);
+    }
+    if action.contains("__git_aliases") {
+        return Some(trie::ARG_MODE_GIT_ALIAS);
+    }
+
+    // Package managers — apt/dpkg
+    if action.contains("_apt_packages") || action.contains("_deb_packages") {
+        return Some(trie::ARG_MODE_APT_PACKAGE);
+    }
+    if action.contains("_dnf_packages") || action.contains("_rpm_packages") {
+        return Some(trie::ARG_MODE_DNF_PACKAGE);
+    }
+    if action.contains("_pacman_packages") {
+        return Some(trie::ARG_MODE_PACMAN_PACKAGE);
+    }
+    if action.contains("_npm_packages") {
+        return Some(trie::ARG_MODE_NPM_PACKAGE);
+    }
+    if action.contains("_pip_packages") {
+        return Some(trie::ARG_MODE_PIP_PACKAGE);
+    }
+
     None
 }
 
