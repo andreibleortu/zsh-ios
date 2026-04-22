@@ -40,7 +40,7 @@ pub fn parse_history(
             result
         };
 
-        let command = strip_history_prefix(&full_line);
+        let (command, ts) = parse_history_line(&full_line);
         if command.is_empty() {
             continue;
         }
@@ -57,7 +57,7 @@ pub fn parse_history(
                 if words.len() > 1 {
                     let cmd = words[1];
                     if !should_skip_command(cmd, trie) {
-                        trie.insert(&words[1..]);
+                        trie.root.insert_with_time(&words[1..], ts);
                         count += 1;
                     }
                 }
@@ -82,7 +82,7 @@ pub fn parse_history(
                 continue;
             }
 
-            trie.insert(&words);
+            trie.root.insert_with_time(&words, ts);
             count += 1;
         }
     }
@@ -106,15 +106,24 @@ fn should_skip_command(cmd: &str, trie: &CommandTrie) -> bool {
     trie.root.get_child(cmd).is_none()
 }
 
-/// Strip the Zsh extended history prefix (`: timestamp:duration;`) if present.
-fn strip_history_prefix(line: &str) -> &str {
-    if line.starts_with(": ") {
-        // Extended format: `: 1234567890:0;actual command`
-        if let Some(pos) = line.find(';') {
-            return line[pos + 1..].trim();
-        }
+/// Strip the Zsh extended history prefix and return `(command, timestamp)`.
+/// For plain lines without a prefix, returns `(line.trim(), 0)`.
+/// Malformed extended entries fall back to the whole line + 0.
+fn parse_history_line(line: &str) -> (&str, u64) {
+    if line.starts_with(": ")
+        && let Some(semi) = line.find(';')
+    {
+        let cmd = line[semi + 1..].trim();
+        // Between `: ` and `;`, layout is `ts:duration`.
+        let meta = &line[2..semi];
+        let ts = meta
+            .split(':')
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        return (cmd, ts);
     }
-    line.trim()
+    (line.trim(), 0)
 }
 
 /// Split a command line on unquoted pipes and semicolons to extract
@@ -182,13 +191,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strip_history_prefix() {
+    fn parse_history_line_extended_format() {
         assert_eq!(
-            strip_history_prefix(": 1234567890:0;git status"),
-            "git status"
+            parse_history_line(": 1700000000:5;git status"),
+            ("git status", 1700000000)
         );
-        assert_eq!(strip_history_prefix("git status"), "git status");
-        assert_eq!(strip_history_prefix("  ls -la  "), "ls -la");
+    }
+
+    #[test]
+    fn parse_history_line_plain() {
+        assert_eq!(parse_history_line("git status"), ("git status", 0));
+    }
+
+    #[test]
+    fn parse_history_line_malformed_extended() {
+        assert_eq!(parse_history_line(": not-a-number:x;foo"), ("foo", 0));
+    }
+
+    #[test]
+    fn parse_history_line_missing_semicolon() {
+        // No `;` found — falls through to the plain branch, which returns line.trim().
+        // The `: ` prefix is preserved because we fall through without stripping it.
+        assert_eq!(
+            parse_history_line(": 123 no-semi"),
+            (": 123 no-semi", 0)
+        );
     }
 
     #[test]
@@ -335,6 +362,73 @@ mod tests {
             trie.root.get_child("terr").is_none(),
             "abbreviated prefix 'terr' should not be learned"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_history_writes_last_used() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-last-used");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(
+            &path,
+            ": 1700000000:0;git status\n: 1700000100:0;ls -la\n",
+        )
+        .unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+        trie.insert_command("ls");
+
+        parse_history(&path, &mut trie).unwrap();
+
+        let git = trie.root.get_child("git").unwrap();
+        assert_eq!(git.last_used, 1700000000);
+
+        let ls = trie.root.get_child("ls").unwrap();
+        assert_eq!(ls.last_used, 1700000100);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_history_plain_leaves_last_used_zero() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-plain-ts-zero");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(&path, "foo bar\n").unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("foo");
+
+        parse_history(&path, &mut trie).unwrap();
+
+        let foo = trie.root.get_child("foo").unwrap();
+        assert_eq!(foo.last_used, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_history_extended_keeps_max_ts() {
+        let dir = std::env::temp_dir().join("zsh-ios-test-max-ts");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        // Newer timestamp first, older second — max must win.
+        std::fs::write(
+            &path,
+            ": 1700000200:0;git status\n: 1700000100:0;git status\n",
+        )
+        .unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+
+        parse_history(&path, &mut trie).unwrap();
+
+        let git = trie.root.get_child("git").unwrap();
+        assert_eq!(git.last_used, 1700000200);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
