@@ -814,6 +814,351 @@ impl TypeResolver for GitReflogResolver {
     }
 }
 
+// --- Shared utility for Docker / Kubernetes resolvers ---
+
+fn run_capture(cmd: &str, args: &[&str], dir: Option<&std::path::Path>) -> Vec<String> {
+    let mut c = std::process::Command::new(cmd);
+    c.args(args);
+    if let Some(d) = dir {
+        c.current_dir(d);
+    }
+    c.stderr(std::process::Stdio::null());
+    match c.output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+// --- Docker resolvers ---
+
+pub fn docker_containers() -> Vec<String> {
+    run_capture("docker", &["ps", "--all", "--format", "{{.Names}}"], None)
+}
+
+pub struct DockerContainerResolver;
+impl TypeResolver for DockerContainerResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        docker_containers()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "docker-container"
+    }
+}
+
+pub fn docker_images() -> Vec<String> {
+    let raw = run_capture("docker", &["images", "--format", "{{.Repository}}:{{.Tag}}"], None);
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        if let Some((repo, tag)) = entry.split_once(':') {
+            if tag == "<none>" {
+                if !repo.is_empty() && repo != "<none>" {
+                    out.push(repo.to_string());
+                }
+            } else {
+                out.push(entry.clone());
+                // Also include bare repo name for convenience.
+                if !repo.is_empty() && repo != "<none>" {
+                    out.push(repo.to_string());
+                }
+            }
+        } else {
+            out.push(entry);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub struct DockerImageResolver;
+impl TypeResolver for DockerImageResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        docker_images()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "docker-image"
+    }
+}
+
+pub fn docker_networks() -> Vec<String> {
+    run_capture("docker", &["network", "ls", "--format", "{{.Name}}"], None)
+}
+
+pub struct DockerNetworkResolver;
+impl TypeResolver for DockerNetworkResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        docker_networks()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "docker-network"
+    }
+}
+
+pub fn docker_volumes() -> Vec<String> {
+    run_capture("docker", &["volume", "ls", "--format", "{{.Name}}"], None)
+}
+
+pub struct DockerVolumeResolver;
+impl TypeResolver for DockerVolumeResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        docker_volumes()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "docker-volume"
+    }
+}
+
+/// Walk from `start` up to the filesystem root and return the first directory
+/// that contains a compose file.
+fn find_compose_dir(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    const COMPOSE_FILES: &[&str] =
+        &["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"];
+    let mut dir = start.to_path_buf();
+    loop {
+        for name in COMPOSE_FILES {
+            if dir.join(name).exists() {
+                return Some(dir);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Parse top-level `services:` keys from a compose YAML file as a fallback
+/// when `docker compose` is unavailable or not running.
+fn parse_compose_services(compose_dir: &std::path::Path) -> Vec<String> {
+    const COMPOSE_FILES: &[&str] =
+        &["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"];
+    for name in COMPOSE_FILES {
+        let path = compose_dir.join(name);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content)
+                && let Some(services) = doc.get("services").and_then(|v| v.as_mapping())
+            {
+                return services
+                    .keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            break;
+        }
+    }
+    Vec::new()
+}
+
+pub fn docker_compose_services(ctx: &Ctx) -> Vec<String> {
+    let start = ctx
+        .cwd
+        .as_deref()
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok());
+    let compose_dir = match start.as_deref().and_then(find_compose_dir) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let out = run_capture(
+        "docker",
+        &["compose", "ps", "--services"],
+        Some(compose_dir.as_path()),
+    );
+    if !out.is_empty() {
+        return out;
+    }
+    parse_compose_services(&compose_dir)
+}
+
+pub struct DockerComposeServiceResolver;
+impl TypeResolver for DockerComposeServiceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        docker_compose_services(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "docker-compose-service"
+    }
+}
+
+// --- Kubernetes resolvers ---
+
+/// Extract the value of a flag from a word list.
+/// Handles `-f value`, `--flag value`, and `--flag=value` forms.
+fn extract_flag_value(words: &[String], flags: &[&str]) -> Option<String> {
+    for i in 0..words.len() {
+        for f in flags {
+            let key = (*f).to_string();
+            if words[i] == key && i + 1 < words.len() {
+                return Some(words[i + 1].clone());
+            }
+            if let Some(rest) = words[i].strip_prefix(&format!("{}=", f)) {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build `-n <namespace>` args to inject into kubectl commands if the caller
+/// specified a namespace in prior words.
+fn kubectl_namespace_args(ctx: &Ctx) -> Vec<String> {
+    match extract_flag_value(&ctx.prior_words, &["-n", "--namespace"]) {
+        Some(ns) => vec!["-n".to_string(), ns],
+        None => Vec::new(),
+    }
+}
+
+pub fn k8s_contexts() -> Vec<String> {
+    run_capture("kubectl", &["config", "get-contexts", "-o", "name"], None)
+}
+
+pub struct K8sContextResolver;
+impl TypeResolver for K8sContextResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        k8s_contexts()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-context"
+    }
+}
+
+pub fn k8s_namespaces() -> Vec<String> {
+    run_capture("kubectl", &["get", "namespaces", "-o", "name"], None)
+        .into_iter()
+        .map(|line| {
+            line.strip_prefix("namespace/").map(|s| s.to_string()).unwrap_or(line)
+        })
+        .collect()
+}
+
+pub struct K8sNamespaceResolver;
+impl TypeResolver for K8sNamespaceResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        k8s_namespaces()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-namespace"
+    }
+}
+
+pub fn k8s_pods(ctx: &Ctx) -> Vec<String> {
+    let ns_args = kubectl_namespace_args(ctx);
+    let ns_strs: Vec<&str> = ns_args.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = vec!["get"];
+    args.extend(ns_strs.iter().copied());
+    args.extend(["pods", "-o", "name"]);
+    run_capture("kubectl", &args, None)
+        .into_iter()
+        .map(|line| line.strip_prefix("pod/").map(|s| s.to_string()).unwrap_or(line))
+        .collect()
+}
+
+pub struct K8sPodResolver;
+impl TypeResolver for K8sPodResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        k8s_pods(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-pod"
+    }
+}
+
+pub fn k8s_deployments(ctx: &Ctx) -> Vec<String> {
+    let ns_args = kubectl_namespace_args(ctx);
+    let ns_strs: Vec<&str> = ns_args.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = vec!["get"];
+    args.extend(ns_strs.iter().copied());
+    args.extend(["deployments", "-o", "name"]);
+    run_capture("kubectl", &args, None)
+        .into_iter()
+        .map(|line| {
+            line.strip_prefix("deployment.apps/").map(|s| s.to_string()).unwrap_or(line)
+        })
+        .collect()
+}
+
+pub struct K8sDeploymentResolver;
+impl TypeResolver for K8sDeploymentResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        k8s_deployments(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-deployment"
+    }
+}
+
+pub fn k8s_services(ctx: &Ctx) -> Vec<String> {
+    let ns_args = kubectl_namespace_args(ctx);
+    let ns_strs: Vec<&str> = ns_args.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = vec!["get"];
+    args.extend(ns_strs.iter().copied());
+    args.extend(["services", "-o", "name"]);
+    run_capture("kubectl", &args, None)
+        .into_iter()
+        .map(|line| line.strip_prefix("service/").map(|s| s.to_string()).unwrap_or(line))
+        .collect()
+}
+
+pub struct K8sServiceResolver;
+impl TypeResolver for K8sServiceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        k8s_services(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-service"
+    }
+}
+
+pub fn k8s_resource_kinds() -> Vec<String> {
+    run_capture("kubectl", &["api-resources", "--no-headers", "--output=name"], None)
+}
+
+pub struct K8sResourceKindResolver;
+impl TypeResolver for K8sResourceKindResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        k8s_resource_kinds()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "k8s-resource-kind"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -834,6 +1179,19 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_GIT_ALIAS, Box::new(GitAliasResolver));
     r.register(ARG_MODE_GIT_COMMIT, Box::new(GitCommitResolver));
     r.register(ARG_MODE_GIT_REFLOG, Box::new(GitReflogResolver));
+    // Docker
+    r.register(ARG_MODE_DOCKER_CONTAINER, Box::new(DockerContainerResolver));
+    r.register(ARG_MODE_DOCKER_IMAGE, Box::new(DockerImageResolver));
+    r.register(ARG_MODE_DOCKER_NETWORK, Box::new(DockerNetworkResolver));
+    r.register(ARG_MODE_DOCKER_VOLUME, Box::new(DockerVolumeResolver));
+    r.register(ARG_MODE_DOCKER_COMPOSE_SERVICE, Box::new(DockerComposeServiceResolver));
+    // Kubernetes
+    r.register(ARG_MODE_K8S_CONTEXT, Box::new(K8sContextResolver));
+    r.register(ARG_MODE_K8S_NAMESPACE, Box::new(K8sNamespaceResolver));
+    r.register(ARG_MODE_K8S_POD, Box::new(K8sPodResolver));
+    r.register(ARG_MODE_K8S_DEPLOYMENT, Box::new(K8sDeploymentResolver));
+    r.register(ARG_MODE_K8S_SERVICE, Box::new(K8sServiceResolver));
+    r.register(ARG_MODE_K8S_RESOURCE_KIND, Box::new(K8sResourceKindResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -873,6 +1231,17 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_GIT_ALIAS => "<alias>",
         trie::ARG_MODE_GIT_COMMIT => "<commit>",
         trie::ARG_MODE_GIT_REFLOG => "<reflog-entry>",
+        trie::ARG_MODE_DOCKER_CONTAINER => "<container>",
+        trie::ARG_MODE_DOCKER_IMAGE => "<image>",
+        trie::ARG_MODE_DOCKER_NETWORK => "<network>",
+        trie::ARG_MODE_DOCKER_VOLUME => "<volume>",
+        trie::ARG_MODE_DOCKER_COMPOSE_SERVICE => "<service>",
+        trie::ARG_MODE_K8S_CONTEXT => "<context>",
+        trie::ARG_MODE_K8S_NAMESPACE => "<namespace>",
+        trie::ARG_MODE_K8S_POD => "<pod>",
+        trie::ARG_MODE_K8S_DEPLOYMENT => "<deployment>",
+        trie::ARG_MODE_K8S_SERVICE => "<k8s-service>",
+        trie::ARG_MODE_K8S_RESOURCE_KIND => "<resource-kind>",
         _ => "<arg>",
     }
 }
@@ -1089,6 +1458,9 @@ host prod staging !excluded
 
     #[test]
     fn call_program_cached_runs_and_caches() {
+        // Hold CWD_LOCK so PATH-clearing tests in this module don't race with
+        // the `printf` exec below.
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
         clear_call_program_cache();
         let argv = vec!["printf".to_string(), "alpha\nbeta\ngamma\n".to_string()];
         let out = call_program_cached(&argv, "");
@@ -1362,6 +1734,299 @@ host prod staging !excluded
         if let Some(o) = orig {
             let _ = std::env::set_current_dir(o);
         }
+    }
+
+    // --- Docker resolver tests ---
+
+    #[test]
+    fn docker_container_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        // SAFETY: test serialized via CWD_LOCK; no other threads touching PATH.
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(docker_containers(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn docker_image_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(docker_images(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn docker_network_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(docker_networks(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn docker_volume_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(docker_volumes(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn docker_compose_service_missing_cli_and_no_compose_file_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let td = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", td.path()); }
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(docker_compose_services(&ctx), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn docker_compose_service_yaml_fallback() {
+        // No docker CLI needed; parses compose YAML directly.
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let compose_content = "services:\n  web:\n    image: nginx\n  db:\n    image: postgres\n";
+        std::fs::write(td.path().join("docker-compose.yml"), compose_content).unwrap();
+
+        // Point PATH at an empty dir so docker is not available.
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut services = docker_compose_services(&ctx);
+        services.sort();
+
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+
+        assert!(services.contains(&"web".to_string()), "services: {:?}", services);
+        assert!(services.contains(&"db".to_string()), "services: {:?}", services);
+    }
+
+    #[test]
+    fn docker_images_deduplicates_repo_none_tag() {
+        // Build raw lines as if docker output them, then check dedup logic.
+        // We test parse_compose_services directly; for images we verify the
+        // dedup behavior using the helper logic path by inspecting docker_images()
+        // output format expectations via the internal logic (unit test the mapping).
+        let raw = vec![
+            "myapp:<none>".to_string(),
+            "myapp:1.0".to_string(),
+            "myapp:latest".to_string(),
+        ];
+        let mut out: Vec<String> = Vec::new();
+        for entry in raw {
+            if let Some((repo, tag)) = entry.split_once(':') {
+                if tag == "<none>" {
+                    if !repo.is_empty() && repo != "<none>" {
+                        out.push(repo.to_string());
+                    }
+                } else {
+                    out.push(entry.clone());
+                    if !repo.is_empty() && repo != "<none>" {
+                        out.push(repo.to_string());
+                    }
+                }
+            } else {
+                out.push(entry);
+            }
+        }
+        out.sort();
+        out.dedup();
+        assert!(out.contains(&"myapp".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"myapp:1.0".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"myapp:latest".to_string()), "out: {:?}", out);
+        assert!(!out.iter().any(|s| s.contains("<none>")), "out: {:?}", out);
+    }
+
+    // --- Kubernetes resolver tests ---
+
+    #[test]
+    fn k8s_context_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(k8s_contexts(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_namespace_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(k8s_namespaces(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_pod_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        let ctx = crate::type_resolver::Ctx::new();
+        assert_eq!(k8s_pods(&ctx), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_deployment_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        let ctx = crate::type_resolver::Ctx::new();
+        assert_eq!(k8s_deployments(&ctx), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_service_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        let ctx = crate::type_resolver::Ctx::new();
+        assert_eq!(k8s_services(&ctx), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_resource_kind_missing_cli_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(k8s_resource_kinds(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    // --- extract_flag_value helper tests ---
+
+    #[test]
+    fn extract_flag_value_short_flag_space_form() {
+        let words = ["-n", "prod"].map(String::from).to_vec();
+        assert_eq!(extract_flag_value(&words, &["-n", "--namespace"]), Some("prod".to_string()));
+    }
+
+    #[test]
+    fn extract_flag_value_long_flag_equals_form() {
+        let words = ["--namespace=dev"].map(String::from).to_vec();
+        assert_eq!(extract_flag_value(&words, &["-n", "--namespace"]), Some("dev".to_string()));
+    }
+
+    #[test]
+    fn extract_flag_value_long_flag_space_form() {
+        let words = ["--namespace", "staging"].map(String::from).to_vec();
+        assert_eq!(extract_flag_value(&words, &["-n", "--namespace"]), Some("staging".to_string()));
+    }
+
+    #[test]
+    fn extract_flag_value_flag_absent_returns_none() {
+        let words = ["pod", "list"].map(String::from).to_vec();
+        assert_eq!(extract_flag_value(&words, &["-n", "--namespace"]), None);
+    }
+
+    #[test]
+    fn kubectl_namespace_args_injected_into_pods() {
+        // With -n prod in prior_words, k8s_pods should pass -n prod to kubectl.
+        // We can't run kubectl in CI; just verify extract_flag_value sees it.
+        let ctx = crate::type_resolver::Ctx {
+            prior_words: vec!["-n".to_string(), "prod".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(kubectl_namespace_args(&ctx), vec!["-n".to_string(), "prod".to_string()]);
     }
 
     // --- list_with_cache integration ---

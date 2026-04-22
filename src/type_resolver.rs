@@ -134,6 +134,19 @@ mod tests {
             ARG_MODE_GIT_ALIAS,
             ARG_MODE_GIT_COMMIT,
             ARG_MODE_GIT_REFLOG,
+            // Docker
+            ARG_MODE_DOCKER_CONTAINER,
+            ARG_MODE_DOCKER_IMAGE,
+            ARG_MODE_DOCKER_NETWORK,
+            ARG_MODE_DOCKER_VOLUME,
+            ARG_MODE_DOCKER_COMPOSE_SERVICE,
+            // Kubernetes
+            ARG_MODE_K8S_CONTEXT,
+            ARG_MODE_K8S_NAMESPACE,
+            ARG_MODE_K8S_POD,
+            ARG_MODE_K8S_DEPLOYMENT,
+            ARG_MODE_K8S_SERVICE,
+            ARG_MODE_K8S_RESOURCE_KIND,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }
