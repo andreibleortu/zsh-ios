@@ -1,5 +1,8 @@
+use crate::trie::*;
+use crate::type_resolver::{Ctx, Registry, TypeResolver};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 /// Each resource initializes independently on first access — no upfront cost,
 /// no mutex contention, and no risk of poisoned-mutex panics.
@@ -386,116 +389,250 @@ fn filter_prefix(items: &[String], prefix: &str) -> Vec<String> {
 /// Resolve a prefix against the completions for a given arg type.
 /// Returns the unique match if exactly one, or None if zero or ambiguous.
 pub fn resolve_prefix(arg_type: u8, prefix: &str) -> Option<String> {
-    use crate::trie;
     // PIDs are special: list_matches returns "pid  cmd" for display,
     // but resolution should yield just the PID number.
-    if arg_type == trie::ARG_MODE_PIDS {
+    if arg_type == ARG_MODE_PIDS {
         let pids = load_pids();
         let matches: Vec<&(String, String)> = pids
             .iter()
             .filter(|(pid, cmd)| {
-                pid.starts_with(prefix) || cmd.starts_with(prefix)
+                pid.starts_with(prefix)
+                    || cmd.starts_with(prefix)
                     || cmd.to_lowercase().starts_with(&prefix.to_lowercase())
             })
             .collect();
-        return if matches.len() == 1 {
-            Some(matches[0].0.clone())
-        } else {
-            None
+        return if matches.len() == 1 { Some(matches[0].0.clone()) } else { None };
+    }
+    // Registry fast path for all other registered types.
+    if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
+        let ctx = Ctx::with_partial(prefix);
+        let items = resolver.list(&ctx);
+        let filtered = filter_prefix(&items, prefix);
+        return match filtered.len() {
+            1 => Some(filtered.into_iter().next().unwrap()),
+            _ => None,
         };
     }
     let matches = list_matches(arg_type, prefix);
-    if matches.len() == 1 {
-        Some(matches[0].clone())
-    } else {
-        None
-    }
+    if matches.len() == 1 { Some(matches[0].clone()) } else { None }
 }
 
 /// List all entries matching a prefix for a given arg type.
 pub fn list_matches(arg_type: u8, prefix: &str) -> Vec<String> {
-    use crate::trie;
     let prefix_lower = prefix.to_lowercase();
 
-    match arg_type {
-        trie::ARG_MODE_SIGNALS => {
-            // Signals: match with or without SIG prefix
-            let stripped = prefix.strip_prefix("SIG").unwrap_or(prefix);
-            SIGNALS
-                .iter()
-                .filter(|s| {
-                    s.starts_with(stripped)
-                        || s.to_lowercase().starts_with(&stripped.to_lowercase())
-                })
-                .cloned()
-                .collect()
-        }
-        trie::ARG_MODE_PORTS => PORTS
-            .keys()
-            .filter(|k| k.starts_with(prefix) || k.to_lowercase().starts_with(&prefix_lower))
-            .cloned()
-            .collect(),
-        trie::ARG_MODE_USERS => USERS
+    // Signals have custom SIG-prefix stripping logic; handle before registry.
+    if arg_type == ARG_MODE_SIGNALS {
+        let stripped = prefix.strip_prefix("SIG").unwrap_or(prefix);
+        return SIGNALS
             .iter()
-            .filter(|u| u.starts_with(prefix) || u.to_lowercase().starts_with(&prefix_lower))
+            .filter(|s| {
+                s.starts_with(stripped) || s.to_lowercase().starts_with(&stripped.to_lowercase())
+            })
             .cloned()
-            .collect(),
-        trie::ARG_MODE_GROUPS => GROUPS
-            .iter()
-            .filter(|g| g.starts_with(prefix) || g.to_lowercase().starts_with(&prefix_lower))
-            .cloned()
-            .collect(),
-        trie::ARG_MODE_USERS_GROUPS => USERS
-            .iter()
-            .chain(GROUPS.iter())
-            .filter(|s| s.starts_with(prefix) || s.to_lowercase().starts_with(&prefix_lower))
-            .cloned()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect(),
-        trie::ARG_MODE_HOSTS => HOSTS
-            .iter()
-            .filter(|h| h.starts_with(prefix) || h.to_lowercase().starts_with(&prefix_lower))
-            .cloned()
-            .collect(),
-        trie::ARG_MODE_NET_IFACES => NET_IFACES
-            .iter()
-            .filter(|i| i.starts_with(prefix))
-            .cloned()
-            .collect(),
-        trie::ARG_MODE_LOCALES => LOCALES
-            .iter()
-            .filter(|l| l.starts_with(prefix) || l.to_lowercase().starts_with(&prefix_lower))
-            .cloned()
-            .collect(),
-        trie::ARG_MODE_GIT_BRANCHES => git_branches()
-            .into_iter()
-            .filter(|b| b.starts_with(prefix) || b.to_lowercase().starts_with(&prefix_lower))
-            .collect(),
-        trie::ARG_MODE_GIT_TAGS => git_tags()
-            .into_iter()
-            .filter(|t| t.starts_with(prefix) || t.to_lowercase().starts_with(&prefix_lower))
-            .collect(),
-        trie::ARG_MODE_GIT_REMOTES => git_remotes()
-            .into_iter()
-            .filter(|r| r.starts_with(prefix) || r.to_lowercase().starts_with(&prefix_lower))
-            .collect(),
-        trie::ARG_MODE_GIT_FILES => git_tracked_files()
-            .into_iter()
-            .filter(|f| f.starts_with(prefix) || f.to_lowercase().starts_with(&prefix_lower))
-            .collect(),
-        trie::ARG_MODE_PIDS => {
-            let pids = load_pids();
-            pids.into_iter()
-                .filter(|(pid, cmd)| {
-                    pid.starts_with(prefix) || cmd.starts_with(prefix)
-                        || cmd.to_lowercase().starts_with(&prefix_lower)
-                })
-                .map(|(pid, cmd)| format!("{}  {}", pid, cmd))
-                .collect()
-        }
-        _ => Vec::new(),
+            .collect();
     }
+
+    // PIDs have a special (pid, cmd) shape; handle before registry.
+    if arg_type == ARG_MODE_PIDS {
+        let pids = load_pids();
+        return pids
+            .into_iter()
+            .filter(|(pid, cmd)| {
+                pid.starts_with(prefix)
+                    || cmd.starts_with(prefix)
+                    || cmd.to_lowercase().starts_with(&prefix_lower)
+            })
+            .map(|(pid, cmd)| format!("{}  {}", pid, cmd))
+            .collect();
+    }
+
+    // Registry fast path for all registered types.
+    if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
+        let ctx = Ctx::with_partial(prefix);
+        let items = resolver.list(&ctx);
+        return filter_prefix(&items, prefix);
+    }
+
+    // Fallback for unregistered types (URLS, PATHS/DIRS_ONLY/EXECS_ONLY handled
+    // by the filesystem layer in complete.rs, unknown future modes, etc.).
+    Vec::new()
+}
+
+// --- Built-in TypeResolver implementations ---
+
+pub struct UsersResolver;
+impl TypeResolver for UsersResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        USERS.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "users"
+    }
+}
+
+pub struct GroupsResolver;
+impl TypeResolver for GroupsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        GROUPS.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "groups"
+    }
+}
+
+pub struct HostsResolver;
+impl TypeResolver for HostsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        HOSTS.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "hosts"
+    }
+}
+
+pub struct SignalsResolver;
+impl TypeResolver for SignalsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        SIGNALS.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "signals"
+    }
+}
+
+pub struct PortsResolver;
+impl TypeResolver for PortsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        PORTS.keys().cloned().collect()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "ports"
+    }
+}
+
+pub struct NetIfacesResolver;
+impl TypeResolver for NetIfacesResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        NET_IFACES.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "net-ifaces"
+    }
+}
+
+pub struct LocalesResolver;
+impl TypeResolver for LocalesResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        LOCALES.clone()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "locales"
+    }
+}
+
+pub struct GitBranchesResolver;
+impl TypeResolver for GitBranchesResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_branches()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-branches"
+    }
+}
+
+pub struct GitTagsResolver;
+impl TypeResolver for GitTagsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_tags()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-tags"
+    }
+}
+
+pub struct GitRemotesResolver;
+impl TypeResolver for GitRemotesResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_remotes()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-remotes"
+    }
+}
+
+pub struct GitFilesResolver;
+impl TypeResolver for GitFilesResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_tracked_files()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "git-files"
+    }
+}
+
+pub struct UsersGroupsResolver;
+impl TypeResolver for UsersGroupsResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        let mut combined: Vec<String> = USERS.iter().chain(GROUPS.iter()).cloned().collect();
+        combined.sort();
+        combined.dedup();
+        combined
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "users-groups"
+    }
+}
+
+pub fn register_builtins(r: &mut Registry) {
+    r.register(ARG_MODE_USERS, Box::new(UsersResolver));
+    r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
+    r.register(ARG_MODE_HOSTS, Box::new(HostsResolver));
+    r.register(ARG_MODE_SIGNALS, Box::new(SignalsResolver));
+    r.register(ARG_MODE_PORTS, Box::new(PortsResolver));
+    r.register(ARG_MODE_NET_IFACES, Box::new(NetIfacesResolver));
+    r.register(ARG_MODE_LOCALES, Box::new(LocalesResolver));
+    r.register(ARG_MODE_GIT_BRANCHES, Box::new(GitBranchesResolver));
+    r.register(ARG_MODE_GIT_TAGS, Box::new(GitTagsResolver));
+    r.register(ARG_MODE_GIT_REMOTES, Box::new(GitRemotesResolver));
+    r.register(ARG_MODE_GIT_FILES, Box::new(GitFilesResolver));
+    r.register(ARG_MODE_USERS_GROUPS, Box::new(UsersGroupsResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test

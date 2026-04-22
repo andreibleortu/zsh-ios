@@ -18,6 +18,7 @@ pub mod resolve;
 pub mod runtime_complete;
 pub mod scanner;
 pub mod trie;
+pub mod type_resolver;
 pub mod user_config;
 
 #[cfg(test)]
