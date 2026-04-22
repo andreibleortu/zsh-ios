@@ -9,7 +9,7 @@
 use crate::path_resolve;
 use crate::pins::Pins;
 use crate::runtime_complete;
-use crate::trie::{self, ArgModeMap, ArgSpec, CommandTrie, TrieNode};
+use crate::trie::{self, ArgModeMap, ArgSpec, ArgSpecMap, CommandTrie, TrieNode};
 
 use super::escape::{escape_resolved_path, shell_escape_path};
 
@@ -400,13 +400,13 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
         }
 
         let mut result_words = expanded_prefix;
-        match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes) {
+        match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes, &trie.arg_specs) {
             Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     } else {
         let mut result_words: Vec<String> = Vec::new();
-        match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes) {
+        match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes, &trie.arg_specs) {
             Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
@@ -518,6 +518,7 @@ pub(super) fn resolve_from_node(
     start_node: &TrieNode,
     result: &mut Vec<String>,
     modes: &ArgModeMap,
+    arg_specs: &ArgSpecMap,
 ) -> Result<(), Box<AmbiguityInfo>> {
     if words.is_empty() {
         return Ok(());
@@ -572,7 +573,7 @@ pub(super) fn resolve_from_node(
         if let Some(exact_node) = start_node.get_child(word) {
             result.push(word.to_string());
             if !rest.is_empty() && !exact_node.children.is_empty() {
-                return resolve_from_node(rest, exact_node, result, modes);
+                return resolve_from_node(rest, exact_node, result, modes, arg_specs);
             }
         } else {
             result.push(word.to_string());
@@ -598,7 +599,7 @@ pub(super) fn resolve_from_node(
     if let Some(exact_node) = start_node.get_child(word) {
         result.push(word.to_string());
         if !rest.is_empty() && !exact_node.children.is_empty() {
-            return resolve_from_node(rest, exact_node, result, modes);
+            return resolve_from_node(rest, exact_node, result, modes, arg_specs);
         }
         for w in rest {
             result.push(w.to_string());
@@ -640,7 +641,7 @@ pub(super) fn resolve_from_node(
             result.push(full_name.to_string());
 
             if !rest.is_empty() && !child_node.children.is_empty() {
-                resolve_from_node(rest, child_node, result, modes)
+                resolve_from_node(rest, child_node, result, modes, arg_specs)
             } else {
                 for w in rest {
                     result.push(w.to_string());
@@ -651,7 +652,21 @@ pub(super) fn resolve_from_node(
         _ => {
             // Ambiguous -- but try deep disambiguation first
             if !rest.is_empty() && !rest[0].starts_with('-') {
-                let deep = deep_disambiguate(&matches, rest);
+                let deep_raw = deep_disambiguate(&matches, rest);
+
+                // Arg-type narrowing applies when subcommand-prefix lookahead
+                // was indecisive (multiple survivors) OR produced no survivors
+                // (the next word isn't a subcommand — it's likely a typed arg).
+                // In the zero-survivor case we narrow on the full original matches.
+                let deep = if deep_raw.len() > 1 {
+                    let narrowed = narrow_by_arg_type(&deep_raw, result, rest, arg_specs);
+                    if narrowed.len() < deep_raw.len() { narrowed } else { deep_raw }
+                } else if deep_raw.is_empty() {
+                    let narrowed = narrow_by_arg_type(&matches, result, rest, arg_specs);
+                    if narrowed.len() < matches.len() { narrowed } else { deep_raw }
+                } else {
+                    deep_raw
+                };
 
                 if deep.len() == 1 {
                     // Deep disambiguation resolved it
@@ -659,7 +674,7 @@ pub(super) fn resolve_from_node(
                     result.push(full_name.to_string());
 
                     if !child_node.children.is_empty() {
-                        return resolve_from_node(rest, child_node, result, modes);
+                        return resolve_from_node(rest, child_node, result, modes, arg_specs);
                     } else {
                         for w in rest {
                             result.push(w.to_string());
@@ -792,6 +807,93 @@ pub(super) fn deep_disambiguate<'a>(
     }
 
     deeper
+}
+
+/// When subcommand-prefix lookahead still leaves ambiguity, try arg-type
+/// evidence: for each candidate, look up its full command path's ArgSpec and
+/// check whether the first non-flag word in `rest` matches the expected
+/// positional type.
+///
+/// Returns a narrowed list. Guarantees:
+/// - Never returns empty (falls back to the original `candidates` list).
+/// - Only narrows when there is a discriminating split: ≥1 candidate has
+///   matching evidence AND ≥1 lacks it; unanimous evidence is not a signal.
+pub(super) fn narrow_by_arg_type<'a>(
+    candidates: &[(&'a str, &'a TrieNode)],
+    prefix_chain: &[String],
+    rest: &[&str],
+    arg_specs: &ArgSpecMap,
+) -> Vec<(&'a str, &'a TrieNode)> {
+    let probe = rest.iter().find(|w| !w.starts_with('-')).copied();
+    let Some(probe) = probe else { return candidates.to_vec(); };
+
+    let mut with_evidence: Vec<(&'a str, &'a TrieNode)> = Vec::new();
+    let mut without_evidence: Vec<(&'a str, &'a TrieNode)> = Vec::new();
+
+    for &(name, node) in candidates {
+        let mut full: Vec<&str> = prefix_chain.iter().map(String::as_str).collect();
+        full.push(name);
+        let key = full.join(" ");
+        let Some(spec) = arg_specs.get(&key) else {
+            without_evidence.push((name, node));
+            continue;
+        };
+        let Some(expected) = spec.type_at(1) else {
+            without_evidence.push((name, node));
+            continue;
+        };
+        if word_matches_type(probe, expected) {
+            with_evidence.push((name, node));
+        } else {
+            without_evidence.push((name, node));
+        }
+    }
+
+    if !with_evidence.is_empty() && !without_evidence.is_empty() {
+        with_evidence
+    } else {
+        candidates.to_vec()
+    }
+}
+
+/// Is `word` a plausible value of the given argument type?
+/// Filesystem types check the filesystem. Other typed values go through
+/// `type_resolver::REGISTRY`. Types without a cheap membership test return
+/// `false` (treated as "no evidence" — not a narrowing signal).
+fn word_matches_type(word: &str, arg_type: u8) -> bool {
+    use crate::trie::*;
+    use std::path::Path;
+    match arg_type {
+        ARG_MODE_PATHS => Path::new(word).exists(),
+        ARG_MODE_DIRS_ONLY => Path::new(word).is_dir(),
+        ARG_MODE_EXECS_ONLY => {
+            let p = Path::new(word);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = p.metadata()
+                    && md.is_file()
+                    && md.permissions().mode() & 0o111 != 0
+                {
+                    return true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = p;
+            }
+            false
+        }
+        _ => {
+            if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
+                let ctx = crate::type_resolver::Ctx::with_partial(word);
+                let items = resolver.list(&ctx);
+                items.iter().any(|it| it == word)
+            } else {
+                false
+            }
+        }
+    }
 }
 
 pub(super) enum PathsResult {
@@ -1392,11 +1494,73 @@ pub(super) fn explain_segment(
                     depth + 1,
                     format!("→ winner: {}", survivors[0].0),
                 ),
-                n => push(
-                    out,
-                    depth + 1,
-                    format!("→ {} candidates survive — still ambiguous", n),
-                ),
+                n => {
+                    push(
+                        out,
+                        depth + 1,
+                        format!("→ {} candidates survive — still ambiguous", n),
+                    );
+                    // Try arg-type narrowing narration when there are still multiple survivors.
+                    if word_refs.len() > 2 {
+                        let probe_word = word_refs[2];
+                        push(
+                            out,
+                            depth + 1,
+                            format!("arg-type narrowing: probe {:?}", probe_word),
+                        );
+                        let survivor_nodes: Vec<(&str, &TrieNode)> = survivors
+                            .iter()
+                            .filter_map(|(name, _)| {
+                                first_matches.iter().find(|(n, _)| n == name).copied()
+                            })
+                            .collect();
+                        let mut any_match = false;
+                        let mut any_no_match = false;
+                        for (name, _node) in &survivor_nodes {
+                            let key = format!("{} {}", name, next);
+                            let type_label = if let Some(spec) = trie.arg_specs.get(&key) {
+                                if let Some(expected) = spec.type_at(1) {
+                                    let hint = trie::arg_mode_name(expected);
+                                    if word_matches_type(probe_word, expected) {
+                                        any_match = true;
+                                        format!("expects {} at pos 1 → MATCH", hint)
+                                    } else {
+                                        any_no_match = true;
+                                        format!("expects {} at pos 1 → no match", hint)
+                                    }
+                                } else {
+                                    "no positional[1] in arg spec".to_string()
+                                }
+                            } else {
+                                "no arg spec".to_string()
+                            };
+                            push(
+                                out,
+                                depth + 2,
+                                format!("{} {}  {}", name, next, type_label),
+                            );
+                        }
+                        if any_match && any_no_match {
+                            let narrowed = narrow_by_arg_type(
+                                &survivor_nodes,
+                                &[word_refs[0].to_string()],
+                                &[*next, probe_word],
+                                &trie.arg_specs,
+                            );
+                            push(
+                                out,
+                                depth + 1,
+                                format!("→ narrowed to: {}", narrowed.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")),
+                            );
+                        } else {
+                            push(
+                                out,
+                                depth + 1,
+                                "→ no discriminating arg-type evidence".into(),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -3010,5 +3174,206 @@ mod tests {
         // Short list: no ellipsis
         let s = summarize_names(&refs[..3], 5);
         assert!(!s.contains("more"));
+    }
+
+    // --- narrow_by_arg_type tests ---
+
+    fn trie_with_git_subcommands_and_argspecs() -> CommandTrie {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "checkout"]);
+        t.insert(&["git", "check-ignore"]);
+        t.insert(&["git", "cherry"]);
+        t.insert(&["git", "cherry-pick"]);
+        t.arg_specs.insert(
+            "git checkout".into(),
+            ArgSpec {
+                positional: [(1u32, trie::ARG_MODE_GIT_BRANCHES)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        t.arg_specs.insert(
+            "git cherry".into(),
+            ArgSpec {
+                positional: [(1u32, trie::ARG_MODE_GIT_BRANCHES)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        t.arg_specs.insert(
+            "git check-ignore".into(),
+            ArgSpec {
+                positional: [(1u32, trie::ARG_MODE_PATHS)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        t.arg_specs.insert(
+            "git cherry-pick".into(),
+            ArgSpec {
+                positional: [(1u32, trie::ARG_MODE_GIT_COMMIT)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        t
+    }
+
+    #[test]
+    fn narrow_by_arg_type_prefers_branch_match() {
+        // Use filesystem types so we don't need a real git repo.
+        // check-ignore expects PATHS; cherry-pick expects GIT_COMMIT.
+        // Create a tempfile named "target_file" and verify check-ignore wins.
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        std::fs::write("target_file", b"").unwrap();
+
+        let trie = trie_with_git_subcommands_and_argspecs();
+        let prefix = vec!["git".to_string()];
+        let check_ignore_node = trie.root.get_child("git").unwrap().get_child("check-ignore").unwrap();
+        let cherry_pick_node = trie.root.get_child("git").unwrap().get_child("cherry-pick").unwrap();
+        let candidates = vec![
+            ("check-ignore", check_ignore_node),
+            ("cherry-pick", cherry_pick_node),
+        ];
+        let narrowed = narrow_by_arg_type(&candidates, &prefix, &["target_file"], &trie.arg_specs);
+        assert_eq!(narrowed.len(), 1, "expected narrowing to 1, got {:?}", narrowed.iter().map(|(n,_)| n).collect::<Vec<_>>());
+        assert_eq!(narrowed[0].0, "check-ignore");
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn narrow_by_arg_type_returns_unchanged_when_unanimous() {
+        // Both candidates have PATHS — all get evidence, no split → unchanged.
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        std::fs::write("myfile", b"").unwrap();
+
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "add"]);
+        t.insert(&["git", "apply"]);
+        t.arg_specs.insert(
+            "git add".into(),
+            ArgSpec { positional: [(1u32, trie::ARG_MODE_PATHS)].into_iter().collect(), ..Default::default() },
+        );
+        t.arg_specs.insert(
+            "git apply".into(),
+            ArgSpec { positional: [(1u32, trie::ARG_MODE_PATHS)].into_iter().collect(), ..Default::default() },
+        );
+        let git_node = t.root.get_child("git").unwrap();
+        let add_node = git_node.get_child("add").unwrap();
+        let apply_node = git_node.get_child("apply").unwrap();
+        let candidates = vec![("add", add_node), ("apply", apply_node)];
+        let prefix = vec!["git".to_string()];
+        let narrowed = narrow_by_arg_type(&candidates, &prefix, &["myfile"], &t.arg_specs);
+        // Unanimous evidence: all match, no split, returned unchanged.
+        assert_eq!(narrowed.len(), 2);
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn narrow_by_arg_type_with_no_arg_specs() {
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "log"]);
+        t.insert(&["git", "ls-files"]);
+        let git_node = t.root.get_child("git").unwrap();
+        let log_node = git_node.get_child("log").unwrap();
+        let ls_node = git_node.get_child("ls-files").unwrap();
+        let candidates = vec![("log", log_node), ("ls-files", ls_node)];
+        let prefix = vec!["git".to_string()];
+        // No arg_specs at all — both go to without_evidence; no split → unchanged.
+        let narrowed = narrow_by_arg_type(&candidates, &prefix, &["anything"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 2);
+    }
+
+    #[test]
+    fn resolve_gi_che_file_resolves_to_check_ignore() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        std::fs::write("target_file", b"").unwrap();
+
+        let mut trie = trie_with_git_subcommands_and_argspecs();
+        // Also add git itself so prefix-search on "gi" finds it.
+        trie.insert_command("git");
+        // "gi" should uniquely resolve to git (no other "gi*" commands).
+        // "che" matches checkout, check-ignore — but only check-ignore expects PATHS.
+        // "target_file" exists on disk → PATHS evidence → narrows to check-ignore.
+        let pins = Pins::default();
+        match resolve_line("gi che target_file", &trie, &pins) {
+            ResolveResult::Resolved(s) => assert_eq!(s, "git check-ignore target_file"),
+            ResolveResult::Ambiguous(info) => panic!("still ambiguous: {:?}", info.candidates),
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn resolve_gi_che_unknown_remains_ambiguous() {
+        let mut trie = trie_with_git_subcommands_and_argspecs();
+        trie.insert_command("git");
+        let pins = Pins::default();
+        // "totally_not_anything" is not a file, not a branch, not a commit →
+        // no arg-type evidence on either side → narrow_by_arg_type returns unchanged.
+        match resolve_line("gi che totally_not_anything", &trie, &pins) {
+            ResolveResult::Ambiguous(info) => {
+                // checkout, check-ignore, cherry, cherry-pick all match "che"
+                assert!(info.candidates.len() >= 2, "expected ≥2 candidates, got {:?}", info.candidates);
+            }
+            ResolveResult::Resolved(s) => panic!("should not have resolved to {:?}", s),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn deep_disambiguate_behavior_unchanged_for_existing_cases() {
+        // Verify the four pre-existing deep-disambig tests still pass after
+        // the narrow_by_arg_type wiring. We call them here explicitly so a
+        // regression is caught in this context too.
+        {
+            // test_deep_disambig_resolves_g_push
+            let trie = build_test_trie();
+            let pins = Pins::default();
+            match resolve("g push", &trie, &pins) {
+                ResolveResult::Resolved(s) => assert_eq!(s, "git push"),
+                other => panic!("g push: expected Resolved, got {:?}", other),
+            }
+        }
+        {
+            // test_deep_disambiguation
+            let trie = build_test_trie();
+            let pins = Pins::default();
+            match resolve("g ch main", &trie, &pins) {
+                ResolveResult::Resolved(s) => assert_eq!(s, "git checkout main"),
+                other => panic!("g ch main: expected Resolved, got {:?}", other),
+            }
+        }
+        {
+            // test_deep_disambig_multi_level
+            let mut trie = CommandTrie::new();
+            trie.insert(&["git", "commit", "-m"]);
+            trie.insert(&["git", "checkout", "main"]);
+            trie.insert(&["grep", "-r", "pattern"]);
+            trie.insert(&["go", "build"]);
+            let pins = Pins::default();
+            match resolve("g ch main", &trie, &pins) {
+                ResolveResult::Resolved(s) => assert_eq!(s, "git checkout main"),
+                other => panic!("multi-level: expected Resolved, got {:?}", other),
+            }
+        }
+        {
+            // test_deep_disambig_flag_skipped
+            let mut trie = CommandTrie::new();
+            trie.insert(&["git", "commit", "-m"]);
+            trie.insert(&["go", "build", "-o"]);
+            let matches = trie.root.prefix_search("g");
+            let result = deep_disambiguate(&matches, &["co", "-m"]);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].0, "git");
+        }
     }
 }
