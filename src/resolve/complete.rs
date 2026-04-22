@@ -719,3 +719,78 @@ pub(super) fn complete_filesystem(word: &str, dirs_only: bool) -> String {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trie::CommandTrie;
+
+    fn build_test_trie() -> CommandTrie {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout", "main"]);
+        trie.insert(&["git", "checkout", "develop"]);
+        trie.insert(&["git", "commit", "-m"]);
+        trie.insert(&["git", "push"]);
+        trie.insert(&["grep", "-r", "pattern"]);
+        trie.insert(&["go", "build"]);
+        trie.insert(&["terraform", "apply"]);
+        trie.insert(&["terraform", "destroy"]);
+        trie.insert(&["terraform", "init"]);
+        trie.insert(&["terraform", "plan"]);
+        trie.insert_command("gzip");
+        trie
+    }
+
+    #[test]
+    fn test_format_columns_empty() {
+        assert_eq!(format_columns(&[], 100), "");
+    }
+    #[test]
+    fn test_format_columns_single_column() {
+        let names = vec!["add", "commit", "push"];
+        let result = format_columns(&names, 100);
+        assert!(result.contains("  add\n"));
+        assert!(result.contains("  commit\n"));
+        assert!(result.contains("  push\n"));
+    }
+    #[test]
+    fn test_format_columns_overflow_message() {
+        let names: Vec<&str> = (0..5).map(|i| match i {
+            0 => "a", 1 => "b", 2 => "c", 3 => "d", _ => "e",
+        }).collect();
+        let result = format_columns(&names, 3);
+        assert!(result.contains("... and 2 more"));
+    }
+    #[test]
+    fn test_format_columns_multi_column() {
+        // >12 items should use multi-column layout
+        let names: Vec<&str> = vec![
+            "aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii", "jj", "kk", "ll", "mm",
+        ];
+        let result = format_columns(&names, 100);
+        // Should have fewer lines than items (multi-column)
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(lines.len() < names.len());
+    }
+    #[test]
+    fn test_resolve_first_word_exact() {
+        let trie = build_test_trie();
+        assert_eq!(resolve_first_word("git", &trie), "git");
+    }
+    #[test]
+    fn test_resolve_first_word_prefix() {
+        let trie = build_test_trie();
+        assert_eq!(resolve_first_word("ter", &trie), "terraform");
+    }
+    #[test]
+    fn test_resolve_first_word_ambiguous() {
+        let trie = build_test_trie();
+        // "g" matches git, grep, go, gzip — returns unchanged
+        assert_eq!(resolve_first_word("g", &trie), "g");
+    }
+    #[test]
+    fn test_resolve_first_word_no_match() {
+        let trie = build_test_trie();
+        assert_eq!(resolve_first_word("zzz", &trie), "zzz");
+    }
+}

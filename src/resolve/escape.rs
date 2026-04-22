@@ -57,3 +57,51 @@ pub(super) fn escape_resolved_path(original_word: &str, resolved: &str) -> Strin
         shell_escape_path(resolved)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_escape_plain_path() {
+        assert_eq!(shell_escape_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(shell_escape_path("file.txt"), "file.txt");
+    }
+    #[test]
+    fn test_shell_escape_special_chars() {
+        assert_eq!(shell_escape_path("my file.txt"), "my\\ file.txt");
+        assert_eq!(shell_escape_path("dir (1)"), "dir\\ \\(1\\)");
+        assert_eq!(shell_escape_path("$HOME/file"), "\\$HOME/file");
+        assert_eq!(shell_escape_path("file;rm -rf"), "file\\;rm\\ -rf");
+        assert_eq!(shell_escape_path("a&b"), "a\\&b");
+        assert_eq!(shell_escape_path("test'quote"), "test\\'quote");
+    }
+    #[test]
+    fn test_shell_escape_all_metacharacters() {
+        assert_eq!(shell_escape_path("a[b]"), "a\\[b\\]");
+        assert_eq!(shell_escape_path("a{b}"), "a\\{b\\}");
+        assert_eq!(shell_escape_path("a#b"), "a\\#b");
+        assert_eq!(shell_escape_path("a?b"), "a\\?b");
+        assert_eq!(shell_escape_path("a<b>"), "a\\<b\\>");
+        assert_eq!(shell_escape_path("a=b"), "a\\=b");
+        assert_eq!(shell_escape_path("a^b"), "a\\^b");
+        assert_eq!(shell_escape_path("a\\b"), "a\\\\b");
+        assert_eq!(shell_escape_path("a`b`"), "a\\`b\\`");
+    }
+    #[test]
+    fn test_escape_resolved_path_glob_passthrough() {
+        // ** passthrough: * in the resolved path should NOT be escaped
+        assert_eq!(escape_resolved_path("./**.py", "./*.py"), "./*.py");
+        assert_eq!(escape_resolved_path("**.py", "*.py"), "*.py");
+        assert_eq!(escape_resolved_path("./**", "./*"), "./*");
+        // Other metacharacters still escaped even in glob paths
+        assert_eq!(escape_resolved_path("**.py", "my dir/*.py"), "my\\ dir/*.py");
+    }
+    #[test]
+    fn test_escape_resolved_path_literal_star_file() {
+        // \* escape (literal * filename): * in the resolved path SHOULD be escaped
+        assert_eq!(escape_resolved_path("\\*star", "*starred"), "\\*starred");
+        // No ** in original → normal escaping applies
+        assert_eq!(escape_resolved_path("./foo", "file*.txt"), "file\\*.txt");
+    }
+}

@@ -1482,7 +1482,7 @@ mod tests {
     // Reach across to sibling submodules for items only the test suite touches.
     // Kept local to the test module so the main engine code doesn't carry
     // imports it doesn't use.
-    use super::super::complete::{complete, format_columns, resolve_first_word};
+    use super::super::complete::{complete, format_columns};
     use super::super::escape::shell_escape_path_glob;
     use crate::pins::Pin;
     use crate::test_util::CWD_LOCK;
@@ -1847,21 +1847,7 @@ mod tests {
 
     // --- Tests for shell_escape_path ---
 
-    #[test]
-    fn test_shell_escape_plain_path() {
-        assert_eq!(shell_escape_path("/usr/local/bin"), "/usr/local/bin");
-        assert_eq!(shell_escape_path("file.txt"), "file.txt");
-    }
 
-    #[test]
-    fn test_shell_escape_special_chars() {
-        assert_eq!(shell_escape_path("my file.txt"), "my\\ file.txt");
-        assert_eq!(shell_escape_path("dir (1)"), "dir\\ \\(1\\)");
-        assert_eq!(shell_escape_path("$HOME/file"), "\\$HOME/file");
-        assert_eq!(shell_escape_path("file;rm -rf"), "file\\;rm\\ -rf");
-        assert_eq!(shell_escape_path("a&b"), "a\\&b");
-        assert_eq!(shell_escape_path("test'quote"), "test\\'quote");
-    }
 
     // --- Tests for descriptions (loaded from YAML) ---
 
@@ -2376,67 +2362,15 @@ mod tests {
 
     // --- Tests for format_columns ---
 
-    #[test]
-    fn test_format_columns_empty() {
-        assert_eq!(format_columns(&[], 100), "");
-    }
 
-    #[test]
-    fn test_format_columns_single_column() {
-        let names = vec!["add", "commit", "push"];
-        let result = format_columns(&names, 100);
-        assert!(result.contains("  add\n"));
-        assert!(result.contains("  commit\n"));
-        assert!(result.contains("  push\n"));
-    }
 
-    #[test]
-    fn test_format_columns_overflow_message() {
-        let names: Vec<&str> = (0..5).map(|i| match i {
-            0 => "a", 1 => "b", 2 => "c", 3 => "d", _ => "e",
-        }).collect();
-        let result = format_columns(&names, 3);
-        assert!(result.contains("... and 2 more"));
-    }
 
-    #[test]
-    fn test_format_columns_multi_column() {
-        // >12 items should use multi-column layout
-        let names: Vec<&str> = vec![
-            "aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii", "jj", "kk", "ll", "mm",
-        ];
-        let result = format_columns(&names, 100);
-        // Should have fewer lines than items (multi-column)
-        let lines: Vec<&str> = result.lines().collect();
-        assert!(lines.len() < names.len());
-    }
 
     // --- Tests for resolve_first_word ---
 
-    #[test]
-    fn test_resolve_first_word_exact() {
-        let trie = build_test_trie();
-        assert_eq!(resolve_first_word("git", &trie), "git");
-    }
 
-    #[test]
-    fn test_resolve_first_word_prefix() {
-        let trie = build_test_trie();
-        assert_eq!(resolve_first_word("ter", &trie), "terraform");
-    }
 
-    #[test]
-    fn test_resolve_first_word_ambiguous() {
-        let trie = build_test_trie();
-        // "g" matches git, grep, go, gzip — returns unchanged
-        assert_eq!(resolve_first_word("g", &trie), "g");
-    }
 
-    #[test]
-    fn test_resolve_first_word_no_match() {
-        let trie = build_test_trie();
-        assert_eq!(resolve_first_word("zzz", &trie), "zzz");
-    }
 
     // --- Tests for split_on_operators ---
 
@@ -2511,36 +2445,8 @@ mod tests {
 
     // --- Tests for shell_escape_path edge cases ---
 
-    #[test]
-    fn test_shell_escape_all_metacharacters() {
-        assert_eq!(shell_escape_path("a[b]"), "a\\[b\\]");
-        assert_eq!(shell_escape_path("a{b}"), "a\\{b\\}");
-        assert_eq!(shell_escape_path("a#b"), "a\\#b");
-        assert_eq!(shell_escape_path("a?b"), "a\\?b");
-        assert_eq!(shell_escape_path("a<b>"), "a\\<b\\>");
-        assert_eq!(shell_escape_path("a=b"), "a\\=b");
-        assert_eq!(shell_escape_path("a^b"), "a\\^b");
-        assert_eq!(shell_escape_path("a\\b"), "a\\\\b");
-        assert_eq!(shell_escape_path("a`b`"), "a\\`b\\`");
-    }
 
-    #[test]
-    fn test_escape_resolved_path_glob_passthrough() {
-        // ** passthrough: * in the resolved path should NOT be escaped
-        assert_eq!(escape_resolved_path("./**.py", "./*.py"), "./*.py");
-        assert_eq!(escape_resolved_path("**.py", "*.py"), "*.py");
-        assert_eq!(escape_resolved_path("./**", "./*"), "./*");
-        // Other metacharacters still escaped even in glob paths
-        assert_eq!(escape_resolved_path("**.py", "my dir/*.py"), "my\\ dir/*.py");
-    }
 
-    #[test]
-    fn test_escape_resolved_path_literal_star_file() {
-        // \* escape (literal * filename): * in the resolved path SHOULD be escaped
-        assert_eq!(escape_resolved_path("\\*star", "*starred"), "\\*starred");
-        // No ** in original → normal escaping applies
-        assert_eq!(escape_resolved_path("./foo", "file*.txt"), "file\\*.txt");
-    }
 
     // --- Tests for resolve_line with empty segments ---
 
