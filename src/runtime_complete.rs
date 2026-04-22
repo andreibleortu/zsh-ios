@@ -1673,6 +1673,171 @@ impl TypeResolver for CargoCrateResolver {
     }
 }
 
+// --- Shell introspection resolvers ---
+
+/// Run `zsh -c 'print -l ${(k)functions}'` and return the function names.
+/// No `-i` flag — keeps it fast; still captures anything compinit exposed.
+fn shell_functions() -> Vec<String> {
+    run_capture("zsh", &["-c", "print -l ${(k)functions}"], None)
+}
+
+pub struct ShellFunctionResolver;
+impl TypeResolver for ShellFunctionResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        shell_functions()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "shell-function"
+    }
+}
+
+/// Parse the output of `alias` (format: `name='value'`) and return just the names.
+fn parse_alias_output(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Split on first `=` and take the name.
+            trimmed.split_once('=').map(|(name, _)| name.to_string())
+        })
+        .collect()
+}
+
+pub struct ShellAliasResolver;
+impl TypeResolver for ShellAliasResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        // run_capture returns lines, but alias output can span many lines —
+        // re-invoke directly to get the full output in one shot.
+        let output = std::process::Command::new("zsh")
+            .args(["-ic", "alias"])
+            .stderr(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+                parse_alias_output(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => Vec::new(),
+        }
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "shell-alias"
+    }
+}
+
+/// Return the current process environment variable names.
+/// Fast — no subprocess. Captures the parent shell's env as seen by zsh-ios.
+pub struct ShellVarResolver;
+impl TypeResolver for ShellVarResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        std::env::vars().map(|(k, _)| k).collect()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "shell-var"
+    }
+}
+
+/// Parse the output of `hash -d` (format: `name=/path`) and return just the names.
+fn parse_hash_d_output(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.split_once('=').map(|(name, _)| name.to_string())
+        })
+        .collect()
+}
+
+/// Run `zsh -ic 'hash -d'` and return named directory names.
+fn named_dirs() -> Vec<String> {
+    let output = std::process::Command::new("zsh")
+        .args(["-ic", "hash -d"])
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            parse_hash_d_output(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub struct NamedDirResolver;
+impl TypeResolver for NamedDirResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        named_dirs()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "named-dir"
+    }
+}
+
+/// Strip the Zsh extended history prefix (`: ts:dur;cmd`) and return the command.
+/// For plain lines, returns the trimmed line itself.
+fn strip_history_prefix(line: &str) -> &str {
+    if line.starts_with(": ")
+        && let Some(semi) = line.find(';')
+    {
+        line[semi + 1..].trim()
+    } else {
+        line.trim()
+    }
+}
+
+/// Read up to the last `n` commands from a history file path.
+fn read_recent_history_entries(path: &std::path::Path, n: usize) -> Vec<String> {
+    let Ok(content) = std::fs::read(path) else { return Vec::new() };
+    let text = String::from_utf8_lossy(&content);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Take last n lines.
+    if lines.len() > n {
+        lines = lines[lines.len() - n..].to_vec();
+    }
+    lines
+        .into_iter()
+        .map(strip_history_prefix)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub struct HistoryEntryResolver;
+impl TypeResolver for HistoryEntryResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        let path = std::env::var("HISTFILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .map(|h| h.join(".zsh_history"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".zsh_history"))
+            });
+        read_recent_history_entries(&path, 200)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "history-entry"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -1726,6 +1891,12 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_NPM_PACKAGE, Box::new(NpmPackageResolver));
     r.register(ARG_MODE_PIP_PACKAGE, Box::new(PipPackageResolver));
     r.register(ARG_MODE_CARGO_CRATE, Box::new(CargoCrateResolver));
+    // Shell introspection
+    r.register(ARG_MODE_SHELL_FUNCTION, Box::new(ShellFunctionResolver));
+    r.register(ARG_MODE_SHELL_ALIAS, Box::new(ShellAliasResolver));
+    r.register(ARG_MODE_SHELL_VAR, Box::new(ShellVarResolver));
+    r.register(ARG_MODE_NAMED_DIR, Box::new(NamedDirResolver));
+    r.register(ARG_MODE_HISTORY_ENTRY, Box::new(HistoryEntryResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -2971,5 +3142,127 @@ pretty_assertions = \"1\"\n\
             ..Default::default()
         };
         assert_eq!(cargo_crates(&ctx), Vec::<String>::new());
+    }
+
+    // --- Shell introspection resolver tests ---
+
+    #[test]
+    fn parse_alias_output_extracts_names() {
+        let input = "ll='ls -la'\ngs='git status'\n";
+        let names = parse_alias_output(input);
+        assert!(names.contains(&"ll".to_string()), "names: {:?}", names);
+        assert!(names.contains(&"gs".to_string()), "names: {:?}", names);
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn parse_alias_output_skips_blank_lines() {
+        let input = "ll='ls -la'\n\ngs='git status'\n";
+        let names = parse_alias_output(input);
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn parse_alias_output_handles_value_with_equals() {
+        // Values can themselves contain `=`; only split on first one.
+        let input = "FOO='a=b=c'\n";
+        let names = parse_alias_output(input);
+        assert_eq!(names, vec!["FOO".to_string()]);
+    }
+
+    #[test]
+    fn parse_hash_d_output_extracts_names() {
+        let input = "proj=/home/me/src\npkgs=/usr/local\n";
+        let names = parse_hash_d_output(input);
+        assert!(names.contains(&"proj".to_string()), "names: {:?}", names);
+        assert!(names.contains(&"pkgs".to_string()), "names: {:?}", names);
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn parse_hash_d_output_skips_blank_lines() {
+        let input = "proj=/home/me/src\n\n";
+        let names = parse_hash_d_output(input);
+        assert_eq!(names, vec!["proj".to_string()]);
+    }
+
+    #[test]
+    fn history_entry_reads_recent() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let hist_path = td.path().join("test_history");
+        std::fs::write(
+            &hist_path,
+            "git status\ngit log\ncargo test\ndocker ps\nls -la\n",
+        )
+        .unwrap();
+        let orig = std::env::var_os("HISTFILE");
+        unsafe { std::env::set_var("HISTFILE", hist_path.as_os_str()); }
+        let resolver = HistoryEntryResolver;
+        let entries = resolver.list(&crate::type_resolver::Ctx::new());
+        assert!(!entries.is_empty(), "expected history entries");
+        assert!(entries.contains(&"git status".to_string()), "entries: {:?}", entries);
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("HISTFILE", p);
+            } else {
+                std::env::remove_var("HISTFILE");
+            }
+        }
+    }
+
+    #[test]
+    fn history_entry_strips_extended_format() {
+        let td = tempfile::tempdir().unwrap();
+        let hist_path = td.path().join("ext_history");
+        // Zsh extended history format
+        std::fs::write(
+            &hist_path,
+            ": 1700000000:0;git status\n: 1700000001:0;cargo build\nplain line\n",
+        )
+        .unwrap();
+        let entries = read_recent_history_entries(&hist_path, 200);
+        assert!(entries.contains(&"git status".to_string()), "entries: {:?}", entries);
+        assert!(entries.contains(&"cargo build".to_string()), "entries: {:?}", entries);
+        assert!(entries.contains(&"plain line".to_string()), "entries: {:?}", entries);
+    }
+
+    #[test]
+    fn history_entry_missing_file_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let missing = td.path().join("no_such_file");
+        assert!(read_recent_history_entries(&missing, 200).is_empty());
+    }
+
+    #[test]
+    fn shell_function_missing_zsh_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let (_td, orig) = empty_path_dir();
+        assert_eq!(shell_functions(), Vec::<String>::new());
+        restore_path(orig);
+    }
+
+    #[test]
+    fn shell_var_resolver_returns_env_keys() {
+        let resolver = ShellVarResolver;
+        let keys = resolver.list(&crate::type_resolver::Ctx::new());
+        // At minimum PATH and HOME should be in the environment.
+        assert!(keys.contains(&"PATH".to_string()), "PATH missing from env keys: {:?}", &keys[..10.min(keys.len())]);
+    }
+
+    #[test]
+    fn shell_introspection_modes_in_registry() {
+        use crate::trie::*;
+        let mut r = crate::type_resolver::Registry::new();
+        register_builtins(&mut r);
+        for mode in [
+            ARG_MODE_SHELL_FUNCTION,
+            ARG_MODE_SHELL_ALIAS,
+            ARG_MODE_SHELL_VAR,
+            ARG_MODE_NAMED_DIR,
+            ARG_MODE_HISTORY_ENTRY,
+        ] {
+            assert!(r.contains(mode), "mode {} missing from registry", mode);
+        }
     }
 }

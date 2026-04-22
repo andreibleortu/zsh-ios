@@ -167,6 +167,12 @@ mod tests {
             ARG_MODE_NPM_PACKAGE,
             ARG_MODE_PIP_PACKAGE,
             ARG_MODE_CARGO_CRATE,
+            // Shell introspection
+            ARG_MODE_SHELL_FUNCTION,
+            ARG_MODE_SHELL_ALIAS,
+            ARG_MODE_SHELL_VAR,
+            ARG_MODE_NAMED_DIR,
+            ARG_MODE_HISTORY_ENTRY,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }

@@ -950,10 +950,41 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+// --- Text/net format validators (private helpers for word_matches_type) ---
+
+fn is_plausible_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else { return false; };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !s.chars().any(char::is_whitespace)
+}
+
+fn is_plausible_url(s: &str) -> bool {
+    if let Some(idx) = s.find("://") {
+        let scheme = &s[..idx];
+        !scheme.is_empty()
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+    } else {
+        false
+    }
+}
+
+fn is_plausible_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split([':', '-']).collect();
+    parts.len() == 6
+        && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn is_valid_timezone(s: &str) -> bool {
+    std::path::Path::new("/usr/share/zoneinfo").join(s).is_file()
+}
+
 /// Is `word` a plausible value of the given argument type?
-/// Filesystem types check the filesystem. Other typed values go through
-/// `type_resolver::REGISTRY`. Types without a cheap membership test return
-/// `false` (treated as "no evidence" — not a narrowing signal).
+/// Filesystem types check the filesystem. Text/net types use format validators.
+/// Other typed values go through `type_resolver::REGISTRY`. Types without a
+/// cheap membership test return `false` (treated as "no evidence" — not a
+/// narrowing signal).
 fn word_matches_type(word: &str, arg_type: u8) -> bool {
     use crate::trie::*;
     use std::path::Path;
@@ -978,6 +1009,12 @@ fn word_matches_type(word: &str, arg_type: u8) -> bool {
             }
             false
         }
+        ARG_MODE_IPV4 => word.parse::<std::net::Ipv4Addr>().is_ok(),
+        ARG_MODE_IPV6 => word.parse::<std::net::Ipv6Addr>().is_ok(),
+        ARG_MODE_EMAIL => is_plausible_email(word),
+        ARG_MODE_URL_SCHEME => is_plausible_url(word),
+        ARG_MODE_MAC_ADDR => is_plausible_mac(word),
+        ARG_MODE_TIMEZONE => is_valid_timezone(word),
         _ => {
             if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
                 let ctx = crate::type_resolver::Ctx::with_partial(word);
@@ -3741,5 +3778,102 @@ mod tests {
         assert!(out.contains("stats tiebreak"), "stats tiebreak section missing:\n{}", out);
         // The chosen winner should be checkout_tool.
         assert!(out.contains("checkout_tool"), "checkout_tool not mentioned:\n{}", out);
+    }
+
+    // --- Text/net validator tests ---
+
+    #[test]
+    fn is_plausible_email_accepts_valid() {
+        assert!(is_plausible_email("a@b.com"));
+        assert!(is_plausible_email("x+y@example.co.uk"));
+        assert!(is_plausible_email("user.name+tag@sub.domain.org"));
+    }
+
+    #[test]
+    fn is_plausible_email_rejects_invalid() {
+        assert!(!is_plausible_email("a@b"));        // no dot in domain
+        assert!(!is_plausible_email("@b.com"));     // empty local
+        assert!(!is_plausible_email("a@"));         // empty domain
+        assert!(!is_plausible_email("foo"));        // no @
+        assert!(!is_plausible_email("a b@c.com")); // whitespace
+    }
+
+    #[test]
+    fn is_plausible_url_accepts_valid() {
+        assert!(is_plausible_url("https://example.com"));
+        assert!(is_plausible_url("ssh://git@host"));
+        assert!(is_plausible_url("git+ssh://foo"));
+        assert!(is_plausible_url("ftp://files.example.org/pub"));
+        assert!(is_plausible_url("file:///etc/hosts"));
+    }
+
+    #[test]
+    fn is_plausible_url_rejects_invalid() {
+        assert!(!is_plausible_url(":foo"));         // no scheme
+        assert!(!is_plausible_url("//foo"));        // missing scheme before //
+        assert!(!is_plausible_url("example.com"));  // no ://
+        assert!(!is_plausible_url("://noscheme"));  // empty scheme
+        assert!(!is_plausible_url("has space://x")); // whitespace in scheme
+    }
+
+    #[test]
+    fn is_plausible_mac_accepts_valid() {
+        assert!(is_plausible_mac("aa:bb:cc:dd:ee:ff"));
+        assert!(is_plausible_mac("AA-BB-CC-DD-EE-FF"));
+        assert!(is_plausible_mac("00:1A:2B:3C:4D:5E"));
+    }
+
+    #[test]
+    fn is_plausible_mac_rejects_invalid() {
+        assert!(!is_plausible_mac("aabbccddeeff"));      // no separators
+        assert!(!is_plausible_mac("aa:bb:cc"));          // only 3 groups
+        assert!(!is_plausible_mac("gg:hh:ii:jj:kk:ll")); // non-hex digits
+        assert!(!is_plausible_mac("a:b:c:d:e:f"));       // single-char groups
+        assert!(!is_plausible_mac(""));
+    }
+
+    #[test]
+    fn is_valid_timezone_known_zones() {
+        // Only check if /usr/share/zoneinfo exists at all on this system.
+        if std::path::Path::new("/usr/share/zoneinfo/UTC").is_file() {
+            assert!(is_valid_timezone("UTC"));
+            assert!(!is_valid_timezone("Not/ATimezone"));
+            assert!(!is_valid_timezone(""));
+        }
+    }
+
+    #[test]
+    fn word_matches_type_text_types() {
+        use crate::trie::*;
+
+        // IPv4
+        assert!(word_matches_type("192.168.1.1", ARG_MODE_IPV4));
+        assert!(word_matches_type("0.0.0.0", ARG_MODE_IPV4));
+        assert!(!word_matches_type("999.999.999.999", ARG_MODE_IPV4));
+        assert!(!word_matches_type("not-an-ip", ARG_MODE_IPV4));
+
+        // IPv6
+        assert!(word_matches_type("::1", ARG_MODE_IPV6));
+        assert!(word_matches_type("2001:db8::1", ARG_MODE_IPV6));
+        assert!(!word_matches_type("192.168.1.1", ARG_MODE_IPV6));
+        assert!(!word_matches_type("not-ipv6", ARG_MODE_IPV6));
+
+        // Email
+        assert!(word_matches_type("me@example.com", ARG_MODE_EMAIL));
+        assert!(!word_matches_type("notanemail", ARG_MODE_EMAIL));
+
+        // URL
+        assert!(word_matches_type("https://example.com", ARG_MODE_URL_SCHEME));
+        assert!(!word_matches_type("example.com", ARG_MODE_URL_SCHEME));
+
+        // MAC
+        assert!(word_matches_type("aa:bb:cc:dd:ee:ff", ARG_MODE_MAC_ADDR));
+        assert!(!word_matches_type("aabbccddeeff", ARG_MODE_MAC_ADDR));
+
+        // Timezone — only test if zoneinfo is present
+        if std::path::Path::new("/usr/share/zoneinfo/UTC").is_file() {
+            assert!(word_matches_type("UTC", ARG_MODE_TIMEZONE));
+            assert!(!word_matches_type("NotReal/Zone", ARG_MODE_TIMEZONE));
+        }
     }
 }
