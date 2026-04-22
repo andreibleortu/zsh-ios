@@ -10,6 +10,11 @@
 ZSH_IOS_BIN="${ZSH_IOS_BIN:-zsh-ios}"
 ZSH_IOS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh-ios"
 
+# Tab-preview state. First Tab on an ambiguous buffer does LCP-extend +
+# multi-column hint and stores the post-LCP buffer here. A second Tab on the
+# unchanged buffer sees the match and enters the picker instead.
+typeset -g _zsh_ios_last_tab_buffer=""
+
 # --- Guard: check if binary exists ---
 if ! command -v "$ZSH_IOS_BIN" &>/dev/null; then
     echo "zsh-ios: binary not found in PATH. Run install.sh or cargo install --path ." >&2
@@ -190,6 +195,7 @@ _zsh_ios_expand_or_complete() {
 
     case $exit_code in
         0)
+            _zsh_ios_last_tab_buffer=""
             if [[ "$output" != "$BUFFER" ]]; then
                 BUFFER="$output"
                 CURSOR=${#BUFFER}
@@ -198,15 +204,55 @@ _zsh_ios_expand_or_complete() {
             fi
             ;;
         1)
-            _zsh_ios_handle_ambiguity "$output" expand
+            # Two-stage Tab: first Tab = LCP extend + one-per-line hint (old
+            # behavior); second Tab on the same buffer = picker (with Tab-cycle
+            # and number-jump). Any edit to the buffer between Tabs resets.
+            if [[ -n "$_zsh_ios_last_tab_buffer" && "$BUFFER" == "$_zsh_ios_last_tab_buffer" ]]; then
+                _zsh_ios_last_tab_buffer=""
+                _zsh_ios_handle_ambiguity "$output" expand
+            else
+                _zsh_ios_tab_preview "$output"
+                _zsh_ios_last_tab_buffer="$BUFFER"
+            fi
             ;;
         3)
+            _zsh_ios_last_tab_buffer=""
             _zsh_ios_handle_path_ambiguity "$output" expand
             ;;
         *)
+            _zsh_ios_last_tab_buffer=""
             zle expand-or-complete
             ;;
     esac
+}
+
+# First-Tab behavior on ambiguity: LCP-extend the buffer (same as the old
+# expand-or-complete path) and show the candidate list one-per-line via
+# `zle -M`. The hint clears on the next keystroke — so a subsequent Tab
+# (caught by the state check above) escalates to the picker.
+_zsh_ios_tab_preview() {
+    local _zio_word _zio_lcp _zio_position _zio_resolved_prefix _zio_remaining
+    local -a _zio_candidates _zio_deep_display _zio_deep_items
+    _zsh_ios_safe_eval "$1"
+
+    if [[ -n "$_zio_lcp" && "$_zio_lcp" != "$_zio_word" ]]; then
+        if [[ -n "$_zio_resolved_prefix" ]]; then
+            BUFFER="$_zio_resolved_prefix $_zio_lcp"
+        else
+            BUFFER="$_zio_lcp"
+        fi
+        CURSOR=${#BUFFER}
+    fi
+
+    if (( ${#_zio_candidates} > 0 )); then
+        local msg="% Ambiguous command: \"$_zio_word\""
+        local c
+        for c in "${_zio_candidates[@]}"; do
+            msg+=$'\n'"  $c"
+        done
+        msg+=$'\n'"  (Tab again to pick)"
+        zle -M "$msg"
+    fi
 }
 
 # --- Path ambiguity handler: single-keypress selection ---
@@ -445,31 +491,65 @@ _zsh_ios_handle_ambiguity() {
 
     echo -n "  > "
 
-    # Keystroke-by-keystroke picker. Accept as soon as the digits typed so
-    # far uniquely identify an option — no Enter needed. For a 5-option menu
-    # that means `5` fires immediately; for a 20-option menu `3` fires
-    # immediately (no 30+ to extend to) but `1` waits for a second digit
-    # because 10-19 are all still reachable. Enter cancels when the buffer
-    # is empty or force-accepts the current digits.
+    # Keystroke-by-keystroke picker. Three input modes, freely intermixed:
+    #   • Digits: accept as soon as the buffered digits uniquely identify an
+    #     option (no Enter needed). `5` fires instantly in a 5-option menu;
+    #     `1` in a 20-option menu waits for a second digit because 10-19 are
+    #     still reachable; `13` fires instantly.
+    #   • Tab: advance a cycle highlight through the options (wraps). The
+    #     prompt line redraws to `> [N] <choice>`. Enter or another Tab-pick
+    #     commits. Useful when the user wants to eyeball options rather than
+    #     map digits to positions.
+    #   • Enter on empty: cancel. Enter while cycling: commit the highlight.
+    #     Any other key cancels.
     local choice=""
+    local cycle_idx=0
     local max=${#menu_display}
     local key trial extendable k sk
+    # Redraw the `> ` prompt line showing the current cycle highlight (or
+    # empty if cycle_idx==0). \r returns to column 0; \e[K clears to EOL.
+    _zsh_ios_pick_redraw_cycle() {
+        if (( cycle_idx == 0 )); then
+            printf '\r  > \e[K'
+        else
+            printf '\r  > [%d] %s\e[K' "$cycle_idx" "${menu_display[$cycle_idx]}"
+        fi
+    }
     while true; do
         read -r -k 1 key </dev/tty
         case "$key" in
             $'\n'|$'\r')
-                # Enter: commit whatever's buffered, or cancel if empty.
+                # Enter: commit digits if present, else cycle highlight, else cancel.
                 echo ""
+                if [[ -z "$choice" && $cycle_idx -gt 0 ]]; then
+                    choice=$cycle_idx
+                fi
                 break
                 ;;
+            $'\t')
+                # Tab cycles the highlight. If digits were being typed, wipe
+                # them first — mixing half-typed numbers with a cycle position
+                # would be confusing.
+                choice=""
+                (( cycle_idx = cycle_idx % max + 1 ))
+                _zsh_ios_pick_redraw_cycle
+                ;;
             $'\x7f'|$'\b')
-                # Backspace: erase one digit from both buffer and display.
+                # Backspace: erase one digit, or step back one cycle position.
                 if [[ -n "$choice" ]]; then
                     choice="${choice%?}"
                     echo -n $'\b \b'
+                elif (( cycle_idx > 0 )); then
+                    (( cycle_idx-- ))
+                    _zsh_ios_pick_redraw_cycle
                 fi
                 ;;
             [0-9])
+                # Switching from cycle → digits: clear the highlight display.
+                if (( cycle_idx > 0 )); then
+                    cycle_idx=0
+                    _zsh_ios_pick_redraw_cycle
+                fi
                 trial="$choice$key"
                 # Is any option number strictly longer than `trial` that
                 # starts with `trial`? If yes, we must wait for more input.
@@ -494,13 +574,21 @@ _zsh_ios_handle_ambiguity() {
                 fi
                 ;;
             *)
-                # Any non-digit, non-enter, non-backspace cancels.
+                # Any non-digit, non-enter, non-backspace, non-tab cancels.
                 echo ""
                 choice=""
+                cycle_idx=0
                 break
                 ;;
         esac
     done
+    unfunction _zsh_ios_pick_redraw_cycle 2>/dev/null
+
+    # Cycle commit: if Enter/Tab-commit-digit path didn't populate `choice`
+    # but a cycle highlight was active, use the highlighted option.
+    if [[ -z "$choice" && $cycle_idx -gt 0 ]]; then
+        choice=$cycle_idx
+    fi
 
     if [[ -z "$choice" ]]; then
         zle reset-prompt
