@@ -747,6 +747,32 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ("git show", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
         ("git bisect good", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
         ("git bisect bad", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
+
+        // --- Executable / command-targeting utilities ---
+        ("man", &[(1, ARG_MODE_EXECS_ONLY)], Some(ARG_MODE_EXECS_ONLY), &[]),
+        ("which", &[(1, ARG_MODE_EXECS_ONLY)], Some(ARG_MODE_EXECS_ONLY), &[]),
+        ("whereis", &[(1, ARG_MODE_EXECS_ONLY)], Some(ARG_MODE_EXECS_ONLY), &[]),
+        ("type", &[(1, ARG_MODE_EXECS_ONLY)], Some(ARG_MODE_EXECS_ONLY), &[]),
+        ("command -v", &[(1, ARG_MODE_EXECS_ONLY)], None, &[]),
+
+        // --- helm (release names use NORMAL, repos use NORMAL — no resolver yet) ---
+        ("helm install", &[], None, &[("-f", ARG_MODE_PATHS), ("--values", ARG_MODE_PATHS)]),
+        ("helm upgrade", &[], None, &[("-f", ARG_MODE_PATHS), ("--values", ARG_MODE_PATHS)]),
+
+        // --- terraform ---
+        ("terraform fmt", &[], Some(ARG_MODE_PATHS), &[]),
+        ("terraform validate", &[], Some(ARG_MODE_DIRS_ONLY), &[]),
+        ("terraform init", &[], Some(ARG_MODE_DIRS_ONLY), &[]),
+
+        // --- gh (GitHub CLI) — common subcommands ---
+        ("gh pr view", &[], None, &[]),
+        ("gh pr checkout", &[(1, ARG_MODE_GIT_BRANCHES)], None, &[]),
+        ("gh issue view", &[], None, &[]),
+        ("gh repo clone", &[], None, &[]),
+
+        // --- systemd user/timer variants ---
+        ("systemctl list-timers", &[], Some(ARG_MODE_SYSTEMD_TIMER), &[]),
+        ("systemctl list-sockets", &[], Some(ARG_MODE_SYSTEMD_SOCKET), &[]),
     ];
 
     // Commands whose rest/positional completions come from an external program.
