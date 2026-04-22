@@ -147,6 +147,17 @@ mod tests {
             ARG_MODE_K8S_DEPLOYMENT,
             ARG_MODE_K8S_SERVICE,
             ARG_MODE_K8S_RESOURCE_KIND,
+            // systemd
+            ARG_MODE_SYSTEMD_UNIT,
+            ARG_MODE_SYSTEMD_SERVICE,
+            ARG_MODE_SYSTEMD_TIMER,
+            ARG_MODE_SYSTEMD_SOCKET,
+            // tmux
+            ARG_MODE_TMUX_SESSION,
+            ARG_MODE_TMUX_WINDOW,
+            ARG_MODE_TMUX_PANE,
+            // screen
+            ARG_MODE_SCREEN_SESSION,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }

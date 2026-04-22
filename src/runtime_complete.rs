@@ -1159,6 +1159,213 @@ impl TypeResolver for K8sResourceKindResolver {
     }
 }
 
+// --- systemd resolvers ---
+
+fn systemctl_args(ctx: &Ctx, rest: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    if ctx.prior_words.iter().any(|w| w == "--user") {
+        out.push("--user".into());
+    }
+    for a in rest {
+        out.push((*a).into());
+    }
+    out
+}
+
+fn parse_systemctl_list_unit_files(raw: &str, suffix_filter: Option<&str>) -> Vec<String> {
+    raw.lines()
+        .filter_map(|line| {
+            let first = line.split_whitespace().next()?;
+            if first.is_empty() {
+                return None;
+            }
+            if let Some(suffix) = suffix_filter
+                && !first.ends_with(suffix)
+            {
+                return None;
+            }
+            Some(first.to_string())
+        })
+        .collect()
+}
+
+fn systemctl_list_units(ctx: &Ctx, suffix_filter: Option<&str>) -> Vec<String> {
+    let base_args: Vec<&str> = vec!["list-unit-files", "--no-legend", "--no-pager"];
+    let args = systemctl_args(ctx, &base_args);
+    let arg_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(&arg_strs);
+    cmd.stderr(std::process::Stdio::null());
+    let raw = match cmd.output() {
+        Ok(out) if out.status.success() || !out.stdout.is_empty() => {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        _ => return Vec::new(),
+    };
+    parse_systemctl_list_unit_files(&raw, suffix_filter)
+}
+
+pub struct SystemdUnitResolver;
+impl TypeResolver for SystemdUnitResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        systemctl_list_units(ctx, None)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "systemd-unit"
+    }
+}
+
+pub struct SystemdServiceResolver;
+impl TypeResolver for SystemdServiceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        systemctl_list_units(ctx, Some(".service"))
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "systemd-service"
+    }
+}
+
+pub struct SystemdTimerResolver;
+impl TypeResolver for SystemdTimerResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        systemctl_list_units(ctx, Some(".timer"))
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "systemd-timer"
+    }
+}
+
+pub struct SystemdSocketResolver;
+impl TypeResolver for SystemdSocketResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        systemctl_list_units(ctx, Some(".socket"))
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "systemd-socket"
+    }
+}
+
+// --- tmux resolvers ---
+
+pub fn tmux_sessions() -> Vec<String> {
+    run_capture("tmux", &["list-sessions", "-F", "#{session_name}"], None)
+}
+
+pub struct TmuxSessionResolver;
+impl TypeResolver for TmuxSessionResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        tmux_sessions()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "tmux-session"
+    }
+}
+
+pub fn tmux_windows() -> Vec<String> {
+    run_capture(
+        "tmux",
+        &["list-windows", "-a", "-F", "#{session_name}:#{window_index}.#{window_name}"],
+        None,
+    )
+}
+
+pub struct TmuxWindowResolver;
+impl TypeResolver for TmuxWindowResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        tmux_windows()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "tmux-window"
+    }
+}
+
+pub fn tmux_panes() -> Vec<String> {
+    run_capture(
+        "tmux",
+        &["list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}"],
+        None,
+    )
+}
+
+pub struct TmuxPaneResolver;
+impl TypeResolver for TmuxPaneResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        tmux_panes()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "tmux-pane"
+    }
+}
+
+// --- screen resolver ---
+
+pub fn parse_screen_ls(output: &str) -> Vec<String> {
+    // Lines of interest look like: `\t12345.work\t(Detached)`
+    // Capture the name after the dot.
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // Must start with a digit (the PID).
+            if trimmed.is_empty() || !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            // The session descriptor is "<pid>.<name>"; take what's after the dot.
+            let dot_pos = trimmed.find('.')?;
+            let rest = &trimmed[dot_pos + 1..];
+            // The name ends at the first whitespace.
+            let name = rest.split_whitespace().next()?;
+            if name.is_empty() { None } else { Some(name.to_string()) }
+        })
+        .collect()
+}
+
+pub fn screen_sessions() -> Vec<String> {
+    let mut cmd = std::process::Command::new("screen");
+    cmd.args(["-ls"]);
+    cmd.stderr(std::process::Stdio::null());
+    let raw = match cmd.output() {
+        // `screen -ls` returns exit code 1 when listing; still captures output.
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+    parse_screen_ls(&raw)
+}
+
+pub struct ScreenSessionResolver;
+impl TypeResolver for ScreenSessionResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        screen_sessions()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "screen-session"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -1192,6 +1399,17 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_K8S_DEPLOYMENT, Box::new(K8sDeploymentResolver));
     r.register(ARG_MODE_K8S_SERVICE, Box::new(K8sServiceResolver));
     r.register(ARG_MODE_K8S_RESOURCE_KIND, Box::new(K8sResourceKindResolver));
+    // systemd
+    r.register(ARG_MODE_SYSTEMD_UNIT, Box::new(SystemdUnitResolver));
+    r.register(ARG_MODE_SYSTEMD_SERVICE, Box::new(SystemdServiceResolver));
+    r.register(ARG_MODE_SYSTEMD_TIMER, Box::new(SystemdTimerResolver));
+    r.register(ARG_MODE_SYSTEMD_SOCKET, Box::new(SystemdSocketResolver));
+    // tmux
+    r.register(ARG_MODE_TMUX_SESSION, Box::new(TmuxSessionResolver));
+    r.register(ARG_MODE_TMUX_WINDOW, Box::new(TmuxWindowResolver));
+    r.register(ARG_MODE_TMUX_PANE, Box::new(TmuxPaneResolver));
+    // screen
+    r.register(ARG_MODE_SCREEN_SESSION, Box::new(ScreenSessionResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -1242,6 +1460,14 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_K8S_DEPLOYMENT => "<deployment>",
         trie::ARG_MODE_K8S_SERVICE => "<k8s-service>",
         trie::ARG_MODE_K8S_RESOURCE_KIND => "<resource-kind>",
+        trie::ARG_MODE_SYSTEMD_UNIT => "<unit>",
+        trie::ARG_MODE_SYSTEMD_SERVICE => "<service>",
+        trie::ARG_MODE_SYSTEMD_TIMER => "<timer>",
+        trie::ARG_MODE_SYSTEMD_SOCKET => "<socket>",
+        trie::ARG_MODE_TMUX_SESSION => "<session>",
+        trie::ARG_MODE_TMUX_WINDOW => "<window>",
+        trie::ARG_MODE_TMUX_PANE => "<pane>",
+        trie::ARG_MODE_SCREEN_SESSION => "<screen-session>",
         _ => "<arg>",
     }
 }
@@ -2092,5 +2318,123 @@ host prod staging !excluded
             1,
             "resolver.list() must be called exactly once; cache should serve the second call"
         );
+    }
+
+    // --- systemd tests ---
+
+    #[test]
+    fn parse_systemctl_list_unit_files_no_filter() {
+        let raw = "\
+foo.service enabled enabled\n\
+bar.timer active static\n\
+baz.socket disabled static\n\
+qux.mount mounted\n";
+        let result = parse_systemctl_list_unit_files(raw, None);
+        assert_eq!(result, vec!["foo.service", "bar.timer", "baz.socket", "qux.mount"]);
+    }
+
+    #[test]
+    fn parse_systemctl_list_unit_files_service_filter() {
+        let raw = "\
+foo.service enabled enabled\n\
+bar.timer active static\n\
+baz.socket disabled static\n\
+qux.mount mounted\n";
+        let result = parse_systemctl_list_unit_files(raw, Some(".service"));
+        assert_eq!(result, vec!["foo.service"]);
+    }
+
+    #[test]
+    fn parse_systemctl_list_unit_files_timer_filter() {
+        let raw = "\
+foo.service enabled enabled\n\
+bar.timer active static\n\
+baz.socket disabled static\n\
+qux.mount mounted\n";
+        let result = parse_systemctl_list_unit_files(raw, Some(".timer"));
+        assert_eq!(result, vec!["bar.timer"]);
+    }
+
+    #[test]
+    fn parse_systemctl_list_unit_files_socket_filter() {
+        let raw = "\
+foo.service enabled enabled\n\
+bar.timer active static\n\
+baz.socket disabled static\n\
+qux.mount mounted\n";
+        let result = parse_systemctl_list_unit_files(raw, Some(".socket"));
+        assert_eq!(result, vec!["baz.socket"]);
+    }
+
+    #[test]
+    fn systemd_tolerates_missing_cli() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        let ctx = crate::type_resolver::Ctx::new();
+        assert_eq!(systemctl_list_units(&ctx, None), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    // --- tmux tests ---
+
+    #[test]
+    fn tmux_tolerates_missing_cli() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(tmux_sessions(), Vec::<String>::new());
+        assert_eq!(tmux_windows(), Vec::<String>::new());
+        assert_eq!(tmux_panes(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    // --- screen tests ---
+
+    #[test]
+    fn parse_screen_ls_extracts_session_names() {
+        let output = "\
+There are screens on:\n\
+    12345.work       (Detached)\n\
+    67890.play       (Attached)\n\
+2 Sockets in /run/screen/S-user.\n";
+        let result = parse_screen_ls(output);
+        assert_eq!(result, vec!["work".to_string(), "play".to_string()]);
+    }
+
+    #[test]
+    fn parse_screen_ls_empty_output() {
+        assert!(parse_screen_ls("No Sockets found in /run/screen/S-user.\n").is_empty());
+        assert!(parse_screen_ls("").is_empty());
+    }
+
+    #[test]
+    fn screen_tolerates_missing_cli() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let orig = std::env::var_os("PATH");
+        let empty = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("PATH", empty.path()); }
+        assert_eq!(screen_sessions(), Vec::<String>::new());
+        unsafe {
+            if let Some(p) = orig {
+                std::env::set_var("PATH", p);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
     }
 }
