@@ -13,6 +13,11 @@ pub fn pins_path() -> PathBuf {
     config_dir().join("pins.txt")
 }
 
+/// Location of the optional user config (`config.yaml`). Absent by default.
+pub fn user_config_path() -> PathBuf {
+    config_dir().join("config.yaml")
+}
+
 pub fn ensure_config_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(config_dir())
 }
@@ -43,6 +48,16 @@ mod tests {
         let pins = pins_path();
         assert_eq!(pins.file_name().and_then(|s| s.to_str()), Some("pins.txt"));
         assert_eq!(pins.parent().unwrap(), config_dir());
+    }
+
+    #[test]
+    fn user_config_path_lives_under_config_dir() {
+        let cfg = user_config_path();
+        assert_eq!(
+            cfg.file_name().and_then(|s| s.to_str()),
+            Some("config.yaml")
+        );
+        assert_eq!(cfg.parent().unwrap(), config_dir());
     }
 
     #[test]

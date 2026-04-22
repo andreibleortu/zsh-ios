@@ -23,9 +23,18 @@ fi
 
 # --- Background tree build on first load ---
 _zsh_ios_build_if_stale() {
-    local tree_file
-    tree_file=$("$ZSH_IOS_BIN" status 2>/dev/null | grep 'Tree file:' | sed 's/.*Tree file:  *//')
+    # One status call; parse both the tree path and the stale threshold from
+    # it so the binary stays the single source of truth (user can override via
+    # $config_dir/config.yaml → stale_threshold_seconds).
+    local status_out
+    status_out=$("$ZSH_IOS_BIN" status 2>/dev/null)
+    [[ -z "$status_out" ]] && return
+
+    local tree_file threshold
+    tree_file=$(print -r -- "$status_out" | grep 'Tree file:' | sed 's/.*Tree file:  *//')
+    threshold=$(print -r -- "$status_out" | grep 'Stale threshold:' | sed -E 's/.*Stale threshold:  *([0-9]+).*/\1/')
     [[ -z "$tree_file" ]] && return
+    [[ "$threshold" =~ '^[0-9]+$' ]] || threshold=3600
 
     local rebuild=0
     if [[ ! -f "$tree_file" ]]; then
@@ -39,7 +48,7 @@ _zsh_ios_build_if_stale() {
         else
             mtime=$(stat -c %Y "$tree_file" 2>/dev/null || echo 0)
         fi
-        if (( now - mtime > 3600 )); then
+        if (( now - mtime > threshold )); then
             rebuild=1
         fi
     fi

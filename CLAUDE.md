@@ -56,6 +56,7 @@ Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and futur
 - **`pins.rs`** — plain-text pin file (`abbrev -> expansion` lines), longest-prefix match at lookup time.
 - **`config.rs`** — XDG / macOS Application Support path resolution.
 - **`data/descriptions.yaml`** — bundled via `include_str!` at compile time; fallback subcommand descriptions when Zsh completion files don't provide one.
+- **`user_config.rs`** — optional `$config_dir/config.yaml`. Knobs: `stale_threshold_seconds` (Zsh plugin parses this out of `zsh-ios status` → `Stale threshold: Ns`), `disable_learning` (short-circuits `cmd_learn`), `command_blocklist` (checked in `cmd_resolve` both literally on the typed first word *and* on the resolved first word — so blocking `kubectl` catches `kub ...` too; blocklist hits print the original input and exit 2). Uses `serde(deny_unknown_fields)` so typos in field names error instead of silently defaulting. Invalid YAML prints a warning and falls back to defaults — it must never wedge the shell.
 
 ### Plugin internals worth knowing
 

@@ -163,6 +163,30 @@ k -> kubectl
 
 Edit by hand anytime. Longest-prefix match applies: `g ch` takes priority over `g` when the input starts with `g ch`.
 
+### Config file
+
+Optional YAML at `~/.config/zsh-ios/config.yaml` (or `~/Library/Application Support/zsh-ios/config.yaml` on macOS). Every field is optional; missing file or missing field falls back to the compiled-in default. An invalid config prints a warning and uses defaults — it can never wedge the shell.
+
+```yaml
+# How many seconds old tree.msgpack can be before the plugin auto-rebuilds
+# on shell startup. Default: 3600.
+stale_threshold_seconds: 3600
+
+# Set true to make `zsh-ios learn` a no-op. Useful if you'd rather curate
+# the trie explicitly via `rebuild` and keep it deterministic across shells.
+disable_learning: false
+
+# Commands zsh-ios must never touch. Matched against the first word you
+# typed AND against what it would resolve to, so `kubectl` here catches
+# `kub ...` too. Blocklist hits exit as passthrough (the buffer runs as
+# typed).
+command_blocklist:
+  - kubectl
+  - docker
+```
+
+Run `zsh-ios status` to see which values are in effect.
+
 ### How resolution works
 
 Given input `ter ap --auto-approve`:

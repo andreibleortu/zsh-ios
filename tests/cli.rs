@@ -411,3 +411,126 @@ fn pin_without_args_errors() {
     let (code, _, _) = run(cmd_in(td.path()).args(["pin", ""]).args(["--to", ""]));
     assert_ne!(code, 0, "empty abbrev/expansion must fail");
 }
+
+/// Write a `config.yaml` next to the tree for the given test home.
+fn write_user_config(home: &Path, yaml: &str) {
+    let dir = config_dir_of(home);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.yaml"), yaml).unwrap();
+}
+
+#[test]
+fn status_surfaces_config_values_for_plugin() {
+    // The Zsh plugin parses `Stale threshold:` out of `status` output — keep
+    // that line stable and respecting the config override.
+    let td = tempfile::tempdir().unwrap();
+    write_user_config(
+        td.path(),
+        "stale_threshold_seconds: 123\ndisable_learning: true\n",
+    );
+    let (code, stdout, _) = run(cmd_in(td.path()).arg("status"));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Stale threshold: 123s"),
+        "status should surface threshold: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Learning:    disabled (config)"),
+        "status should surface learning state: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Config file:") && stdout.contains("(loaded)"),
+        "status should show config file path+state: {}",
+        stdout
+    );
+}
+
+#[test]
+fn status_stale_threshold_defaults_without_config() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, stdout, _) = run(cmd_in(td.path()).arg("status"));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Stale threshold: 3600s"),
+        "default threshold should be 3600: {}",
+        stdout
+    );
+    assert!(stdout.contains("(absent)"));
+}
+
+#[test]
+fn invalid_config_falls_back_to_defaults() {
+    // A bad config must never wedge the shell — parse error → warn + defaults.
+    let td = tempfile::tempdir().unwrap();
+    write_user_config(td.path(), "stale_threshold_seconds: not-a-number\n");
+    let (code, stdout, stderr) = run(cmd_in(td.path()).arg("status"));
+    assert_eq!(code, 0, "status should not crash on invalid config");
+    assert!(
+        stdout.contains("Stale threshold: 3600s"),
+        "should fall back to default: {}",
+        stdout
+    );
+    assert!(
+        stderr.contains("ignoring invalid config"),
+        "should warn on stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn blocklist_passthroughs_literal_match() {
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+    write_user_config(td.path(), "command_blocklist:\n  - kubectl\n");
+    let (code, stdout, _) = run(cmd_in(td.path()).args(["resolve", "kubectl get pods"]));
+    assert_eq!(code, 2, "blocklisted literal should passthrough");
+    assert_eq!(stdout.trim_end_matches('\n'), "kubectl get pods");
+}
+
+#[test]
+fn blocklist_passthroughs_abbreviation_that_resolves() {
+    // The whole point of the blocklist: abbreviations that would otherwise
+    // resolve into a blocklisted command are also passed through, with the
+    // ORIGINAL (abbreviated) line printed — not the expansion.
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+
+    // First confirm the abbrev actually resolves without the blocklist so
+    // the test is meaningful. We can only seed commands that exist on PATH
+    // during the build; `zsh-ios` itself is always in the trie.
+    write_user_config(td.path(), "");
+    let (c, stdout, _) = run(cmd_in(td.path()).args(["resolve", "zsh-io stat"]));
+    assert_eq!(c, 0, "abbrev should resolve with no blocklist");
+    assert_eq!(stdout.trim_end_matches('\n'), "zsh-ios status");
+
+    // Now block the resolved command and check the same abbrev passes through.
+    write_user_config(td.path(), "command_blocklist:\n  - zsh-ios\n");
+    let (c, stdout, _) = run(cmd_in(td.path()).args(["resolve", "zsh-io stat"]));
+    assert_eq!(c, 2, "blocklisted resolution should passthrough");
+    assert_eq!(
+        stdout.trim_end_matches('\n'),
+        "zsh-io stat",
+        "should print original, not expansion"
+    );
+}
+
+#[test]
+fn disable_learning_makes_learn_noop() {
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+    write_user_config(td.path(), "disable_learning: true\n");
+
+    let tree = tree_path_of(td.path());
+    let before = fs::metadata(&tree).unwrap().modified().unwrap();
+
+    // `learn` must neither succeed-and-modify nor error out — just silent no-op.
+    // Sleep so mtime resolution (typically 1s on ext4) lets a real write register.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (code, _, _) = run(cmd_in(td.path()).args(["learn", "git checkout"]));
+    assert_eq!(code, 0);
+
+    let after = fs::metadata(&tree).unwrap().modified().unwrap();
+    assert_eq!(before, after, "disable_learning should leave the trie file untouched");
+}

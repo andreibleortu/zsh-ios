@@ -195,9 +195,26 @@ fn cmd_build(aliases_stdin: bool) {
 fn cmd_resolve(line: &str) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+
+    // Blocklist pre-check: if the user typed the blocklisted name literally,
+    // passthrough immediately so the engine does zero work.
+    let typed_first = first_word(line);
+    if user_cfg.is_blocklisted(typed_first) {
+        println!("{}", line);
+        process::exit(2);
+    }
 
     match resolve::resolve_line(line, &trie, &pin_store) {
         resolve::ResolveResult::Resolved(expanded) => {
+            // Blocklist post-check: if the resolved command is blocklisted,
+            // print the ORIGINAL input (not the expansion) and passthrough.
+            // This catches abbreviations — `kub ...` that resolves to
+            // `kubectl ...` is blocked by `command_blocklist: [kubectl]`.
+            if user_cfg.is_blocklisted(first_word(&expanded)) {
+                println!("{}", line);
+                process::exit(2);
+            }
             println!("{}", expanded);
             process::exit(0);
         }
@@ -214,6 +231,10 @@ fn cmd_resolve(line: &str) {
             process::exit(2);
         }
     }
+}
+
+fn first_word(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or("")
 }
 
 fn print_ambiguity_shell(info: &resolve::AmbiguityInfo) {
@@ -272,6 +293,11 @@ fn cmd_complete(line: &str) {
 
 fn cmd_learn(command: &str) {
     if command.trim().is_empty() {
+        return;
+    }
+
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    if user_cfg.disable_learning {
         return;
     }
 
@@ -428,6 +454,8 @@ fn cmd_status() {
     let config_dir = config::config_dir();
     let tree_path = config::tree_path();
     let pins_path = config::pins_path();
+    let user_config_path = config::user_config_path();
+    let user_cfg = user_config::UserConfig::load(&user_config_path);
     let disabled = config_dir.join("disabled").exists();
 
     println!("zsh-ios status");
@@ -435,6 +463,27 @@ fn cmd_status() {
     println!("  Config dir:  {}", config_dir.display());
     println!("  Tree file:   {}", tree_path.display());
     println!("  Pins file:   {}", pins_path.display());
+    // Stable key-value lines; the Zsh plugin parses "Stale threshold:" to
+    // know how long tree.msgpack may be before it auto-rebuilds.
+    println!(
+        "  Config file: {} ({})",
+        user_config_path.display(),
+        if user_config_path.exists() {
+            "loaded"
+        } else {
+            "absent"
+        }
+    );
+    println!("  Stale threshold: {}s", user_cfg.stale_threshold());
+    println!(
+        "  Learning:    {}",
+        if user_cfg.disable_learning {
+            "disabled (config)"
+        } else {
+            "enabled"
+        }
+    );
+    println!("  Blocklist:   {}", user_cfg.command_blocklist.len());
 
     if tree_path.exists() {
         if let Ok(meta) = std::fs::metadata(&tree_path) {
