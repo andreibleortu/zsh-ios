@@ -1670,6 +1670,11 @@ mod tests {
 
     #[test]
     fn test_unambiguous_resolve() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
         let trie = build_test_trie();
         let pins = Pins::default();
 
@@ -1681,6 +1686,10 @@ mod tests {
         match resolve("ter pl", &trie, &pins) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform plan"),
             other => panic!("Expected Resolved, got {:?}", other),
+        }
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
         }
     }
 
@@ -1865,12 +1874,21 @@ mod tests {
 
     #[test]
     fn test_semicolon_resolution() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
         let trie = build_test_trie();
         let pins = Pins::default();
 
         match resolve_line("ter init; ter pl", &trie, &pins) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform init ; terraform plan"),
             other => panic!("Expected Resolved, got {:?}", other),
+        }
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
         }
     }
 
@@ -2223,6 +2241,11 @@ mod tests {
 
     #[test]
     fn test_sudo_with_chain() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
         let trie = build_test_trie();
         let pins = Pins::default();
 
@@ -2231,6 +2254,10 @@ mod tests {
                 assert_eq!(s, "sudo terraform init && sudo terraform apply");
             }
             other => panic!("Expected Resolved, got {:?}", other),
+        }
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
         }
     }
 
@@ -2627,6 +2654,11 @@ mod tests {
 
     #[test]
     fn test_resolve_line_or_operator() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
         let trie = build_test_trie();
         let pins = Pins::default();
         match resolve_line("ter in || ter ap", &trie, &pins) {
@@ -2634,6 +2666,10 @@ mod tests {
                 assert_eq!(s, "terraform init || terraform apply");
             }
             other => panic!("Expected Resolved, got {:?}", other),
+        }
+
+        if let Some(o) = orig {
+            let _ = std::env::set_current_dir(o);
         }
     }
 
