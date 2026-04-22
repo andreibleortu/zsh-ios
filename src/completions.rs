@@ -716,6 +716,11 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
 
 fn completion_dirs() -> Vec<String> {
     let mut dirs = Vec::new();
+    let add = |d: String, out: &mut Vec<String>| {
+        if !d.is_empty() && !out.contains(&d) {
+            out.push(d);
+        }
+    };
 
     // Standard Zsh completion directories
     for pattern in &[
@@ -724,16 +729,64 @@ fn completion_dirs() -> Vec<String> {
         "/opt/homebrew/share/zsh/site-functions",
     ] {
         if let Ok(entries) = glob_simple(pattern) {
-            dirs.extend(entries);
+            for e in entries {
+                add(e, &mut dirs);
+            }
+        }
+    }
+
+    // Plugin framework trees — each is a glob of directories that tend to
+    // contain `_cmd` completion functions.  We don't care which framework
+    // the user actually has; we try every known location and skip ones
+    // that don't exist.
+    let home = dirs::home_dir();
+    if let Some(h) = home.as_ref() {
+        let h = h.to_string_lossy().into_owned();
+        for pattern in &[
+            // Oh-My-Zsh
+            "{h}/.oh-my-zsh/plugins/*",
+            "{h}/.oh-my-zsh/custom/plugins/*",
+            "{h}/.oh-my-zsh/completions",
+            // Prezto
+            "{h}/.zprezto/modules/*/functions",
+            // zinit
+            "{h}/.local/share/zinit/plugins/*",
+            "{h}/.local/share/zinit/completions",
+            "{h}/.zinit/plugins/*",
+            "{h}/.zinit/completions",
+            // antidote
+            "{h}/.cache/antidote/*",
+            "{h}/.antidote/*",
+            // antibody
+            "{h}/.cache/antibody/*",
+            // znap
+            "{h}/Git/*/plugins/*",
+            "{h}/.znap/*",
+            // zplug
+            "{h}/.zplug/repos/*",
+            // Misc XDG locations
+            "{h}/.config/zsh/plugins/*",
+            "{h}/.config/zsh/completions",
+        ] {
+            let expanded = pattern.replace("{h}", &h);
+            if let Ok(entries) = glob_simple(&expanded) {
+                for e in entries {
+                    add(e, &mut dirs);
+                }
+            }
+            // Also include the path verbatim for non-glob literals so a
+            // pattern like `~/.oh-my-zsh/completions` is added even if
+            // glob_simple expects a * somewhere.
+            if !expanded.contains('*') && std::path::Path::new(&expanded).is_dir() {
+                add(expanded, &mut dirs);
+            }
         }
     }
 
     // Also check $fpath from environment if available
     if let Ok(fpath) = std::env::var("FPATH") {
         for dir in fpath.split(':') {
-            if !dir.is_empty() && !dirs.contains(&dir.to_string()) {
-                dirs.push(dir.to_string());
-            }
+            add(dir.to_string(), &mut dirs);
         }
     }
 
@@ -4615,5 +4668,18 @@ _git-checkout() {
                 );
             }
         }
+    }
+
+    #[test]
+    fn completion_dirs_is_deduplicated() {
+        let dirs = completion_dirs();
+        let mut sorted = dirs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            dirs.len(),
+            sorted.len(),
+            "completion_dirs must not contain duplicates",
+        );
     }
 }
