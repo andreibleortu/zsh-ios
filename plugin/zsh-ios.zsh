@@ -475,6 +475,13 @@ _zsh_ios_help() {
     else
         zle -M "% No commands found"
     fi
+    # TODO: approximate completer fallback
+    # When both the Rust binary and _zsh_ios_worker_complete return empty,
+    # a third tier could try `zle _approximate` inside the worker to catch
+    # typos.  Deferred because _approximate requires ZLE to be active and
+    # the worker's zpty handle must survive the fork — non-trivial to wire
+    # correctly without stalling the shell.  When implemented, tag output
+    # with "[approximate]" so the user knows it's a fuzzy suggestion.
 }
 
 # --- Ambiguity handler with interactive clarifier ---
@@ -847,6 +854,34 @@ _zio_accept_line() {
             dump-zstyle)
                 zstyle -L >> "\$_ZIO_RF" 2>/dev/null
                 ;;
+            dump-history)
+                print -l "\${history[@]}" >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-dirstack)
+                # Combines \$dirstack (array) with \$PWD at index 0.  Zsh's
+                # dirstack array doesn't include the current dir — users expect
+                # ~0 to map to PWD and ~1 to the first pushed entry.
+                print -r -- "\$PWD" >> "\$_ZIO_RF" 2>/dev/null
+                print -l "\${dirstack[@]}" >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-jobs)
+                jobs >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-commands)
+                hash -L >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-parameters)
+                typeset +m '*' >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-options)
+                setopt >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-widgets)
+                zle -l >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-modules)
+                zmodload >> "\$_ZIO_RF" 2>/dev/null
+                ;;
         esac
         [[ -n "\$_ZIO_DF" ]] && touch "\$_ZIO_DF"
         rm -f "\$_req"
@@ -982,6 +1017,22 @@ _zsh_ios_ingest_worker_state() {
         _zsh_ios_worker_dump functions
         print "@nameddirs"
         _zsh_ios_worker_dump nameddirs
+        print "@history"
+        _zsh_ios_worker_dump history
+        print "@dirstack"
+        _zsh_ios_worker_dump dirstack
+        print "@jobs"
+        _zsh_ios_worker_dump jobs
+        print "@commands"
+        _zsh_ios_worker_dump commands
+        print "@parameters"
+        _zsh_ios_worker_dump parameters
+        print "@options"
+        _zsh_ios_worker_dump options
+        print "@widgets"
+        _zsh_ios_worker_dump widgets
+        print "@modules"
+        _zsh_ios_worker_dump modules
     } | "$ZSH_IOS_BIN" ingest 2>/dev/null
 }
 

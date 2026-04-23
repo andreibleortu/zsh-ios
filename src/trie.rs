@@ -628,6 +628,17 @@ pub struct CommandTrie {
     /// plugin worker's `hash -d` dump.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub named_dirs: HashMap<String, String>,
+    /// Directory stack, PWD first, pushd entries after. Consulted by
+    /// path_resolve for `~N` references. Populated by `zsh-ios ingest` via
+    /// the plugin worker's `dirstack` dump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dir_stack: Vec<String>,
+    /// Live-state metadata captured by the worker ingest. Key = section
+    /// name (jobs, parameters, options, widgets, modules, commands),
+    /// value = the raw dump body. Purely informational — surfaced in
+    /// `zsh-ios status` for introspection, not consumed by resolution.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub live_state: HashMap<String, String>,
 }
 
 impl CommandTrie {

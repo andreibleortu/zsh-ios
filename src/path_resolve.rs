@@ -10,6 +10,56 @@ pub enum PathResult {
     Unchanged,
 }
 
+/// Expand a `~N` / `~+N` / `~-N` token against the directory stack.
+///
+/// Zsh convention: `~0` (or `~+0`) is `$PWD`; `~1` is the first pushed
+/// directory; `~-1` counts from the end. The plugin stores `$PWD` at
+/// `dir_stack[0]` so indices map directly to the slice.
+///
+/// Returns `None` if `token` doesn't look like a dirstack reference or if
+/// the requested index is out of range.
+pub fn expand_dir_stack(token: &str, dir_stack: &[String]) -> Option<String> {
+    let rest = token.strip_prefix('~')?;
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Collect the numeric (possibly sign-prefixed) part and the tail.
+    // Accepted forms: ~N, ~+N, ~-N (where N is one or more decimal digits).
+    let sign_and_digits_end = rest
+        .char_indices()
+        .take_while(|(i, c)| (*i == 0 && (*c == '+' || *c == '-')) || c.is_ascii_digit())
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+
+    if sign_and_digits_end == 0 {
+        return None;
+    }
+
+    let num_str = &rest[..sign_and_digits_end];
+    let tail = &rest[sign_and_digits_end..];
+
+    // Must have at least one digit (reject bare `~+` or `~-`).
+    if !num_str.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let index: i32 = num_str.trim_start_matches('+').parse().ok()?;
+    let len = dir_stack.len() as i32;
+    let resolved = if index >= 0 {
+        dir_stack.get(index as usize)?
+    } else {
+        let idx = len + index;
+        if idx < 0 {
+            return None;
+        }
+        dir_stack.get(idx as usize)?
+    };
+
+    Some(format!("{}{}", resolved, tail))
+}
+
 /// Resolve an abbreviated path against the real filesystem.
 ///
 /// For each component separated by `/`, tries:
@@ -23,33 +73,48 @@ pub enum PathResult {
 /// `named_dirs` maps Zsh `hash -d` names to their absolute paths.
 /// Tokens of the form `~name`, `name/rest`, or `name:rest` are expanded
 /// before filesystem resolution when `name` is a key in `named_dirs`.
-pub fn resolve_path(abbreviated: &str, named_dirs: &HashMap<String, String>) -> PathResult {
-    resolve_path_inner(abbreviated, false, named_dirs)
+///
+/// `dir_stack` is the Zsh directory stack (PWD at index 0). Tokens of the
+/// form `~N` / `~+N` / `~-N` are expanded against this slice before
+/// filesystem resolution.
+pub fn resolve_path(
+    abbreviated: &str,
+    named_dirs: &HashMap<String, String>,
+    dir_stack: &[String],
+) -> PathResult {
+    resolve_path_inner(abbreviated, false, named_dirs, dir_stack)
 }
 
 /// Like `resolve_path` but only matches directories (for cd, pushd, etc.).
 pub fn resolve_path_dirs_only(
     abbreviated: &str,
     named_dirs: &HashMap<String, String>,
+    dir_stack: &[String],
 ) -> PathResult {
-    resolve_path_inner(abbreviated, true, named_dirs)
+    resolve_path_inner(abbreviated, true, named_dirs, dir_stack)
 }
 
 fn resolve_path_inner(
     abbreviated: &str,
     dirs_only: bool,
     named_dirs: &HashMap<String, String>,
+    dir_stack: &[String],
 ) -> PathResult {
     if abbreviated.is_empty() {
         return PathResult::Unchanged;
     }
 
-    // Expand named-dir references before doing filesystem resolution.
+    // Expand named-dir references first (highest precedence).
     // A reference expands to an absolute path, so we recurse once with an
     // empty named_dirs to avoid a second expansion pass.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(expanded) = expand_named_dir_with_cwd(abbreviated, named_dirs, &cwd) {
-        return resolve_path_inner(&expanded, dirs_only, &HashMap::new());
+        return resolve_path_inner(&expanded, dirs_only, &HashMap::new(), &[]);
+    }
+
+    // Expand dirstack references (~N / ~+N / ~-N).
+    if let Some(expanded) = expand_dir_stack(abbreviated, dir_stack) {
+        return resolve_path_inner(&expanded, dirs_only, &HashMap::new(), &[]);
     }
 
     let trailing_slash = abbreviated.ends_with('/');
@@ -501,9 +566,13 @@ mod tests {
         HashMap::new()
     }
 
+    fn empty_dir_stack() -> Vec<String> {
+        vec![]
+    }
+
     #[test]
     fn test_resolve_absolute() {
-        let result = resolve_path("/usr/lo", &empty_named_dirs());
+        let result = resolve_path("/usr/lo", &empty_named_dirs(), &empty_dir_stack());
         if Path::new("/usr/local").exists() {
             match result {
                 PathResult::Resolved(s) => assert_eq!(s, "/usr/local"),
@@ -516,7 +585,7 @@ mod tests {
     fn test_resolve_tilde() {
         let home = dirs::home_dir().unwrap();
         if home.join("Desktop").exists() && !home.join("Desk").exists() {
-            match resolve_path("~/Desk", &empty_named_dirs()) {
+            match resolve_path("~/Desk", &empty_named_dirs(), &empty_dir_stack()) {
                 PathResult::Resolved(s) => assert_eq!(s, "~/Desktop"),
                 _ => panic!("Expected Resolved"),
             }
@@ -753,7 +822,7 @@ mod tests {
     #[test]
     fn test_resolve_path_unchanged() {
         // A completely non-matching path should return Unchanged
-        match resolve_path("zzzznonexistent", &empty_named_dirs()) {
+        match resolve_path("zzzznonexistent", &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Unchanged => {}
             other => panic!("Expected Unchanged for nonexistent, got {:?}", other),
         }
@@ -761,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_empty() {
-        match resolve_path("", &empty_named_dirs()) {
+        match resolve_path("", &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Unchanged => {}
             other => panic!("Expected Unchanged for empty, got {:?}", other),
         }
@@ -838,7 +907,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("application")).unwrap();
         let abbrev = format!("{}/appl", td.path().display());
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Resolved(s) => {
                 assert!(s.ends_with("/application"), "got: {}", s);
             }
@@ -854,7 +923,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("Application Support/zsh-ios")).unwrap();
         std::fs::create_dir_all(td.path().join("Application Scripts/other")).unwrap();
         let abbrev = format!("{}/Appli/zsh-", td.path().display());
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Resolved(s) => {
                 assert!(s.contains("Application Support"), "branched wrong: {}", s);
                 assert!(s.ends_with("zsh-ios"), "didn't complete leaf: {}", s);
@@ -873,7 +942,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("apple")).unwrap();
         std::fs::create_dir_all(td.path().join("application")).unwrap();
         let abbrev = format!("{}/app", td.path().display());
-        match resolve_path_dirs_only(&abbrev, &empty_named_dirs()) {
+        match resolve_path_dirs_only(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Ambiguous(paths) => {
                 assert_eq!(paths.len(), 2);
                 assert!(paths.iter().any(|p| p.ends_with("/apple")));
@@ -882,7 +951,7 @@ mod tests {
             other => panic!("expected Ambiguous, got {:?}", other),
         }
         // Same input in non-dirs-only mode: Unchanged (caller handles it).
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Unchanged => {}
             other => panic!("expected Unchanged for plain resolve, got {:?}", other),
         }
@@ -893,7 +962,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("targetdir")).unwrap();
         let abbrev = format!("{}/target/", td.path().display());
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Resolved(s) => assert!(s.ends_with('/'), "lost trailing slash: {}", s),
             other => panic!("expected Resolved, got {:?}", other),
         }
@@ -904,7 +973,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("only-a-file"), "").unwrap();
         let abbrev = format!("{}/only", td.path().display());
-        match resolve_path_dirs_only(&abbrev, &empty_named_dirs()) {
+        match resolve_path_dirs_only(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Unchanged => {}
             // Allow Resolved only if the platform for some reason creates
             // a matching dir — in our tempdir we only made a file.
@@ -919,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("tests/test-1")).unwrap();
         std::fs::create_dir_all(td.path().join("tests/test-5")).unwrap();
         let abbrev = format!("{}/tests/!5", td.path().display());
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Resolved(s) => assert!(s.ends_with("test-5"), "got: {}", s),
             other => panic!("expected Resolved, got {:?}", other),
         }
@@ -931,7 +1000,7 @@ mod tests {
         std::fs::write(td.path().join("a.py"), "").unwrap();
         std::fs::write(td.path().join("b.py"), "").unwrap();
         let abbrev = format!("{}/**.py", td.path().display());
-        match resolve_path(&abbrev, &empty_named_dirs()) {
+        match resolve_path(&abbrev, &empty_named_dirs(), &empty_dir_stack()) {
             PathResult::Resolved(s) => assert!(s.ends_with("/*.py"), "got: {}", s),
             // It is also valid for this to be Unchanged if the path already
             // starts with "*/*.py" after joining — but our tempdir abbrev
@@ -1072,6 +1141,83 @@ mod tests {
         );
     }
 
+    // --- Tests for expand_dir_stack ---
+
+    #[test]
+    fn dir_stack_index_zero_returns_pwd() {
+        let stack = vec![
+            "/home/me".to_string(),
+            "/tmp".to_string(),
+            "/var".to_string(),
+        ];
+        // ~0 is PWD (index 0)
+        assert_eq!(expand_dir_stack("~0", &stack), Some("/home/me".to_string()));
+    }
+
+    #[test]
+    fn dir_stack_ancestor_ref() {
+        let stack = vec![
+            "/home/me".to_string(),
+            "/tmp".to_string(),
+            "/var".to_string(),
+        ];
+        assert_eq!(expand_dir_stack("~0", &stack), Some("/home/me".to_string()));
+        assert_eq!(expand_dir_stack("~2", &stack), Some("/var".to_string()));
+        assert_eq!(expand_dir_stack("~3", &stack), None);
+        assert_eq!(expand_dir_stack("~-1", &stack), Some("/var".to_string()));
+    }
+
+    #[test]
+    fn dir_stack_index_out_of_range() {
+        let stack = vec!["/home/me".to_string()];
+        assert_eq!(expand_dir_stack("~5", &stack), None);
+    }
+
+    #[test]
+    fn dir_stack_plus_prefix_same_as_bare() {
+        let stack = vec!["/home/me".to_string(), "/tmp".to_string()];
+        assert_eq!(expand_dir_stack("~+1", &stack), Some("/tmp".to_string()));
+    }
+
+    #[test]
+    fn dir_stack_with_tail() {
+        let stack = vec!["/home/me".to_string()];
+        // ~0/src should expand to /home/me/src
+        assert_eq!(
+            expand_dir_stack("~0/src", &stack),
+            Some("/home/me/src".to_string())
+        );
+    }
+
+    #[test]
+    fn dir_stack_no_digits_returns_none() {
+        let stack = vec!["/home/me".to_string()];
+        // bare ~ or ~name (no digits) → None
+        assert_eq!(expand_dir_stack("~", &stack), None);
+        assert_eq!(expand_dir_stack("~name", &stack), None);
+    }
+
+    #[test]
+    fn dir_stack_negative_out_of_range() {
+        let stack = vec!["/home/me".to_string(), "/tmp".to_string()];
+        // ~-3 when stack has 2 entries → index -1 → None
+        assert_eq!(expand_dir_stack("~-3", &stack), None);
+    }
+
+    #[test]
+    fn dir_stack_integration_with_resolve_path() {
+        // resolve_path should expand ~0 to dir_stack[0] and then resolve from there
+        let dir_stack = vec!["/tmp".to_string()];
+        // /tmp itself should resolve (it exists), so ~0 → /tmp → Resolved or Unchanged
+        let result = resolve_path("~0", &HashMap::new(), &dir_stack);
+        // The expansion produces "/tmp" which is a real path: either Unchanged (already
+        // fully resolved) or Resolved is acceptable.
+        match result {
+            PathResult::Unchanged | PathResult::Resolved(_) => {}
+            other => panic!("expected Resolved or Unchanged for ~0, got {:?}", other),
+        }
+    }
+
     #[test]
     fn path_resolve_uses_named_dir() {
         // End-to-end: set up a tempdir as the mapped path, add a file, call
@@ -1083,7 +1229,7 @@ mod tests {
         let mut dirs = HashMap::new();
         dirs.insert("proj".to_string(), td.path().to_str().unwrap().to_string());
 
-        match resolve_path("proj:fil", &dirs) {
+        match resolve_path("proj:fil", &dirs, &empty_dir_stack()) {
             PathResult::Resolved(s) => {
                 assert!(s.ends_with("file.rs"), "expected file.rs, got: {s}");
             }

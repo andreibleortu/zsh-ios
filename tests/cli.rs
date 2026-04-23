@@ -7,6 +7,7 @@
 //! error surfacing we put in during the fix pass.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -748,4 +749,41 @@ fn resolve_with_context_redirection() {
     let (code, _, _) = run(cmd_in(td.path())
         .args(["resolve", "--context", "redirection", "--", "echo hello > /tmp/x"]));
     assert_ne!(code, 1, "redirection context should not produce command ambiguity");
+}
+
+#[test]
+fn ingest_dirstack_populates_trie_field() {
+    // Pipe an @dirstack section through `zsh-ios ingest`, reload trie, assert dir_stack set.
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+
+    // Pipe a dirstack section into ingest
+    let ingest_input = "@dirstack\n/home/me\n/tmp\n/var\n";
+    let mut child = cmd_in(td.path())
+        .arg("ingest")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(ingest_input.as_bytes())
+            .unwrap();
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "ingest exited non-zero");
+
+    let trie = CommandTrie::load(&tree_path_of(td.path())).unwrap();
+    assert_eq!(
+        trie.dir_stack,
+        vec!["/home/me", "/tmp", "/var"],
+        "dir_stack not populated after ingest: {:?}",
+        trie.dir_stack
+    );
 }

@@ -602,6 +602,14 @@ fn cmd_status() {
                     detailed
                 );
             }
+            if !trie.dir_stack.is_empty() {
+                println!("  Dir stack:   {} entries", trie.dir_stack.len());
+            }
+            if !trie.live_state.is_empty() {
+                let mut keys: Vec<&str> = trie.live_state.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                println!("  Live state:  {} ({})", keys.len(), keys.join(", "));
+            }
         }
     } else {
         println!("  Tree:        not built yet (run `zsh-ios rebuild`)");

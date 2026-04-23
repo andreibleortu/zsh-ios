@@ -411,7 +411,7 @@ fn resolve_with_ctx(
         if let Some(last) = words.last() {
             // If it looks like a path abbreviation try to resolve it; otherwise
             // pass through verbatim so the shell handles it.
-            match path_resolve::resolve_path(last, &trie.named_dirs) {
+            match path_resolve::resolve_path(last, &trie.named_dirs, &trie.dir_stack) {
                 path_resolve::PathResult::Resolved(resolved) => {
                     let mut parts: Vec<String> =
                         words[..words.len() - 1].iter().map(|s| s.to_string()).collect();
@@ -605,7 +605,7 @@ pub(super) fn finalize_with_paths(input: &str, mut words: Vec<String>, trie: &Co
     // `~/bin/foo`), resolve it against the filesystem before handling args.
     if let Some(cmd) = words.first()
         && (cmd.contains('/') || cmd.starts_with('~')) && !cmd.starts_with('-') {
-            match path_resolve::resolve_path(cmd, &trie.named_dirs) {
+            match path_resolve::resolve_path(cmd, &trie.named_dirs, &trie.dir_stack) {
                 path_resolve::PathResult::Resolved(resolved) => {
                     words[0] = shell_escape_path(&resolved);
                 }
@@ -631,7 +631,7 @@ pub(super) fn finalize_with_paths(input: &str, mut words: Vec<String>, trie: &Co
         .first()
         .map(|w| arg_mode(w, &trie.arg_modes))
         .unwrap_or(ArgMode::Normal);
-    match resolve_paths_in_words(&words, spec, fallback_mode, cmd_words, &trie.named_dirs) {
+    match resolve_paths_in_words(&words, spec, fallback_mode, cmd_words, &trie.named_dirs, &trie.dir_stack) {
         PathsResult::Resolved(result) => {
             if result == input {
                 ResolveResult::Passthrough(input.to_string())
@@ -1416,6 +1416,7 @@ pub(super) fn resolve_paths_in_words(
     fallback_mode: ArgMode,
     cmd_words: usize,
     named_dirs: &std::collections::HashMap<String, String>,
+    dir_stack: &[String],
 ) -> PathsResult {
     let mut result: Vec<String> = Vec::new();
     let mut arg_position: u32 = 0; // 1-indexed position of non-flag arguments after the command prefix
@@ -1473,8 +1474,8 @@ pub(super) fn resolve_paths_in_words(
             // Filesystem path resolution
             ArgMode::Paths | ArgMode::DirsOnly => {
                 let path_result = match mode {
-                    ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word, named_dirs),
-                    _ => path_resolve::resolve_path(word, named_dirs),
+                    ArgMode::DirsOnly => path_resolve::resolve_path_dirs_only(word, named_dirs, dir_stack),
+                    _ => path_resolve::resolve_path(word, named_dirs, dir_stack),
                 };
                 match path_result {
                     path_resolve::PathResult::Resolved(resolved) => {
@@ -1508,7 +1509,7 @@ pub(super) fn resolve_paths_in_words(
             // Normal: only resolve path-like words against the filesystem
             ArgMode::Normal => {
                 if looks_like_path(word) || path_resolve::looks_like_named_dir_ref(word, named_dirs) {
-                    match path_resolve::resolve_path(word, named_dirs) {
+                    match path_resolve::resolve_path(word, named_dirs, dir_stack) {
                         path_resolve::PathResult::Resolved(resolved) => {
                             result.push(escape_resolved_path(word, &resolved));
                         }

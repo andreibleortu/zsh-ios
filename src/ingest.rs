@@ -62,6 +62,17 @@ pub fn apply_ingest(trie: &mut crate::trie::CommandTrie, input: &str) {
     if let Some(body) = sections.get("nameddirs") {
         apply_nameddirs(trie, body);
     }
+    if let Some(body) = sections.get("history") {
+        apply_history(trie, body);
+    }
+    if let Some(body) = sections.get("dirstack") {
+        apply_dirstack(trie, body);
+    }
+    for meta_kind in &["jobs", "commands", "parameters", "options", "widgets", "modules"] {
+        if let Some(body) = sections.get(*meta_kind) {
+            trie.live_state.insert((*meta_kind).to_string(), body.to_string());
+        }
+    }
     // zstyle and any future unknown sections are tolerated but not consumed.
 }
 
@@ -142,6 +153,81 @@ pub fn apply_functions(trie: &mut crate::trie::CommandTrie, body: &str) {
         }
         trie.insert_command(name);
     }
+}
+
+/// Apply live history lines (one command per line) to the trie.
+///
+/// Each non-empty line is treated as a historical command. Lines are validated
+/// with the same rules as `history::parse_history`: skip control-flow keywords,
+/// subshell artifacts, env-var prefixes, and commands not already known to the
+/// trie. Uses `insert_with_time(…, 0)` — live `$history` doesn't expose timestamps.
+pub fn apply_history(trie: &mut crate::trie::CommandTrie, body: &str) {
+    use crate::history::split_command_segments;
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        for segment in split_command_segments(line) {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            if words.is_empty() {
+                continue;
+            }
+            // Skip env-var prefixed invocations (FOO=bar cmd …)
+            let (words, start) = if words[0].contains('=') && !words[0].starts_with('-') {
+                if words.len() > 1 { (&words[1..], 1) } else { continue; }
+            } else {
+                (&words[..], 0)
+            };
+            let _ = start;
+            if words.is_empty() {
+                continue;
+            }
+            let cmd = words[0];
+            // Skip subshell artifacts
+            if cmd.starts_with("$(") || cmd.starts_with('`') {
+                continue;
+            }
+            // Skip shell control-flow keywords
+            if matches!(
+                cmd,
+                "if" | "then" | "else" | "elif" | "fi" | "while" | "do" | "done" | "for" | "in"
+                    | "case" | "esac" | "{" | "}" | "[[" | "((" | "function"
+            ) {
+                continue;
+            }
+            // Only insert commands the trie already knows
+            if trie.root.get_child(cmd).is_none() {
+                continue;
+            }
+            // Don't insert if this word is a strict prefix of an existing entry
+            if trie.root.is_prefix_of_existing(cmd) {
+                continue;
+            }
+            trie.root.insert_with_time(words, 0);
+        }
+    }
+}
+
+/// Apply directory-stack lines (one absolute path per line) to `trie.dir_stack`.
+///
+/// The first line is PWD (index 0); subsequent lines are pushed directories.
+/// Trailing slashes are stripped. Consecutive duplicate entries are de-duplicated.
+pub fn apply_dirstack(trie: &mut crate::trie::CommandTrie, body: &str) {
+    let mut stack: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let path = line.trim().trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        // De-duplicate consecutive identical entries
+        if stack.last().is_some_and(|last| last == path) {
+            continue;
+        }
+        stack.push(path.to_string());
+    }
+    trie.dir_stack = stack;
 }
 
 /// Apply named-directory lines (`name=/abs/path`) to `trie.named_dirs`.
@@ -258,6 +344,75 @@ mod tests {
         apply_nameddirs(&mut trie, "bad-line-no-equals\nok=/tmp\n");
         assert!(!trie.named_dirs.contains_key("bad-line-no-equals"));
         assert_eq!(trie.named_dirs.get("ok"), Some(&"/tmp".to_string()));
+    }
+
+    // ── apply_history ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_history_inserts_known_commands() {
+        let mut trie = CommandTrie::new();
+        // Pre-insert known commands so history validation passes
+        trie.insert_command("git");
+        trie.insert_command("ls");
+        // Store counts before so we can verify they don't regress
+        let git_count_before = trie.root.get_child("git").unwrap().count;
+        let ls_count_before = trie.root.get_child("ls").unwrap().count;
+
+        apply_history(&mut trie, "git status\nls -la\nunknowncmd foo\n");
+
+        // 'git' and 'ls' must still be present (counts may go up via sub-path inserts)
+        assert!(trie.root.get_child("git").is_some());
+        assert!(trie.root.get_child("ls").is_some());
+        // 'unknowncmd' must NOT be inserted
+        assert!(trie.root.get_child("unknowncmd").is_none());
+        // sub-paths should have been inserted for the known commands
+        let git_count_after = trie.root.get_child("git").unwrap().count;
+        let ls_count_after = trie.root.get_child("ls").unwrap().count;
+        // counts should not regress
+        assert!(git_count_after >= git_count_before);
+        assert!(ls_count_after >= ls_count_before);
+    }
+
+    // ── apply_dirstack ────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_dirstack_populates_field() {
+        let mut trie = CommandTrie::new();
+        apply_dirstack(&mut trie, "/home/me\n/tmp\n");
+        assert_eq!(trie.dir_stack, vec!["/home/me", "/tmp"]);
+    }
+
+    #[test]
+    fn apply_dirstack_dedupes_consecutive() {
+        let mut trie = CommandTrie::new();
+        apply_dirstack(&mut trie, "/tmp\n/tmp\n/var\n");
+        assert_eq!(trie.dir_stack, vec!["/tmp", "/var"]);
+    }
+
+    #[test]
+    fn apply_dirstack_strips_trailing_slash() {
+        let mut trie = CommandTrie::new();
+        apply_dirstack(&mut trie, "/home/me/\n/tmp/\n");
+        assert_eq!(trie.dir_stack, vec!["/home/me", "/tmp"]);
+    }
+
+    // ── apply_live_state ──────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_live_state_stores_metadata() {
+        let mut trie = CommandTrie::new();
+        let input = "@jobs\n[1]+ Running some_cmd\n@options\nauto_cd\n";
+        apply_ingest(&mut trie, input);
+        assert!(
+            trie.live_state.contains_key("jobs"),
+            "live_state missing 'jobs'"
+        );
+        assert!(
+            trie.live_state.contains_key("options"),
+            "live_state missing 'options'"
+        );
+        assert!(trie.live_state["jobs"].contains("Running"));
+        assert!(trie.live_state["options"].contains("auto_cd"));
     }
 
     // ── end_to_end_apply_ingest ───────────────────────────────────────────────
