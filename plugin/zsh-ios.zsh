@@ -32,6 +32,18 @@ _zsh_ios_read_picker_key() {
     fi
 }
 
+# Picker keystroke source with a timeout (for multi-byte escape sequences).
+# _ms is the timeout in milliseconds; non-zero return = timed out / no char.
+_zsh_ios_read_picker_key_timeout() {
+    local _var="$1" _ms="$2"
+    local _secs=$(( _ms / 1000.0 ))
+    if [[ -n "$_ZSH_IOS_TEST_INPUT_FD" ]]; then
+        read -r -k 1 -t "$_secs" -u "$_ZSH_IOS_TEST_INPUT_FD" "$_var"
+    else
+        read -r -k 1 -t "$_secs" "$_var" </dev/tty
+    fi
+}
+
 # --- Guard: check if binary exists ---
 if ! command -v "$ZSH_IOS_BIN" &>/dev/null; then
     echo "zsh-ios: binary not found in PATH. Run install.sh or cargo install --path ." >&2
@@ -692,8 +704,51 @@ _zsh_ios_handle_ambiguity() {
                     fi
                 fi
                 ;;
+            $'\x1b')
+                # Possibly an ANSI escape sequence (arrow keys send ESC [ A/B/C/D).
+                # Peek at the next two bytes with a short timeout so a lone Esc
+                # (which has nothing following it) is still treated as cancel.
+                local _zio_esc_next _zio_esc_code
+                if _zsh_ios_read_picker_key_timeout _zio_esc_next 50 && [[ "$_zio_esc_next" == '[' ]]; then
+                    if _zsh_ios_read_picker_key_timeout _zio_esc_code 50; then
+                        case "$_zio_esc_code" in
+                            A|D)
+                                # Up / Left — move to previous option (wraps).
+                                choice=""
+                                (( cycle_idx = (cycle_idx + max - 2) % max + 1 ))
+                                _zsh_ios_pick_redraw_cycle
+                                ;;
+                            B|C)
+                                # Down / Right — move to next option (same as Tab).
+                                choice=""
+                                (( cycle_idx = cycle_idx % max + 1 ))
+                                _zsh_ios_pick_redraw_cycle
+                                ;;
+                            *)
+                                # Unrecognised escape sequence — cancel.
+                                echo ""
+                                choice=""
+                                cycle_idx=0
+                                break
+                                ;;
+                        esac
+                    else
+                        # ESC [ but no third byte — cancel.
+                        echo ""
+                        choice=""
+                        cycle_idx=0
+                        break
+                    fi
+                else
+                    # Lone ESC (nothing followed within timeout) — cancel.
+                    echo ""
+                    choice=""
+                    cycle_idx=0
+                    break
+                fi
+                ;;
             *)
-                # Any non-digit, non-enter, non-backspace, non-tab cancels.
+                # Any non-digit, non-enter, non-backspace, non-tab, non-esc cancels.
                 echo ""
                 choice=""
                 cycle_idx=0
