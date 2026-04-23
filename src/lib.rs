@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod locks;
 pub mod path_resolve;
 pub mod pins;
+pub mod presets;
 pub mod regex_args;
 pub mod resolve;
 pub mod runtime_cache;

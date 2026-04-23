@@ -247,9 +247,21 @@ a simpler, consistent output format.
 
 ## Configuration profiles
 
+Apply any of these with the `zsh-ios preset` subcommand:
+
+```
+zsh-ios preset                 # list presets
+zsh-ios preset power --show    # print the YAML without writing
+zsh-ios preset power           # back up existing and write
+zsh-ios preset power --force   # skip the backup
+```
+
 ### Deterministic / reproducible (for CI, shared servers)
 
 ```yaml
+# zsh-ios — deterministic / reproducible profile
+# Resolution never depends on per-machine history; ties always surface as a
+# picker rather than a silent pick.
 disable_learning: true
 disable_statistics: true
 disable_sibling_context: true
@@ -265,6 +277,10 @@ produces the same resolution regardless of who ran what before.
 ### Privacy-conscious (no worker, no build-time shell exec)
 
 ```yaml
+# zsh-ios — privacy-conscious profile
+# No background worker, no build-time shell exec, no dynamic harvest.
+# Live `?` completion via the Rust binary's own subprocess calls
+# (git, docker, etc.) still works.
 disable_worker: true
 disable_build_time_shell_exec: true
 disable_runtime_resolvers:
@@ -282,6 +298,9 @@ Resolution still works fully; completion hints are less rich.
 ### Power user (all defaults, aggressive statistics)
 
 ```yaml
+# zsh-ios — power user profile
+# Reduced dominance margin so the stats tiebreaker is more willing to
+# auto-pick. Git branch/tag lists refreshed more frequently.
 dominance_margin: 1.01
 force_picker_at_candidates: 0
 max_completions_shown: 500

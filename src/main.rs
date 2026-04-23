@@ -100,6 +100,19 @@ enum Commands {
     /// Read a harvest capture from stdin and fold _regex_arguments specs into the trie
     #[command(name = "regex-args-ingest")]
     RegexArgsIngest,
+    /// Show or apply a config preset to $XDG_CONFIG_HOME/zsh-ios/config.yaml.
+    /// With no name: list available presets.
+    /// With a name: apply (backs up existing config.yaml first).
+    Preset {
+        /// Preset name: deterministic | privacy | power
+        name: Option<String>,
+        /// Print the preset YAML to stdout without writing to config.yaml.
+        #[arg(long)]
+        show: bool,
+        /// Skip backup + existing-file prompt. Still writes to the real path.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -123,6 +136,7 @@ fn main() {
         Commands::Explain { line } => cmd_explain(&line.join(" ")),
         Commands::Ingest => ingest::cmd_ingest(),
         Commands::RegexArgsIngest => cmd_regex_args_ingest(),
+        Commands::Preset { name, show, force } => presets::cmd_preset(name.as_deref(), show, force),
     }
 }
 
@@ -218,7 +232,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
-        "status", "explain", "ingest", "regex-args-ingest",
+        "status", "explain", "ingest", "regex-args-ingest", "preset",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }

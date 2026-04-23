@@ -397,6 +397,104 @@ fn bang_prefixed_resolve_is_passthrough() {
     }
 }
 
+// ── preset subcommand ────────────────────────────────────────────────────────
+
+fn config_yaml_of(home: &Path) -> PathBuf {
+    config_dir_of(home).join("config.yaml")
+}
+
+#[test]
+fn preset_no_name_lists_presets() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, stdout, _) = run(cmd_in(td.path()).arg("preset"));
+    assert_eq!(code, 0, "preset with no args should exit 0");
+    assert!(stdout.contains("deterministic"), "stdout: {}", stdout);
+    assert!(stdout.contains("privacy"), "stdout: {}", stdout);
+    assert!(stdout.contains("power"), "stdout: {}", stdout);
+}
+
+#[test]
+fn preset_show_prints_yaml() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, stdout, _) = run(cmd_in(td.path()).args(["preset", "deterministic", "--show"]));
+    assert_eq!(code, 0, "preset --show should exit 0");
+    assert!(
+        stdout.contains("disable_statistics: true"),
+        "stdout: {}",
+        stdout
+    );
+    // --show must not write any file.
+    assert!(
+        !config_yaml_of(td.path()).exists(),
+        "config.yaml should not be written by --show"
+    );
+}
+
+#[test]
+fn preset_apply_writes_file() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(cmd_in(td.path()).args(["preset", "deterministic", "--force"]));
+    assert_eq!(code, 0, "preset --force should exit 0; stderr: {}", stderr);
+    let path = config_yaml_of(td.path());
+    assert!(path.exists(), "config.yaml should have been written");
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("disable_statistics: true"),
+        "written file: {}",
+        content
+    );
+    // Verify it parses cleanly via UserConfig.
+    // (We can't call UserConfig directly here, but we can run `status` to
+    //  confirm the binary loads it without errors.)
+    let (code, _, stderr) = run(cmd_in(td.path()).arg("status"));
+    assert_eq!(code, 0, "status after preset apply: {}", stderr);
+}
+
+#[test]
+fn preset_apply_backs_up_existing() {
+    let td = tempfile::tempdir().unwrap();
+    // Pre-write a recognisable config.
+    let cfg_dir = config_dir_of(td.path());
+    fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg_path = cfg_dir.join("config.yaml");
+    let original = "disable_learning: true\n";
+    fs::write(&cfg_path, original).unwrap();
+
+    // Apply a preset without --force; it should back up first.
+    let (code, _, stderr) = run(cmd_in(td.path()).args(["preset", "privacy"]));
+    assert_eq!(code, 0, "preset privacy failed: {}", stderr);
+    assert!(
+        stderr.contains("Backed up"),
+        "expected backup message; stderr: {}",
+        stderr
+    );
+
+    // Find the .yaml.bak.<ts> file.
+    let backup = fs::read_dir(&cfg_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("config.yaml.bak.")
+        })
+        .expect("backup file not found");
+    let backup_content = fs::read_to_string(backup.path()).unwrap();
+    assert_eq!(backup_content, original, "backup content mismatch");
+}
+
+#[test]
+fn preset_unknown_name_errors() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(cmd_in(td.path()).args(["preset", "bogus"]));
+    assert_ne!(code, 0, "unknown preset should exit non-zero");
+    assert!(
+        stderr.contains("Unknown preset") || stderr.contains("bogus"),
+        "stderr: {}",
+        stderr
+    );
+}
+
 #[test]
 fn bang_prefixed_complete_is_empty() {
     let td = tempfile::tempdir().unwrap();
