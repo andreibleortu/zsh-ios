@@ -26,6 +26,12 @@ typeset -g _zsh_ios_ghost_prefix="  "
 typeset -g _zsh_ios_ghost_last_buffer=""
 typeset -g _zsh_ios_ghost_last_postdisplay=""
 typeset -g _zsh_ios_ghost_last_highlight=""
+# Set non-empty while a widget is mutating BUFFER (e.g. accept-line
+# substituting the resolved form). Any redraw that fires during that
+# window must NOT add a ghost — otherwise an entry set for the
+# pre-mutation BUFFER length ends up styling part of the expanded
+# BUFFER in the scrollback after the command runs.
+typeset -g _zsh_ios_ghost_suspended=0
 
 # Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
 # have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
@@ -286,11 +292,16 @@ _zsh_ios_quote_args() {
 
 # --- ZLE Widget: Enter key (resolve + execute) ---
 _zsh_ios_accept_line() {
+    # Suspend the ghost widget for the duration of this accept-line;
+    # any line-pre-redraw hook that fires during BUFFER mutation /
+    # finalization must leave POSTDISPLAY + region_highlight alone.
+    _zsh_ios_ghost_suspended=1
     POSTDISPLAY=""
-    if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
-        region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
-        _zsh_ios_ghost_last_highlight=""
-    fi
+    # Drop both the remembered entry AND any stray highlight that
+    # carries our style (covers the case where a mid-widget redraw
+    # added a new entry before we got here).
+    region_highlight=("${(@)region_highlight:#* * $_zsh_ios_ghost_style}")
+    _zsh_ios_ghost_last_highlight=""
     _zsh_ios_ghost_last_buffer=""
 
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
@@ -391,14 +402,14 @@ _zsh_ios_expand_or_complete() {
         0)
             _zsh_ios_last_tab_buffer=""
             if [[ "$output" != "$BUFFER" ]]; then
+                _zsh_ios_ghost_suspended=1
                 BUFFER="$output"
                 CURSOR=${#BUFFER}
                 POSTDISPLAY=""
-                if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
-                    region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
-                    _zsh_ios_ghost_last_highlight=""
-                fi
+                region_highlight=("${(@)region_highlight:#* * $_zsh_ios_ghost_style}")
+                _zsh_ios_ghost_last_highlight=""
                 _zsh_ios_ghost_last_buffer=""
+                _zsh_ios_ghost_suspended=0
             else
                 zle expand-or-complete
             fi
@@ -1650,6 +1661,11 @@ add-zle-hook-widget line-init _zsh_ios_worker_lazy_start 2>/dev/null
 # it here made the range mistakenly cover BUFFER + the start of POSTDISPLAY
 # while the tail of POSTDISPLAY stayed unstyled.)
 _zsh_ios_ghost_preview_widget() {
+    # While another widget is in the middle of mutating BUFFER (e.g.
+    # accept-line substituting the resolved form), we must not touch
+    # POSTDISPLAY or region_highlight — the widget will finalize them.
+    (( _zsh_ios_ghost_suspended )) && return 0
+
     # Drop any previous ghost entry before adding a fresh one.
     if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
         region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
@@ -1700,6 +1716,18 @@ _zsh_ios_ghost_preview_widget() {
 }
 
 add-zle-hook-widget line-pre-redraw _zsh_ios_ghost_preview_widget 2>/dev/null
+
+# Reset the suspend flag at the start of every new line. The flag was
+# set by accept-line / expand-or-complete to keep the ghost widget out
+# of the way while they mutated BUFFER; once the new prompt is live,
+# the flag must drop so the next line's ghost works normally.
+_zsh_ios_ghost_line_init() {
+    _zsh_ios_ghost_suspended=0
+    _zsh_ios_ghost_last_buffer=""
+    _zsh_ios_ghost_last_postdisplay=""
+    _zsh_ios_ghost_last_highlight=""
+}
+add-zle-hook-widget line-init _zsh_ios_ghost_line_init 2>/dev/null
 
 # --- Register widgets ---
 zle -N _zsh_ios_accept_line
