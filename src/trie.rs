@@ -237,6 +237,17 @@ pub const ARG_MODE_IPV6: u8 = 70;
 pub const ARG_MODE_MAC_ADDR: u8 = 71;
 pub const ARG_MODE_TIMEZONE: u8 = 72;
 
+// Git introspection (extended)
+pub const ARG_MODE_GIT_HEAD: u8 = 73;
+pub const ARG_MODE_GIT_BISECT: u8 = 74;
+pub const ARG_MODE_GIT_REMOTE_REF: u8 = 75;
+
+// Node/Python workspace
+pub const ARG_MODE_PNPM_WORKSPACE: u8 = 76;
+pub const ARG_MODE_LERNA_PACKAGE: u8 = 77;
+pub const ARG_MODE_YARN_WORKSPACE: u8 = 78;
+pub const ARG_MODE_PIPENV_SCRIPT: u8 = 79;
+
 /// Returns a short human-readable label for an ARG_MODE_* constant.
 /// Returns "?" for unknown values.
 pub fn arg_mode_name(mode: u8) -> &'static str {
@@ -313,6 +324,13 @@ pub fn arg_mode_name(mode: u8) -> &'static str {
         ARG_MODE_IPV6 => "ipv6",
         ARG_MODE_MAC_ADDR => "mac-addr",
         ARG_MODE_TIMEZONE => "timezone",
+        ARG_MODE_GIT_HEAD => "git-head",
+        ARG_MODE_GIT_BISECT => "git-bisect",
+        ARG_MODE_GIT_REMOTE_REF => "git-remote-ref",
+        ARG_MODE_PNPM_WORKSPACE => "pnpm-workspace",
+        ARG_MODE_LERNA_PACKAGE => "lerna-package",
+        ARG_MODE_YARN_WORKSPACE => "yarn-workspace",
+        ARG_MODE_PIPENV_SCRIPT => "pipenv-script",
         _ => "?",
     }
 }

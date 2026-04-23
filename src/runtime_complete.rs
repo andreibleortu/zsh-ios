@@ -183,30 +183,164 @@ fn parse_known_hosts(content: &str) -> Vec<String> {
     out
 }
 
-/// Parse `~/.ssh/config` `Host` aliases. Wildcards (`*`, `?`) and negations
-/// (`!foo`) are skipped since they aren't real hostnames.
-fn parse_ssh_config(content: &str) -> Vec<String> {
+/// Minimal glob expansion for SSH `Include` directives: expands `*` and `?` in the
+/// filename component only. Does not support recursive `**`. If the path is a plain
+/// file (no wildcards) it is returned as-is (existence not checked; caller handles it).
+fn expand_simple_glob(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let file_name = match path.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return vec![path.to_path_buf()],
+    };
+    if !file_name.contains('*') && !file_name.contains('?') {
+        return vec![path.to_path_buf()];
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut matched: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            simple_glob_match(&file_name, &name_str)
+        })
+        .map(|e| e.path())
+        .collect();
+    matched.sort();
+    matched
+}
+
+/// Minimal glob matcher supporting `*` (any sequence) and `?` (any single char).
+fn simple_glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let mut dp = vec![vec![false; n.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=p.len() {
+        for j in 1..=n.len() {
+            if p[i - 1] == '*' {
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if p[i - 1] == '?' || p[i - 1] == n[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+    dp[p.len()][n.len()]
+}
+
+/// Core SSH config parser. Handles `Host`, `Match host`, and `Include` directives.
+///
+/// `dir_ctx` is the directory to resolve relative `Include` paths against.
+/// `visited` tracks already-processed files to prevent infinite loops.
+/// `depth` limits recursion depth.
+fn parse_ssh_config_core(
+    content: &str,
+    dir_ctx: &std::path::Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    depth: u8,
+) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+
+        // Include directive — recursively expand referenced files.
         if let Some(rest) = trimmed
-            .strip_prefix("Host ")
-            .or_else(|| trimmed.strip_prefix("Host\t"))
-            .or_else(|| trimmed.strip_prefix("host "))
-            .or_else(|| trimmed.strip_prefix("host\t"))
+            .strip_prefix("Include ")
+            .or_else(|| trimmed.strip_prefix("Include\t"))
         {
+            if depth < 16 {
+                let pattern = rest.trim();
+                // Expand `~` as home dir.
+                let expanded: std::path::PathBuf = if pattern.starts_with("~/") {
+                    dirs::home_dir()
+                        .map(|h| h.join(&pattern[2..]))
+                        .unwrap_or_else(|| std::path::PathBuf::from(pattern))
+                } else if pattern.starts_with('/') {
+                    std::path::PathBuf::from(pattern)
+                } else {
+                    dir_ctx.join(pattern)
+                };
+                // Simple glob expansion: if the filename component contains `*` or `?`,
+                // list the parent directory and match against the pattern manually.
+                let paths: Vec<std::path::PathBuf> =
+                    expand_simple_glob(&expanded);
+                for p in paths {
+                    let canonical = p.canonicalize().unwrap_or(p.clone());
+                    if visited.contains(&canonical) {
+                        continue;
+                    }
+                    visited.insert(canonical);
+                    if let Ok(sub_content) = std::fs::read_to_string(&p) {
+                        let sub_dir = p.parent().unwrap_or(dir_ctx);
+                        out.extend(parse_ssh_config_core(&sub_content, sub_dir, visited, depth + 1));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Host keyword (case-insensitive first word).
+        let is_host_line = trimmed.starts_with("Host ")
+            || trimmed.starts_with("Host\t")
+            || trimmed.starts_with("host ")
+            || trimmed.starts_with("host\t");
+
+        if is_host_line {
+            let rest = &trimmed[5..]; // skip "Host " or "host "
             for alias in rest.split_whitespace() {
-                if alias.contains('*') || alias.contains('?') || alias.starts_with('!') {
+                // Skip pure wildcards (`*` alone) and negations.
+                if alias.starts_with('!') || alias == "*" {
                     continue;
                 }
+                // Include patterns like `*.corp` and `dev-*` verbatim — they are
+                // useful partial completions for the user to see.
                 out.push(alias.to_string());
+            }
+            continue;
+        }
+
+        // Match host <patterns> — treat the host patterns as additional hosts.
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("match ") {
+            // Find `host` keyword inside the Match criteria.
+            let rest = &trimmed[6..];
+            let mut words = rest.split_whitespace();
+            while let Some(word) = words.next() {
+                if word.eq_ignore_ascii_case("host")
+                    && let Some(hosts_val) = words.next() {
+                        for h in hosts_val.split(',') {
+                            let h = h.trim();
+                            if !h.is_empty() && !h.starts_with('!') && h != "*" {
+                                out.push(h.to_string());
+                            }
+                        }
+                    }
             }
         }
     }
     out
+}
+
+/// Parse `~/.ssh/config` `Host` aliases. Handles `Host`, `Match host`, and
+/// `Include` directives. Pure wildcards (`*` alone) and negations (`!foo`) are
+/// skipped. Partial patterns like `*.corp` or `dev-*` are included verbatim as
+/// they still aid completion.
+fn parse_ssh_config(content: &str) -> Vec<String> {
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".ssh"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".ssh"));
+    let mut visited = std::collections::HashSet::new();
+    parse_ssh_config_core(content, &dir, &mut visited, 0)
 }
 
 // --- Network interfaces ---
@@ -379,6 +513,139 @@ pub fn git_commits() -> Vec<String> {
 
 pub fn git_reflog_list() -> Vec<String> {
     git_query(&["reflog", "--format=%gd", "--max-count=100"])
+}
+
+pub fn git_head_refs() -> Vec<String> {
+    let mut refs = Vec::new();
+    // Try to get the current branch name; falls back to the commit hash when detached.
+    let branch_lines = git_query(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    if let Some(branch) = branch_lines.into_iter().next()
+        && !branch.is_empty() && branch != "HEAD"
+    {
+        refs.push(branch);
+    }
+    // Always append standard symbolic refs useful with git reset / git diff etc.
+    for sym in ["HEAD", "HEAD~1", "HEAD~2", "HEAD^", "@{u}", "ORIG_HEAD", "FETCH_HEAD"] {
+        refs.push(sym.to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// Parse the terms used by an active git bisect session.
+/// Returns the good/bad term names from `.git/BISECT_TERMS` when present,
+/// plus the static subcommands (`start`, `reset`, `skip`, …).
+pub fn parse_bisect_terms(bisect_terms: &str) -> (String, String) {
+    let mut lines = bisect_terms.lines();
+    let good = lines.next().unwrap_or("good").trim().to_string();
+    let bad = lines.next().unwrap_or("bad").trim().to_string();
+    let good = if good.is_empty() { "good".to_string() } else { good };
+    let bad = if bad.is_empty() { "bad".to_string() } else { bad };
+    (good, bad)
+}
+
+pub fn git_bisect_terms() -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "start".into(),
+        "reset".into(),
+        "skip".into(),
+        "log".into(),
+        "view".into(),
+        "replay".into(),
+    ];
+
+    // Detect whether a bisect is active and load custom terms.
+    let git_dir_lines = git_query(&["rev-parse", "--git-dir"]);
+    if let Some(git_dir) = git_dir_lines.into_iter().next() {
+        let git_dir = std::path::PathBuf::from(git_dir.trim());
+
+        // Custom term names (only present when `git bisect start --term-good/bad` was used).
+        if let Ok(content) = std::fs::read_to_string(git_dir.join("BISECT_TERMS")) {
+            let (good, bad) = parse_bisect_terms(&content);
+            if !out.contains(&good) { out.push(good); }
+            if !out.contains(&bad) { out.push(bad); }
+        } else {
+            // Default terms.
+            for t in ["good", "bad"] {
+                if !out.contains(&t.to_string()) {
+                    out.push(t.to_string());
+                }
+            }
+        }
+
+        // If a bisect is active, include recent commits from BISECT_LOG.
+        if let Ok(log) = std::fs::read_to_string(git_dir.join("BISECT_LOG")) {
+            for line in log.lines() {
+                let line = line.trim();
+                // Lines like: `# good: [<hash>] msg` or `# bad: [<hash>] msg`
+                if let Some(rest) = line.strip_prefix("# ")
+                    && let Some(bracket) = rest.find('[') {
+                        let after = &rest[bracket + 1..];
+                        if let Some(end) = after.find(']') {
+                            let hash = after[..end].trim();
+                            if !hash.is_empty() {
+                                out.push(hash.to_string());
+                            }
+                        }
+                    }
+            }
+        }
+    } else {
+        // Not in a repo — still return the static subcommands + default terms.
+        for t in ["good", "bad"] {
+            if !out.contains(&t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Fetch refs from a remote using `git ls-remote --refs <remote>`.
+/// Returns branch and tag names with the `refs/heads/` and `refs/tags/` prefixes stripped.
+/// Returns an empty vec if the remote cannot be determined from `ctx.prior_words`.
+pub fn git_remote_refs(ctx: &Ctx) -> Vec<String> {
+    // Walk prior_words to find a word matching a known remote name.
+    let remotes = git_remotes();
+    if remotes.is_empty() {
+        return Vec::new();
+    }
+    let remote = ctx.prior_words.iter().find(|w| remotes.contains(w)).cloned();
+    let remote = match remote {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    let output = match std::process::Command::new("git")
+        .args(["ls-remote", "--refs", &remote])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
+        _ => return Vec::new(),
+    };
+
+    let mut refs = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // Each line: `<hash>\t<refname>`
+        if let Some((_hash, refname)) = line.split_once('\t') {
+            let name = refname.trim();
+            let short = name
+                .strip_prefix("refs/heads/")
+                .or_else(|| name.strip_prefix("refs/tags/"))
+                .unwrap_or(name);
+            if !short.is_empty() {
+                refs.push(short.to_string());
+            }
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 // --- _call_program dynamic runner ---
@@ -811,6 +1078,45 @@ impl TypeResolver for GitReflogResolver {
     }
     fn id(&self) -> &'static str {
         "git-reflog"
+    }
+}
+
+pub struct GitHeadResolver;
+impl TypeResolver for GitHeadResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_head_refs()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+    fn id(&self) -> &'static str {
+        "git-head"
+    }
+}
+
+pub struct GitBisectResolver;
+impl TypeResolver for GitBisectResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        git_bisect_terms()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "git-bisect"
+    }
+}
+
+pub struct GitLsRemoteResolver;
+impl TypeResolver for GitLsRemoteResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        git_remote_refs(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(120)
+    }
+    fn id(&self) -> &'static str {
+        "git-remote-ref"
     }
 }
 
@@ -2258,6 +2564,309 @@ impl TypeResolver for RakeTaskResolver {
     }
 }
 
+// --- Workspace resolvers (pnpm, lerna, yarn, pipenv) ---
+
+// ---- PnpmWorkspaceResolver ----
+
+/// Parse the `packages:` list from `pnpm-workspace.yaml` content.
+/// Each entry is a glob pattern; we return them all for downstream glob-expansion.
+pub fn parse_pnpm_workspace_yaml(content: &str) -> Vec<String> {
+    // Use serde_yaml_ng to parse the YAML properly.
+    let doc: serde_yaml_ng::Value = match serde_yaml_ng::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let packages = match doc.get("packages").and_then(|v| v.as_sequence()) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    packages
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Walk up from `start`, find `pnpm-workspace.yaml`, parse package globs,
+/// and return the basenames of all matching directories.
+pub fn pnpm_workspace_packages(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(workspace_file) = find_ancestor_file(&start, "pnpm-workspace.yaml") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&workspace_file) else { return Vec::new() };
+    let workspace_root = match workspace_file.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let patterns = parse_pnpm_workspace_yaml(&content);
+    collect_workspace_package_names(&workspace_root, &patterns)
+}
+
+/// Given a workspace root and a list of glob patterns (e.g. `packages/*`, `apps/web`),
+/// return the basenames of all matching directories.
+fn collect_workspace_package_names(root: &std::path::Path, patterns: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let abs_pattern = root.join(pattern);
+        for p in expand_simple_glob(&abs_pattern) {
+            if p.is_dir()
+                && let Some(name) = p.file_name()
+            {
+                names.push(name.to_string_lossy().to_string());
+            }
+        }
+        // Also try as a plain path (non-glob).
+        let plain = root.join(pattern);
+        if plain.is_dir()
+            && let Some(name) = plain.file_name()
+        {
+            let n = name.to_string_lossy().to_string();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub struct PnpmWorkspaceResolver;
+impl TypeResolver for PnpmWorkspaceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        pnpm_workspace_packages(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "pnpm-workspace"
+    }
+}
+
+// ---- LernaWorkspaceResolver ----
+
+/// Parse the `packages` array from a `lerna.json` file.
+/// Uses the same line-based approach as other JSON parsers to avoid a dep.
+pub fn parse_lerna_json(content: &str) -> Vec<String> {
+    // Locate "packages" key and extract the array contents.
+    let section_key = "\"packages\"";
+    let Some(key_pos) = content.find(section_key) else { return Vec::new() };
+    let after_key = &content[key_pos + section_key.len()..];
+    let Some(open) = after_key.find('[') else { return Vec::new() };
+    let block_start = open + 1;
+    let mut depth = 1usize;
+    let mut end = block_start;
+    for (i, ch) in after_key[block_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = block_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &after_key[block_start..end];
+    let mut patterns = Vec::new();
+    let mut remaining = block;
+    while let Some(q_open) = remaining.find('"') {
+        remaining = &remaining[q_open + 1..];
+        let Some(q_close) = remaining.find('"') else { break };
+        let s = &remaining[..q_close];
+        remaining = &remaining[q_close + 1..];
+        if !s.is_empty() {
+            patterns.push(s.to_string());
+        }
+    }
+    patterns
+}
+
+pub fn lerna_packages(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(lerna_file) = find_ancestor_file(&start, "lerna.json") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&lerna_file) else { return Vec::new() };
+    let workspace_root = match lerna_file.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let patterns = parse_lerna_json(&content);
+    collect_workspace_package_names(&workspace_root, &patterns)
+}
+
+pub struct LernaWorkspaceResolver;
+impl TypeResolver for LernaWorkspaceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        lerna_packages(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "lerna-package"
+    }
+}
+
+// ---- YarnWorkspaceResolver ----
+
+/// Extract workspace package globs from a `package.json` file.
+/// Supports `"workspaces": [...]` and `"workspaces": {"packages": [...]}`.
+pub fn parse_yarn_workspaces(content: &str) -> Vec<String> {
+    let section_key = "\"workspaces\"";
+    let Some(key_pos) = content.find(section_key) else { return Vec::new() };
+    let after_key = &content[key_pos + section_key.len()..];
+    let after_colon = match after_key.find(':') {
+        Some(i) => after_key[i + 1..].trim_start(),
+        None => return Vec::new(),
+    };
+    // If it's an array, parse directly.
+    if after_colon.starts_with('[') {
+        return parse_json_string_array(after_colon);
+    }
+    // If it's an object, look for "packages" key inside.
+    if after_colon.starts_with('{') {
+        let inner_key = "\"packages\"";
+        if let Some(pkg_pos) = after_colon.find(inner_key) {
+            let after_pkg = &after_colon[pkg_pos + inner_key.len()..];
+            if let Some(colon) = after_pkg.find(':') {
+                let array_start = after_pkg[colon + 1..].trim_start();
+                if array_start.starts_with('[') {
+                    return parse_json_string_array(array_start);
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Parse a JSON `["a", "b", ...]` string array. Returns string contents.
+fn parse_json_string_array(text: &str) -> Vec<String> {
+    let Some(open) = text.find('[') else { return Vec::new() };
+    let block_start = open + 1;
+    let text = &text[block_start..];
+    let mut depth = 1usize;
+    let mut end = text.len();
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &text[..end];
+    let mut out = Vec::new();
+    let mut remaining = block;
+    while let Some(q_open) = remaining.find('"') {
+        remaining = &remaining[q_open + 1..];
+        let Some(q_close) = remaining.find('"') else { break };
+        let s = &remaining[..q_close];
+        remaining = &remaining[q_close + 1..];
+        if !s.is_empty() {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+pub fn yarn_workspace_packages(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    // Walk up to find a package.json with a "workspaces" field.
+    let mut dir = start.clone();
+    loop {
+        let pkg = dir.join("package.json");
+        if pkg.exists()
+            && let Ok(content) = std::fs::read_to_string(&pkg)
+        {
+            let patterns = parse_yarn_workspaces(&content);
+            if !patterns.is_empty() {
+                return collect_workspace_package_names(&dir, &patterns);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Vec::new()
+}
+
+pub struct YarnWorkspaceResolver;
+impl TypeResolver for YarnWorkspaceResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        yarn_workspace_packages(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "yarn-workspace"
+    }
+}
+
+// ---- PipenvScriptResolver ----
+
+/// Parse script names from the `[scripts]` section of a `Pipfile`.
+/// Uses the same line-based TOML parser as `parse_cargo_aliases`.
+pub fn parse_pipfile_scripts(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_scripts = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            let header = trimmed.trim_matches('[').trim_matches(']').trim();
+            in_scripts = header.eq_ignore_ascii_case("scripts");
+            continue;
+        }
+        if !in_scripts {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key_part = trimmed[..eq_pos].trim().trim_matches('"');
+            if !key_part.is_empty()
+                && !key_part.contains('.')
+                && key_part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                names.push(key_part.to_string());
+            }
+        }
+    }
+    names.truncate(500);
+    names
+}
+
+pub fn pipenv_scripts(ctx: &Ctx) -> Vec<String> {
+    let start = ctx.cwd.as_deref().map(|p| p.to_path_buf()).or_else(|| std::env::current_dir().ok());
+    let start = match start { Some(s) => s, None => return Vec::new() };
+    let Some(path) = find_ancestor_file(&start, "Pipfile") else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    parse_pipfile_scripts(&content)
+}
+
+pub struct PipenvScriptResolver;
+impl TypeResolver for PipenvScriptResolver {
+    fn list(&self, ctx: &Ctx) -> Vec<String> {
+        pipenv_scripts(ctx)
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+    fn id(&self) -> &'static str {
+        "pipenv-script"
+    }
+}
+
 // --- Shell introspection resolvers ---
 
 /// Run `zsh -c 'print -l ${(k)functions}'` and return the function names.
@@ -2443,6 +3052,9 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_GIT_ALIAS, Box::new(GitAliasResolver));
     r.register(ARG_MODE_GIT_COMMIT, Box::new(GitCommitResolver));
     r.register(ARG_MODE_GIT_REFLOG, Box::new(GitReflogResolver));
+    r.register(ARG_MODE_GIT_HEAD, Box::new(GitHeadResolver));
+    r.register(ARG_MODE_GIT_BISECT, Box::new(GitBisectResolver));
+    r.register(ARG_MODE_GIT_REMOTE_REF, Box::new(GitLsRemoteResolver));
     // Docker
     r.register(ARG_MODE_DOCKER_CONTAINER, Box::new(DockerContainerResolver));
     r.register(ARG_MODE_DOCKER_IMAGE, Box::new(DockerImageResolver));
@@ -2485,6 +3097,11 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_COMPOSER_SCRIPT, Box::new(ComposerScriptResolver));
     r.register(ARG_MODE_GRADLE_TASK, Box::new(GradleTaskResolver));
     r.register(ARG_MODE_RAKE_TASK, Box::new(RakeTaskResolver));
+    // Workspace resolvers
+    r.register(ARG_MODE_PNPM_WORKSPACE, Box::new(PnpmWorkspaceResolver));
+    r.register(ARG_MODE_LERNA_PACKAGE, Box::new(LernaWorkspaceResolver));
+    r.register(ARG_MODE_YARN_WORKSPACE, Box::new(YarnWorkspaceResolver));
+    r.register(ARG_MODE_PIPENV_SCRIPT, Box::new(PipenvScriptResolver));
     // Shell introspection
     r.register(ARG_MODE_SHELL_FUNCTION, Box::new(ShellFunctionResolver));
     r.register(ARG_MODE_SHELL_ALIAS, Box::new(ShellAliasResolver));
@@ -2557,6 +3174,13 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_NPM_PACKAGE => "<package>",
         trie::ARG_MODE_PIP_PACKAGE => "<package>",
         trie::ARG_MODE_CARGO_CRATE => "<crate>",
+        trie::ARG_MODE_GIT_HEAD => "<git-ref>",
+        trie::ARG_MODE_GIT_BISECT => "<bisect-term>",
+        trie::ARG_MODE_GIT_REMOTE_REF => "<remote-ref>",
+        trie::ARG_MODE_PNPM_WORKSPACE => "<workspace-package>",
+        trie::ARG_MODE_LERNA_PACKAGE => "<lerna-package>",
+        trie::ARG_MODE_YARN_WORKSPACE => "<workspace-package>",
+        trie::ARG_MODE_PIPENV_SCRIPT => "<pipenv-script>",
         _ => "<arg>",
     }
 }
@@ -2677,9 +3301,12 @@ host prod staging !excluded
         assert!(hosts.contains(&"beta".to_string()));
         assert!(hosts.contains(&"prod".to_string()));
         assert!(hosts.contains(&"staging".to_string()));
-        // Wildcards and negations filtered.
-        assert!(!hosts.iter().any(|h| h.contains('*')));
+        // Patterns like `*.internal` are now included verbatim (useful completion hint).
+        assert!(hosts.contains(&"*.internal".to_string()));
+        // Negations are always excluded.
         assert!(!hosts.iter().any(|h| h.starts_with('!')));
+        // Bare `*` alone is excluded.
+        assert!(!hosts.contains(&"*".to_string()));
     }
 
     // --- filter_prefix ---
@@ -4340,6 +4967,451 @@ task :default => :build
             ARG_MODE_COMPOSER_SCRIPT,
             ARG_MODE_GRADLE_TASK,
             ARG_MODE_RAKE_TASK,
+        ] {
+            assert!(r.contains(mode), "mode {} missing from registry", mode);
+        }
+    }
+
+    // ---- GitHeadResolver tests ----
+
+    #[test]
+    fn git_head_refs_in_repo_includes_standard_refs() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let refs = git_head_refs();
+        assert!(refs.contains(&"HEAD".to_string()), "refs: {:?}", refs);
+        assert!(refs.contains(&"HEAD~1".to_string()), "refs: {:?}", refs);
+        assert!(refs.contains(&"ORIG_HEAD".to_string()), "refs: {:?}", refs);
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn git_head_refs_tolerates_non_repo() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        // Must not panic; standard refs should still be present.
+        let refs = git_head_refs();
+        assert!(refs.contains(&"HEAD".to_string()), "refs: {:?}", refs);
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    // ---- GitBisectResolver tests ----
+
+    #[test]
+    fn parse_bisect_terms_defaults() {
+        let (good, bad) = parse_bisect_terms("");
+        assert_eq!(good, "good");
+        assert_eq!(bad, "bad");
+    }
+
+    #[test]
+    fn parse_bisect_terms_custom() {
+        let (good, bad) = parse_bisect_terms("fixed\nbroken\n");
+        assert_eq!(good, "fixed");
+        assert_eq!(bad, "broken");
+    }
+
+    #[test]
+    fn git_bisect_terms_includes_static_subcommands() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        let terms = git_bisect_terms();
+        for expected in ["start", "reset", "skip", "log"] {
+            assert!(terms.contains(&expected.to_string()), "missing {}, terms: {:?}", expected, terms);
+        }
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn git_bisect_terms_reads_custom_terms_from_file() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        // Create a fake BISECT_TERMS file in .git/
+        let git_dir_out = std::process::Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        let git_dir = String::from_utf8_lossy(&git_dir_out.stdout).trim().to_string();
+        std::fs::write(format!("{}/BISECT_TERMS", git_dir), "fixed\nbroken\n").unwrap();
+
+        let terms = git_bisect_terms();
+        assert!(terms.contains(&"fixed".to_string()), "terms: {:?}", terms);
+        assert!(terms.contains(&"broken".to_string()), "terms: {:?}", terms);
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    // ---- GitLsRemoteResolver tests ----
+
+    #[test]
+    fn git_remote_refs_without_remote_context_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        // No prior_words that match a remote → empty.
+        let ctx = crate::type_resolver::Ctx {
+            prior_words: vec!["git".to_string(), "push".to_string()],
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        // Repo has no remotes, so this should be empty regardless of prior_words content.
+        let refs = git_remote_refs(&ctx);
+        // Either empty (no remotes) or non-empty (remote found) — must not panic.
+        let _ = refs;
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn git_remote_refs_with_no_matching_remote_in_prior_words_returns_empty() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let td = setup_git_repo();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+
+        // prior_words doesn't contain any known remote name (no remotes in test repo).
+        let ctx = crate::type_resolver::Ctx {
+            prior_words: vec!["not-a-remote".to_string()],
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(git_remote_refs(&ctx).is_empty());
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    // ---- SSH config enhancement tests ----
+
+    #[test]
+    fn parse_ssh_config_core_basic_hosts() {
+        let content = "Host alpha beta\n    User me\nHost gamma\n";
+        let mut visited = std::collections::HashSet::new();
+        let td = tempfile::tempdir().unwrap();
+        let hosts = parse_ssh_config_core(content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"alpha".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"beta".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"gamma".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_core_include_resolves_sub_file() {
+        let td = tempfile::tempdir().unwrap();
+        // Sub-config with additional hosts.
+        std::fs::write(td.path().join("extra"), "Host extra-host\n").unwrap();
+        let content = format!("Host main-host\nInclude {}\n", td.path().join("extra").display());
+        let mut visited = std::collections::HashSet::new();
+        let hosts = parse_ssh_config_core(&content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"main-host".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"extra-host".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_core_include_loop_detection() {
+        // a includes b; b includes a — must not recurse infinitely.
+        let td = tempfile::tempdir().unwrap();
+        let a = td.path().join("a");
+        let b = td.path().join("b");
+        std::fs::write(&a, format!("Host a-host\nInclude {}\n", b.display())).unwrap();
+        std::fs::write(&b, format!("Host b-host\nInclude {}\n", a.display())).unwrap();
+        let content = std::fs::read_to_string(&a).unwrap();
+        let mut visited = std::collections::HashSet::new();
+        // Seed visited with `a` to simulate being called from `a`.
+        if let Ok(c) = a.canonicalize() { visited.insert(c); }
+        let hosts = parse_ssh_config_core(&content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"b-host".to_string()), "hosts: {:?}", hosts);
+        // a-host is in the content being parsed directly, not via Include.
+        assert!(hosts.contains(&"a-host".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_core_match_host_block() {
+        let content = "Match host *.corp\n    ProxyJump bastion\nHost dev-box\n";
+        let mut visited = std::collections::HashSet::new();
+        let td = tempfile::tempdir().unwrap();
+        let hosts = parse_ssh_config_core(content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"*.corp".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"dev-box".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_core_wildcard_star_alone_excluded() {
+        let content = "Host *\n    ServerAliveInterval 60\nHost specific\n";
+        let mut visited = std::collections::HashSet::new();
+        let td = tempfile::tempdir().unwrap();
+        let hosts = parse_ssh_config_core(content, td.path(), &mut visited, 0);
+        // Bare `*` should be excluded.
+        assert!(!hosts.contains(&"*".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"specific".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_core_wildcard_pattern_included() {
+        let content = "Host *.corp dev-*\n";
+        let mut visited = std::collections::HashSet::new();
+        let td = tempfile::tempdir().unwrap();
+        let hosts = parse_ssh_config_core(content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"*.corp".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"dev-*".to_string()), "hosts: {:?}", hosts);
+    }
+
+    #[test]
+    fn parse_ssh_config_negations_excluded() {
+        let content = "Host prod staging !excluded\n";
+        let mut visited = std::collections::HashSet::new();
+        let td = tempfile::tempdir().unwrap();
+        let hosts = parse_ssh_config_core(content, td.path(), &mut visited, 0);
+        assert!(hosts.contains(&"prod".to_string()), "hosts: {:?}", hosts);
+        assert!(hosts.contains(&"staging".to_string()), "hosts: {:?}", hosts);
+        assert!(!hosts.iter().any(|h| h.starts_with('!')), "hosts: {:?}", hosts);
+    }
+
+    // ---- simple_glob_match tests ----
+
+    #[test]
+    fn simple_glob_match_star() {
+        assert!(simple_glob_match("*.conf", "ssh.conf"));
+        assert!(simple_glob_match("*.conf", "a.conf"));
+        assert!(!simple_glob_match("*.conf", "ssh.toml"));
+    }
+
+    #[test]
+    fn simple_glob_match_question() {
+        assert!(simple_glob_match("conf.?", "conf.d"));
+        assert!(!simple_glob_match("conf.?", "conf.de"));
+    }
+
+    #[test]
+    fn simple_glob_match_exact() {
+        assert!(simple_glob_match("config", "config"));
+        assert!(!simple_glob_match("config", "configs"));
+    }
+
+    // ---- PnpmWorkspaceResolver tests ----
+
+    #[test]
+    fn parse_pnpm_workspace_yaml_basic() {
+        let yaml = "packages:\n  - packages/*\n  - apps/web\n";
+        let out = parse_pnpm_workspace_yaml(yaml);
+        assert!(out.contains(&"packages/*".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"apps/web".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_pnpm_workspace_yaml_no_packages_key() {
+        let yaml = "some_other_key:\n  - foo\n";
+        assert!(parse_pnpm_workspace_yaml(yaml).is_empty());
+    }
+
+    #[test]
+    fn parse_pnpm_workspace_yaml_malformed() {
+        assert!(parse_pnpm_workspace_yaml("not valid: [yaml: {").is_empty());
+    }
+
+    #[test]
+    fn pnpm_workspace_resolver_reads_workspace_yaml() {
+        let td = tempfile::tempdir().unwrap();
+        let pkg_dir = td.path().join("packages").join("mylib");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let yaml = "packages:\n  - packages/*\n";
+        std::fs::write(td.path().join("pnpm-workspace.yaml"), yaml).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = pnpm_workspace_packages(&ctx);
+        assert!(out.contains(&"mylib".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn pnpm_workspace_resolver_no_yaml_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(pnpm_workspace_packages(&ctx).is_empty());
+    }
+
+    // ---- LernaWorkspaceResolver tests ----
+
+    #[test]
+    fn parse_lerna_json_basic() {
+        let content = r#"{"version": "1.0", "packages": ["packages/*", "apps/web"]}"#;
+        let out = parse_lerna_json(content);
+        assert!(out.contains(&"packages/*".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"apps/web".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_lerna_json_no_packages_key() {
+        assert!(parse_lerna_json(r#"{"version": "1.0"}"#).is_empty());
+    }
+
+    #[test]
+    fn lerna_resolver_reads_lerna_json() {
+        let td = tempfile::tempdir().unwrap();
+        let pkg_dir = td.path().join("packages").join("utils");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let json = r#"{"packages": ["packages/*"]}"#;
+        std::fs::write(td.path().join("lerna.json"), json).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = lerna_packages(&ctx);
+        assert!(out.contains(&"utils".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn lerna_resolver_no_lerna_json_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(lerna_packages(&ctx).is_empty());
+    }
+
+    // ---- YarnWorkspaceResolver tests ----
+
+    #[test]
+    fn parse_yarn_workspaces_array_form() {
+        let json = r#"{"workspaces": ["packages/*", "apps/web"], "name": "root"}"#;
+        let out = parse_yarn_workspaces(json);
+        assert!(out.contains(&"packages/*".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"apps/web".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_yarn_workspaces_object_form() {
+        let json = r#"{"workspaces": {"packages": ["packages/*"]}, "name": "root"}"#;
+        let out = parse_yarn_workspaces(json);
+        assert!(out.contains(&"packages/*".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_yarn_workspaces_no_workspaces_key() {
+        let json = r#"{"name": "root", "version": "1.0"}"#;
+        assert!(parse_yarn_workspaces(json).is_empty());
+    }
+
+    #[test]
+    fn yarn_workspace_resolver_reads_package_json() {
+        let td = tempfile::tempdir().unwrap();
+        let pkg_dir = td.path().join("packages").join("core");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let json = r#"{"private": true, "workspaces": ["packages/*"]}"#;
+        std::fs::write(td.path().join("package.json"), json).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = yarn_workspace_packages(&ctx);
+        assert!(out.contains(&"core".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn yarn_workspace_resolver_no_workspaces_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        // package.json without workspaces key.
+        std::fs::write(td.path().join("package.json"), r#"{"name": "app"}"#).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(yarn_workspace_packages(&ctx).is_empty());
+    }
+
+    // ---- PipenvScriptResolver tests ----
+
+    #[test]
+    fn parse_pipfile_scripts_basic() {
+        let content = "\
+[packages]
+requests = \"*\"
+
+[scripts]
+start = \"python app.py\"
+test = \"pytest\"
+lint = \"flake8 .\"
+";
+        let out = parse_pipfile_scripts(content);
+        assert!(out.contains(&"start".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"lint".to_string()), "out: {:?}", out);
+        // Keys from other sections must not appear.
+        assert!(!out.contains(&"requests".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn parse_pipfile_scripts_no_scripts_section() {
+        let content = "[packages]\nrequests = \"*\"\n";
+        assert!(parse_pipfile_scripts(content).is_empty());
+    }
+
+    #[test]
+    fn parse_pipfile_scripts_case_insensitive_section_header() {
+        let content = "[Scripts]\nmyapp = \"python main.py\"\n";
+        let out = parse_pipfile_scripts(content);
+        assert!(out.contains(&"myapp".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn pipenv_script_resolver_reads_pipfile() {
+        let td = tempfile::tempdir().unwrap();
+        let content = "[scripts]\nstart = \"python app.py\"\ntest = \"pytest\"\n";
+        std::fs::write(td.path().join("Pipfile"), content).unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = pipenv_scripts(&ctx);
+        assert!(out.contains(&"start".to_string()), "out: {:?}", out);
+        assert!(out.contains(&"test".to_string()), "out: {:?}", out);
+    }
+
+    #[test]
+    fn pipenv_script_resolver_no_pipfile_returns_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = crate::type_resolver::Ctx {
+            cwd: Some(td.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(pipenv_scripts(&ctx).is_empty());
+    }
+
+    // ---- workspace + pipenv resolver registry check ----
+
+    #[test]
+    fn workspace_resolvers_in_registry() {
+        use crate::trie::*;
+        let mut r = crate::type_resolver::Registry::new();
+        register_builtins(&mut r);
+        for mode in [
+            ARG_MODE_GIT_HEAD,
+            ARG_MODE_GIT_BISECT,
+            ARG_MODE_GIT_REMOTE_REF,
+            ARG_MODE_PNPM_WORKSPACE,
+            ARG_MODE_LERNA_PACKAGE,
+            ARG_MODE_YARN_WORKSPACE,
+            ARG_MODE_PIPENV_SCRIPT,
         ] {
             assert!(r.contains(mode), "mode {} missing from registry", mode);
         }

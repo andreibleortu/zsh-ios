@@ -437,7 +437,7 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ("git diff", &[], Some(ARG_MODE_PATHS), &[]),
         (
             "git push",
-            &[(1, ARG_MODE_GIT_REMOTES), (2, ARG_MODE_GIT_BRANCHES)],
+            &[(1, ARG_MODE_GIT_REMOTES), (2, ARG_MODE_GIT_REMOTE_REF)],
             None,
             &[],
         ),
@@ -447,7 +447,12 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
             None,
             &[],
         ),
-        ("git fetch", &[(1, ARG_MODE_GIT_REMOTES)], None, &[]),
+        (
+            "git fetch",
+            &[(1, ARG_MODE_GIT_REMOTES), (2, ARG_MODE_GIT_REMOTE_REF)],
+            None,
+            &[],
+        ),
         ("git tag", &[(1, ARG_MODE_GIT_TAGS)], None, &[]),
         ("git stash", &[], None, &[]),
         ("git mv", &[(1, ARG_MODE_GIT_FILES), (2, ARG_MODE_PATHS)], None, &[]),
@@ -460,10 +465,11 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ),
         (
             "git reset",
-            &[(1, ARG_MODE_GIT_BRANCHES)],
+            &[(1, ARG_MODE_GIT_HEAD)],
             Some(ARG_MODE_PATHS),
             &[],
         ),
+        ("git bisect", &[(1, ARG_MODE_GIT_BISECT)], None, &[]),
         // kill — signals
         (
             "kill",
@@ -787,6 +793,14 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         ("git show", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
         ("git bisect good", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
         ("git bisect bad", &[(1, ARG_MODE_GIT_COMMIT)], None, &[]),
+
+        // --- pnpm / yarn workspaces ---
+        ("pnpm --filter", &[(1, ARG_MODE_PNPM_WORKSPACE)], None, &[]),
+        ("yarn workspace", &[(1, ARG_MODE_YARN_WORKSPACE)], None, &[]),
+        ("lerna run", &[], None, &[("--scope", ARG_MODE_LERNA_PACKAGE)]),
+
+        // --- pipenv ---
+        ("pipenv run", &[(1, ARG_MODE_PIPENV_SCRIPT)], None, &[]),
 
         // --- Executable / command-targeting utilities ---
         ("man", &[(1, ARG_MODE_EXECS_ONLY)], Some(ARG_MODE_EXECS_ONLY), &[]),

@@ -182,6 +182,15 @@ mod tests {
             ARG_MODE_SHELL_VAR,
             ARG_MODE_NAMED_DIR,
             ARG_MODE_HISTORY_ENTRY,
+            // Git introspection extended
+            ARG_MODE_GIT_HEAD,
+            ARG_MODE_GIT_BISECT,
+            ARG_MODE_GIT_REMOTE_REF,
+            // Workspace resolvers
+            ARG_MODE_PNPM_WORKSPACE,
+            ARG_MODE_LERNA_PACKAGE,
+            ARG_MODE_YARN_WORKSPACE,
+            ARG_MODE_PIPENV_SCRIPT,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }
