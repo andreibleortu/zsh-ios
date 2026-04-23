@@ -84,6 +84,42 @@ Files with `.bash` extension or no extension are parsed. The parser extracts:
 
 Existing Zsh and Fish data wins on conflicts.
 
+### carapace-spec YAML files (`carapace_completions.rs`)
+
+Directories scanned: `~/.config/carapace/specs/`, `/usr/share/carapace/specs/`, `/usr/local/share/carapace/specs/`.
+
+If the `carapace` binary is on PATH and `disable_build_time_shell_exec` is false, the scanner additionally shells to `carapace _list` to enumerate every builtin completer, then `carapace <cmd> _spec` to dump each as YAML. Dumps cache under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/<name>.yaml` keyed by `carapace --version` so upgrades invalidate automatically. The cached files are then read the same way as user-authored specs.
+
+Each spec's `name` / `description` / `flags` / `persistentflags` / `commands[]` / `completion.positional[N]` / `completion.flag[flag]` / `completion.positionalany` are recursively folded into `trie.root`, `trie.descriptions`, and `trie.arg_specs`. Action strings are resolved via:
+
+- `$files` / `$files(pattern)` → `ARG_MODE_PATHS`
+- `$directories` → `ARG_MODE_DIRS_ONLY`
+- `$list(sep,items)` → static list (delimiter from first character)
+- `$(cmd args)` → `call_program` with argv from `shlex::split`
+- `["foo", "bar"]` / `["foo\tdescription"]` → static list (descriptions captured separately)
+
+Comma-separated flag aliases (`-v, --verbose`) populate `flag_aliases` groups. Persistent flags inherit through the subcommand tree. Existing Zsh / Fish / Bash data wins on conflict.
+
+### withfig/autocomplete (Fig) JSON specs (`fig_completions.rs` + `data/fig_dump.js`)
+
+Fig's 500+ completion specs are written in TypeScript, so the pipeline is split:
+
+1. **One-time fetch** (`zsh-ios fig-fetch`): clones `withfig/autocomplete`, runs `pnpm install && pnpm build` to produce compiled `.js` specs, then runs a bundled Node scriptlet (`data/fig_dump.js`, embedded via `include_str!`) that `require()`s every spec, replaces JS functions with the `"__FN__"` sentinel so `JSON.stringify` survives, and writes one JSON per spec to `$XDG_CACHE_HOME/zsh-ios/fig-json/`.
+
+2. **Every build**: Rust reads those JSONs via `serde_json`, deserializes `FigSpec { name, description, subcommands[], options[], args }`, and folds into the trie:
+   - `template: "filepaths"` → `ARG_MODE_PATHS`
+   - `template: "folders"` → `ARG_MODE_DIRS_ONLY`
+   - `template: "hosts"` → `ARG_MODE_HOSTS`
+   - `template: "history"` / `"help"` → skipped (no resolver mapping)
+   - `suggestions: [items]` → static list
+   - `generators.script` (string or argv array) → `call_program`
+   - `name: ["-v", "--verbose"]` → `flag_aliases` + individual `flag_args`
+   - Subcommands nest recursively to unbounded depth
+
+The `"__FN__"` sentinel prevents ghost `call_program` entries when a generator's logic was a JS closure we can't execute — only generators with an explicit `script` argv are usable by the resolver.
+
+Users who skip `fig-fetch` stay completely dep-free; `scan_fig_completions` returns `(0, 0, 0)` silently when the JSON cache is absent. Node + pnpm (or npm) is required only for `fig-fetch` itself.
+
 ### Project manifests (resolved at both build and runtime)
 
 Manifest resolvers walk up from the current working directory to find the nearest manifest file. At build time these are not scanned; they are queried live when `?` / Tab fires (see section 2). The manifest types and their parsed content are:

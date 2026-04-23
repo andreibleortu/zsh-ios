@@ -46,13 +46,14 @@ Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and futur
 
 ### Binary subcommands (src/main.rs)
 
-`build`, `resolve`, `complete`, `learn`, `pin`, `unpin`, `pins`, `toggle`, `rebuild`, `status`, `explain`, `ingest`, `regex-args-ingest`, `preset`.
+`build`, `resolve`, `complete`, `learn`, `pin`, `unpin`, `pins`, `toggle`, `rebuild`, `status`, `explain`, `ingest`, `regex-args-ingest`, `preset`, `fig-fetch`.
 
 - `resolve` / `complete` take `--context` / `--quote` / `--param-context` flags for shell-context inference threaded in by the plugin.
 - `learn` takes `--exit-code` (default 0) and `--cwd` for per-directory frequency tracking.
 - `ingest` reads a sectioned `@<kind>` payload from stdin and applies it to the trie (aliases, galiases, saliases, functions, named dirs, history, dirstack, jobs, commands, parameters, options, widgets, modules, zstyle).
 - `regex-args-ingest` folds a `_regex_arguments` harvest capture from stdin into the trie's arg specs.
 - `preset` lists, shows (`--show`), or applies (`--force` skips backup) one of three named YAML presets: `deterministic`, `privacy`, `power`.
+- `fig-fetch` clones `withfig/autocomplete`, runs `pnpm build`, and dumps every compiled TypeScript spec as JSON to `$XDG_CACHE_HOME/zsh-ios/fig-json/` for subsequent `rebuild` to ingest. Requires Node + pnpm/npm on PATH; one-time (rerun after upstream updates).
 - `build` and `rebuild` differ only in that `rebuild` re-execs via `zsh -c 'alias | zsh-ios build --aliases-stdin'` so aliases from the user's interactive shell are captured.
 - `explain` is a debugging tool — `resolve::explain` walks the same primitives as `resolve_line` and narrates each step, then prints the actual `resolve_line` result so any drift is visible.
 
@@ -76,6 +77,8 @@ Split lib + bin: `src/lib.rs` re-exports all modules publicly so tests and futur
 - **`runtime_cache.rs`** — on-disk MessagePack TTL cache for `TypeResolver` results. Writes via sibling tempfile + atomic rename. TTL checked against file mtime; `Duration::ZERO` disables caching for a resolver.
 - **`bash_completions.rs`** — scans standard Bash completion directories (`/etc/bash_completion.d`, `/usr/share/bash-completion/completions`, etc.) and parses `complete -F` / `complete -W` stanzas to supplement the trie. Zsh and Fish data win on conflicts.
 - **`fish_completions.rs`** — scans Fish completion directories (`/usr/share/fish/completions`, `~/.config/fish/completions`, etc.) and parses `.fish` completion files to supplement the trie.
+- **`carapace_completions.rs`** — scans `~/.config/carapace/specs/` + distro paths for carapace-spec YAML, and shells to `carapace _list` + `carapace <cmd> _spec` when the binary is on PATH and `disable_build_time_shell_exec` is off. Maps action strings (`$files`, `$directories`, `$list(…)`, `$(cmd args)`, literal arrays) to ArgSpec types via `shlex::split` for the `$(…)` path. Version-keyed cache under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/`.
+- **`fig_completions.rs`** + **`data/fig_dump.js`** — withfig/autocomplete JSON ingester. The `zsh-ios fig-fetch` subcommand clones the upstream repo, runs `pnpm build`, and invokes the bundled Node scriptlet (embedded via `include_str!`) to dump every compiled TypeScript spec as JSON to `$XDG_CACHE_HOME/zsh-ios/fig-json/`. Subsequent `zsh-ios rebuild` reads the JSON via `serde_json` and folds it in. Node + pnpm/npm required only for `fig-fetch`; `scan_fig_completions` returns `(0,0,0)` silently when the cache is absent.
 - **`galiases.rs`** — `expand_galiases` rewrites global aliases token-by-token before the trie walk. Not recursive. Skips tokens inside single/double quotes, `$(...)`, `` `...` ``, and `${...}`.
 - **`ingest.rs`** — `cmd_ingest` reads a sectioned `@<kind>` payload from stdin and folds it into the trie. `apply_ingest` is exported for unit tests. Handles all worker dump types.
 - **`locks.rs`** — `lock_for(path)` acquires an exclusive `fs2` advisory flock on a sibling `.lock` file. Called by `cmd_build`, `cmd_learn`, `cmd_pin`, `cmd_unpin`, `cmd_ingest`, and `cmd_regex_args_ingest`.

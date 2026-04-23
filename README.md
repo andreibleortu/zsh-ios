@@ -26,7 +26,7 @@ Selection is keystroke-driven — the moment your digits uniquely identify an op
 
 ## How it works
 
-zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, Zsh/Fish/Bash completion definitions, and live shell state. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
+zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, Zsh/Fish/Bash/carapace/fig completion definitions, and live shell state. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
 
 **Deep disambiguation** looks ahead at subsequent words to narrow things down. `gi pu orig main` resolves to `git push origin main` because `git` is the only `gi*` command with a `pu*` subcommand. The same technique works for filesystem paths -- `cd ~/Lib/Applic/zsh-` resolves through `Application Support` (not `Application Scripts`) because only `Application Support` has a `zsh-*` child.
 
@@ -55,6 +55,7 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 - **Config presets** -- `zsh-ios preset` to apply `deterministic`, `privacy`, or `power` profiles
 - **Fast** -- Rust binary with MessagePack-serialized trie; resolution takes < 10ms
 - **Over 70 runtime resolvers** -- live data at `?`/Tab time: git (branches/tags/remotes/files/stash/worktree/submodule/commit/reflog/bisect), docker, k8s, systemd, tmux, screen, brew, apt, dnf, pacman, npm, pip, cargo, and project scripts from Makefile/justfile/package.json/Cargo.toml/pyproject.toml/composer.json/build.gradle/Rakefile/Pipfile/pnpm-workspace.yaml/lerna.json
+- **External spec catalogs** -- carapace-spec YAML (user + system + `carapace _spec` dumps) and withfig/autocomplete (500+ TypeScript specs compiled via `zsh-ios fig-fetch`) supplement Zsh/Fish/Bash parsing with the long tail of commands they don't cover
 
 ## Data sources
 
@@ -69,9 +70,11 @@ The command trie is built from:
 7. **Zsh completion files** -- subcommand patterns and per-position argument specs from `$fpath` directories, including system paths and plugin-framework trees (Oh-My-Zsh, Prezto, zinit, antidote, antibody, znap, zplug, `~/.config/zsh`)
 8. **Fish completion files** -- `.fish` completion files from standard Fish completion directories (`/usr/share/fish/completions`, `~/.config/fish/completions`, etc.)
 9. **Bash completion files** -- `complete -F` / `complete -W` stanzas from `/etc/bash_completion.d`, `/usr/share/bash-completion/completions`, and equivalents
-10. **Project-local manifests** -- `package.json`, `Makefile`, `justfile`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `build.gradle`, `Rakefile`, `Pipfile`, `pnpm-workspace.yaml`, `lerna.json` (scripts and targets resolved by walking up from cwd)
-11. **Live worker state** -- on first shell startup the background zpty worker dumps: aliases, galiases, saliases, functions, named dirs, history, dirstack, jobs, commands, parameters, options, widgets, modules, and zstyle settings; all folded into the trie via `zsh-ios ingest`
-12. **Runtime resolvers** -- live data queried when `?` / Tab fires: git (`git for-each-ref`, `git log`, `git remote`, `git ls-files`, …), docker (`docker ps`, `docker images`, …), k8s (`kubectl get`), systemd (`systemctl list-units`), tmux (`tmux list-sessions`), package managers (brew, apt, dnf, pacman, npm, pip, cargo), and project scripts from manifests found by walking up from cwd
+10. **carapace-spec YAML** -- user, distro, and Homebrew carapace specs under `~/.config/carapace/specs/` and `/usr/{share,local/share}/carapace/specs/`; when the `carapace` binary is on PATH and `disable_build_time_shell_exec` is off, also shells to `carapace _list` + `carapace <cmd> _spec` to dump every builtin completer (cached under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/` keyed by `carapace --version`)
+11. **Fig / withfig/autocomplete** -- 500+ TypeScript specs from [withfig/autocomplete](https://github.com/withfig/autocomplete), compiled to JSON via `zsh-ios fig-fetch` (one-time; requires Node + pnpm/npm on PATH). Subsequent `zsh-ios rebuild` reads the cached JSON and folds templates / suggestions / generator scripts into the trie
+12. **Project-local manifests** -- `package.json`, `Makefile`, `justfile`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `build.gradle`, `Rakefile`, `Pipfile`, `pnpm-workspace.yaml`, `lerna.json` (scripts and targets resolved by walking up from cwd)
+13. **Live worker state** -- on first shell startup the background zpty worker dumps: aliases, galiases, saliases, functions, named dirs, history, dirstack, jobs, commands, parameters, options, widgets, modules, and zstyle settings; all folded into the trie via `zsh-ios ingest`
+14. **Runtime resolvers** -- live data queried when `?` / Tab fires: git (`git for-each-ref`, `git log`, `git remote`, `git ls-files`, …), docker (`docker ps`, `docker images`, …), k8s (`kubectl get`), systemd (`systemctl list-units`), tmux (`tmux list-sessions`), package managers (brew, apt, dnf, pacman, npm, pip, cargo), and project scripts from manifests found by walking up from cwd
 
 ## Installation
 
@@ -149,6 +152,8 @@ zsh-ios regex-args-ingest  # Fold a _regex_arguments harvest capture from stdin
 zsh-ios preset          # List available config presets
 zsh-ios preset power    # Apply the power-user preset (backs up existing config)
 zsh-ios preset deterministic --show   # Print preset YAML without writing
+zsh-ios fig-fetch       # Clone + build withfig/autocomplete, dump specs to JSON cache
+                        # (one-time; requires Node + pnpm/npm; re-run after upstream updates)
 ```
 
 ### Debugging resolution
@@ -223,7 +228,7 @@ Given input `ter ap --auto-approve`:
 9. **Path resolution** -- arguments are checked against the real filesystem; if a matching file or directory exists, the abbreviation is expanded
 10. **Result**: `terraform apply --auto-approve`
 
-The engine is context-aware about what kind of arguments each command and subcommand takes. Arg specs are extracted from Zsh, Fish, and Bash completion files for 1400+ commands. See `docs/DATA-SOURCES.md` for the full arg-type list and resolver inventory.
+The engine is context-aware about what kind of arguments each command and subcommand takes. Arg specs are extracted from Zsh, Fish, Bash, carapace-spec, and Fig completion sources for 2000+ commands (depending on which catalogs you've populated). See `docs/DATA-SOURCES.md` for the full arg-type list and resolver inventory.
 
 | Argument type | Examples | Resolved from |
 |---------------|----------|---------------|
@@ -365,6 +370,9 @@ src/
                         _regex_arguments, _values, tag groups, …); ~1400 commands
   bash_completions.rs   Bash completion file parser (complete -F / -W)
   fish_completions.rs   Fish completion file parser (.fish files)
+  carapace_completions.rs
+                        carapace-spec YAML ingester + `carapace _spec` dumper
+  fig_completions.rs    withfig/autocomplete JSON ingester + `zsh-ios fig-fetch`
   scanner.rs            PATH scanner, builtins, alias parser
   history.rs            Zsh history parser
   pins.rs               Pin storage (load/save/match)
@@ -380,6 +388,8 @@ src/
   regex_args.rs         _regex_arguments DSL parser + dynamic harvest support
 data/
   descriptions.yaml     Fallback subcommand descriptions (bundled at compile time)
+  fig_dump.js           Node scriptlet bundled via include_str! — used by
+                        `zsh-ios fig-fetch` to convert compiled fig specs to JSON
 plugin/
   zsh-ios.zsh           Zsh plugin (ZLE widgets, ghost preview, zpty worker,
                         key bindings, preexec/precmd hooks, context inference)
