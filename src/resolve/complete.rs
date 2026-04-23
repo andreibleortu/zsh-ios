@@ -855,6 +855,36 @@ mod tests {
         assert_eq!(resolve_first_word("zzz", &trie), "zzz");
     }
 
+    /// Verify the Rust binary never emits the "[approximate]" label in any
+    /// complete output.  That tag is exclusive to the plugin's worker fallback
+    /// path (_zsh_ios_worker_approximate) so users can distinguish fuzzy
+    /// suggestions from typed ones.
+    #[test]
+    fn complete_never_emits_approximate_label() {
+        let trie = build_test_trie();
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+
+        // Inputs that exercise different output paths
+        let inputs = [
+            ("",              ContextHint::Unknown),   // top-level command list
+            ("gi",            ContextHint::Unknown),   // ambiguous prefix
+            ("zzznomatch",    ContextHint::Unknown),   // no match
+            ("git ",          ContextHint::Argument),  // subcommand list
+            ("git ch",        ContextHint::Argument),  // subcommand prefix
+            ("git checkout ", ContextHint::Argument),  // positional arg (unknown type)
+        ];
+        for (input, hint) in inputs {
+            let out = super::complete(input, &trie, &pins, hint);
+            assert!(
+                !out.contains("[approximate]"),
+                "complete({:?}) must not emit [approximate], got: {:?}",
+                input,
+                out
+            );
+        }
+    }
+
     #[test]
     fn complete_omits_excluded_flags() {
         use crate::trie::ArgSpec;

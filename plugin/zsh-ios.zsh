@@ -369,14 +369,42 @@ _zsh_ios_handle_path_ambiguity() {
     fi
 }
 
+# --- Column-layout helper used by _zsh_ios_help ---
+# Usage: _zsh_ios_format_items <label> <newline-separated items string>
+# Prints:  "% Expects: <argument> [<label>]\n<two-column layout>"
+# Returns the formatted string in $_zio_format_result (avoids subshell fork).
+_zsh_ios_format_items() {
+    local _label="$1" _raw="$2"
+    local -a _items=("${(@f)_raw}")
+    _items=("${(@u)_items}")
+    local _col_output _max_w=0 _item
+    for _item in "${_items[@]}"; do
+        (( ${#_item} > _max_w )) && _max_w=${#_item}
+    done
+    local _col_w=$(( _max_w + 2 ))
+    local _cols=$(( 80 / _col_w ))
+    (( _cols < 1 )) && _cols=1
+    local _line="" _col_n=0
+    _col_output=""
+    for _item in "${_items[@]}"; do
+        (( _col_n == _cols )) && { _col_output+="${_line}"$'\n'; _line=""; _col_n=0 }
+        _line+="$(printf "  %-${_max_w}s" "$_item")"
+        (( _col_n++ ))
+    done
+    [[ -n "$_line" ]] && _col_output+="${_line}"$'\n'
+    _zio_format_result="% Expects: <argument> [${_label}]\n${_col_output}"
+}
+
 # --- ZLE Widget: ? key (show completions) ---
 # Cisco IOS behavior:
 #   "show ?" (space before ?) = what arguments/subcommands come after "show"
 #   "sh?"    (no space)       = what commands match the "sh" prefix
 #
-# When the Rust binary cannot provide completions (returns a generic
-# "no completions" signal), we fall back to asking the ZLE worker —
-# a background Zsh process with the full completion system loaded.
+# Three-tier fallback when the Rust binary returns a generic "no completions":
+#   1. Rust binary — fast, typed completions (branches, hosts, etc.)
+#   2. ZLE worker complete-word — full Zsh completion system via compadd intercept
+#   3. ZLE worker _approximate — fuzzy/typo-tolerant last resort
+# Two-tier worker fallback: complete-word first, _approximate as last resort.
 _zsh_ios_help() {
     if _zsh_ios_is_disabled; then
         zle self-insert
@@ -444,29 +472,23 @@ _zsh_ios_help() {
         local worker_items=""
         [[ -s "$_wc_out" ]] && worker_items=$(<"$_wc_out")
         rm -f "$_wc_out"
+
         if [[ -n "$worker_items" ]]; then
-            # Format items into columns (simple, matches the Rust binary style)
-            local -a items=("${(@f)worker_items}")
-            # Deduplicate and sort
-            items=("${(@u)items}")
-            local col_output
-            # Build a simple two-column layout at 80 chars
-            local max_w=0 item
-            for item in "${items[@]}"; do
-                (( ${#item} > max_w )) && max_w=${#item}
-            done
-            local col_w=$(( max_w + 2 ))
-            local cols=$(( 80 / col_w ))
-            (( cols < 1 )) && cols=1
-            local line="" col_n=0
-            col_output=""
-            for item in "${items[@]}"; do
-                (( col_n == cols )) && { col_output+="${line}"$'\n'; line=""; col_n=0 }
-                line+="$(printf "  %-${max_w}s" "$item")"
-                (( col_n++ ))
-            done
-            [[ -n "$line" ]] && col_output+="${line}"$'\n'
-            output="% Expects: <argument> [ZLE]\n${col_output}"
+            local _zio_format_result
+            _zsh_ios_format_items "ZLE" "$worker_items"
+            output="$_zio_format_result"
+        else
+            # Worker complete returned nothing — try approximate fallback
+            local _wa_out="${TMPDIR:-/tmp}/zio-wa-out.$$"
+            _zsh_ios_worker_approximate "$_worker_prefix" > "$_wa_out" 2>/dev/null
+            local _approx_out=""
+            [[ -s "$_wa_out" ]] && _approx_out=$(<"$_wa_out")
+            rm -f "$_wa_out"
+            if [[ -n "$_approx_out" ]]; then
+                local _zio_format_result
+                _zsh_ios_format_items "approximate" "$_approx_out"
+                output="$_zio_format_result"
+            fi
         fi
     fi
 
@@ -475,13 +497,6 @@ _zsh_ios_help() {
     else
         zle -M "% No commands found"
     fi
-    # TODO: approximate completer fallback
-    # When both the Rust binary and _zsh_ios_worker_complete return empty,
-    # a third tier could try `zle _approximate` inside the worker to catch
-    # typos.  Deferred because _approximate requires ZLE to be active and
-    # the worker's zpty handle must survive the fork — non-trivial to wire
-    # correctly without stalling the shell.  When implemented, tag output
-    # with "[approximate]" so the user knows it's a fuzzy suggestion.
 }
 
 # --- Ambiguity handler with interactive clarifier ---
@@ -821,6 +836,13 @@ compadd() {
     fi
 }
 
+# Configure the approximate completer for the `approximate` request type.
+# max-errors 2 numeric — tolerate up to 2 typos (insertion/deletion/swap),
+# shown as numeric substitutions in the prompt.  Applies only when we opt
+# into it via compstate[completer].
+zstyle ':completion:zsh-ios:approximate:*' max-errors 2 numeric
+zstyle ':completion:zsh-ios:approximate:*' completer _approximate
+
 # Override accept-line: when a request file exists, handle the request instead
 # of accepting input.  The parent triggers this by sending a newline via zpty -w.
 _zio_accept_line() {
@@ -833,6 +855,24 @@ _zio_accept_line() {
                 BUFFER="\$_ZIO_BUFFER"
                 CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
                 zle complete-word 2>/dev/null
+                BUFFER=""
+                CURSOR=0
+                ;;
+            approximate)
+                BUFFER="\$_ZIO_BUFFER"
+                CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+                # Force the approximate completer by temporarily overriding the
+                # global completer list.  zle _approximate dispatches the widget
+                # directly so we don't depend on compstate manipulation.
+                local _zio_prev_completer
+                zstyle -s ':completion:*' completer _zio_prev_completer 2>/dev/null
+                zstyle ':completion:*' completer _approximate
+                zle _approximate 2>/dev/null || zle complete-word 2>/dev/null
+                if [[ -n "\$_zio_prev_completer" ]]; then
+                    zstyle ':completion:*' completer "\$_zio_prev_completer"
+                else
+                    zstyle -d ':completion:*' completer 2>/dev/null
+                fi
                 BUFFER=""
                 CURSOR=0
                 ;;
@@ -949,6 +989,48 @@ EOF
 
     # Poll for the done-file, draining pty output each cycle so the worker's
     # ZLE can re-enter after precmd / prompt display without blocking.
+    local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
+    for _i in $(seq 1 $_slices); do
+        [[ -f "$_df" ]] && break
+        sleep 0.01
+        while zpty -t _zsh_ios_worker 2>/dev/null; do
+            zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        done
+    done
+    local _rc=1
+    if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
+    rm -f "$_rf" "$_df" "$_bf" "$_req"
+    return $_rc
+}
+
+_zsh_ios_worker_approximate() {
+    _zsh_ios_worker_is_ready || return 1
+    local _buf="$1" _rf _df
+
+    # Drain accumulated pty output
+    local _zio_drain_buf _zio_drain_n=0
+    while zpty -t _zsh_ios_worker 2>/dev/null; do
+        zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        (( ++_zio_drain_n > 200 )) && break
+    done
+
+    _rf=$(mktemp "${TMPDIR:-/tmp}/zio-approx.XXXXXX") || return 1
+    _df="${_rf}.done"
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+    local _bf="${_rf}.buf"
+    printf '%s' "$_buf" > "$_bf"
+    cat > "$_req" <<EOF
+_ZIO_REQUEST='approximate'
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+_ZIO_BUFFER="\$(<'$_bf')"
+_ZIO_CURSOR=${#_buf}
+EOF
+
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null || {
+        rm -f "$_rf" "$_df" "$_bf" "$_req"; return 1
+    }
+
     local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
     for _i in $(seq 1 $_slices); do
         [[ -f "$_df" ]] && break
