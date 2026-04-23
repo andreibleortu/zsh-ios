@@ -2247,9 +2247,15 @@ fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
 
     let case_body = &body[case_body_start..case_body_end];
 
-    // Split on arm terminators `;;` to get individual arms
-    for arm_text in case_body.split(";;") {
-        let arm = arm_text.trim();
+    // Split arms on `;;`, but only at the outer case's nesting level. A
+    // naive `split(";;")` chops an arm as soon as it encounters the inner
+    // terminator of a nested `case $X in … ;; esac`, which is how the
+    // `_mount` parser used to end up with only the first `if compset …`
+    // block as "the whole devordir arm" — missing the trailing
+    // `case "$OSTYPE" in … _alternative { _hosts, _files } …` tree and
+    // misclassifying positional 1 as HOSTS.
+    for arm in split_case_arms_at_depth(case_body) {
+        let arm = arm.trim();
         if arm.is_empty() {
             continue;
         }
@@ -2280,6 +2286,73 @@ fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
     }
 
     result
+}
+
+/// Split a `case` body into arm texts, respecting nested `case … esac`
+/// blocks. Only `;;` terminators that appear at the *outermost* depth cut
+/// an arm; `;;` inside an inner case (e.g. `case "$OSTYPE" in … ;; esac`)
+/// stays with the enclosing arm.
+fn split_case_arms_at_depth(case_body: &str) -> Vec<String> {
+    let lines: Vec<&str> = case_body.lines().collect();
+    let mut arms: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut inner_depth: u32 = 0;
+
+    for line in &lines {
+        let t = line.trim();
+
+        // Inner `case … in` opens a nesting level.
+        if t.starts_with("case ")
+            && (t.ends_with(" in") || t.ends_with(" in;") || t.contains(" in "))
+        {
+            inner_depth += 1;
+            current.push_str(line);
+            current.push('\n');
+            continue;
+        }
+        // Inner `esac` closes one.
+        if t == "esac" || t.starts_with("esac;") || t.starts_with("esac ") {
+            if inner_depth > 0 {
+                inner_depth -= 1;
+            }
+            current.push_str(line);
+            current.push('\n');
+            continue;
+        }
+
+        // `;;` at outer depth terminates an arm. A `;;` inside a nested
+        // case belongs to the enclosing arm, so we only split at depth 0.
+        // Lines may also carry an inline `;;` (e.g. `return ret ;;`).
+        if inner_depth == 0 && t.contains(";;") {
+            // Keep the text before `;;` as part of the arm.
+            if let Some(idx) = line.find(";;") {
+                current.push_str(&line[..idx]);
+                current.push('\n');
+            }
+            let flushed = std::mem::take(&mut current);
+            if !flushed.trim().is_empty() {
+                arms.push(flushed);
+            }
+            // Any trailing text after `;;` on the same line starts the
+            // next arm. Rare in practice but cheap to support.
+            if let Some(idx) = line.find(";;") {
+                let tail = &line[idx + 2..];
+                if !tail.trim().is_empty() {
+                    current.push_str(tail);
+                    current.push('\n');
+                }
+            }
+            continue;
+        }
+
+        current.push_str(line);
+        current.push('\n');
+    }
+
+    if !current.trim().is_empty() {
+        arms.push(current);
+    }
+    arms
 }
 
 /// Given the raw text of a `case` arm, return the first completion action found.
@@ -3165,15 +3238,20 @@ fn detect_type_in_block(body: &str) -> Option<u8> {
             continue;
         }
 
-        // Direct calls — filesystem types
-        if trimmed.contains("_directories")
-            || (trimmed.contains("_path_files") && trimmed.contains("-/"))
-            || trimmed.contains("_files -/")
-        {
+        // Direct calls — filesystem types. The `-/` flag turns `_files` /
+        // `_path_files` into a directories-only call; detect it as the
+        // specific token pair, not a loose substring. Zsh globs like
+        // `_files -g "*(-%b,-/)"` put `-/` inside the glob pattern; an
+        // over-broad "-/" test would both (a) flag them as dirs-only and
+        // (b) suppress the files signal, leading detect_type_in_block to
+        // drop the `_alternative { _hosts, _files }` down to HOSTS.
+        let has_files_dir_flag = trimmed.contains("_files -/")
+            || trimmed.contains("_path_files -/");
+        if trimmed.contains("_directories") || has_files_dir_flag {
             has_dirs = true;
         }
         if (contains_func_name(trimmed, "_files") || contains_func_name(trimmed, "_path_files"))
-            && !trimmed.contains("-/")
+            && !has_files_dir_flag
         {
             has_files = true;
         }
@@ -3360,11 +3438,71 @@ fn extract_words_flags(condition: &str) -> Vec<String> {
 ///
 /// Returns a map from array variable name to all spec strings collected across all
 /// branches (conservative union — we include specs from every `if`/`else` branch).
+/// Scan a line for array-expansion references and add any variable names
+/// found to `out`. Recognises the four zsh forms used in completer functions:
+/// `"$name[@]"`, `"$name[*]"`, `${name[@]}`, `${name[*]}`. Conservative
+/// (alphanum/underscore only, no indexing) so we never accept gibberish.
+fn collect_array_refs(line: &str, out: &mut std::collections::HashSet<String>) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // `$name[@]` or `$name[*]`
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] != b'{' {
+            let name_start = i + 1;
+            let mut j = name_start;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+            {
+                j += 1;
+            }
+            if j > name_start
+                && j + 2 < bytes.len()
+                && bytes[j] == b'['
+                && (bytes[j + 1] == b'@' || bytes[j + 1] == b'*')
+                && bytes[j + 2] == b']'
+            {
+                out.insert(line[name_start..j].to_string());
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        // `${name[@]}` or `${name[*]}`
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let name_start = i + 2;
+            let mut j = name_start;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+            {
+                j += 1;
+            }
+            if j > name_start
+                && j + 3 < bytes.len()
+                && bytes[j] == b'['
+                && (bytes[j + 1] == b'@' || bytes[j + 1] == b'*')
+                && bytes[j + 2] == b']'
+                && bytes[j + 3] == b'}'
+            {
+                out.insert(line[name_start..j].to_string());
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn extract_array_specs(content: &str) -> HashMap<String, Vec<String>> {
     let mut arrays: HashMap<String, Vec<String>> = HashMap::new();
     let lines: Vec<&str> = content.lines().collect();
 
-    // First pass: find all declared array variables (`declare -a`, `local -a`, `typeset -a`)
+    // Track any variable that is (a) explicitly declared as an array, OR (b)
+    // referenced as `"$NAME[@]"` / `"$NAME[*]"` / `${NAME[@]}` anywhere in
+    // the file. Case (b) is what catches `_mount`-style completers: `args`
+    // is declared `local args` (no -a), built up inside `case "$OSTYPE"`
+    // branches as `args=( ... )`, and passed to `_arguments "$args[@]"`.
+    // Zsh promotes a scalar-declared variable to an array on assignment
+    // with `=( ... )`, so the explicit `-a` pass misses the whole class of
+    // state-machine completers that drive their arg specs through arrays.
     let mut tracked: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in &lines {
         let t = line.trim();
@@ -3379,6 +3517,8 @@ fn extract_array_specs(content: &str) -> HashMap<String, Vec<String>> {
                 }
             }
         }
+        // `"$name[@]"`, `"$name[*]"`, `${name[@]}`, `${name[*]}`
+        collect_array_refs(t, &mut tracked);
     }
 
     if tracked.is_empty() {
@@ -6273,6 +6413,127 @@ _git-checkout() {
     }
 
     // ── _call_program well-known specs ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_real_mount_completion_file_is_not_hosts() {
+        // Integration check against the system's actual _mount. Skips when
+        // the file isn't present (non-Linux / non-Fedora CI). Guards
+        // against the "mount completion shows hosts" regression: whatever
+        // positional 1 / rest resolves to, it must NOT be ARG_MODE_HOSTS.
+        let paths = [
+            "/usr/share/zsh/5.9/functions/_mount",
+            "/usr/share/zsh/functions/Completion/Unix/_mount",
+        ];
+        let content = paths
+            .iter()
+            .find_map(|p| std::fs::read_to_string(p).ok());
+        let Some(content) = content else { return };
+
+        let spec = parse_arg_spec(&content);
+        assert_ne!(
+            spec.positional.get(&1).copied(),
+            Some(trie::ARG_MODE_HOSTS),
+            "mount positional 1 must not be HOSTS; spec={spec:?}"
+        );
+        assert_ne!(
+            spec.rest,
+            Some(trie::ARG_MODE_HOSTS),
+            "mount rest must not be HOSTS; spec={spec:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_array_specs_finds_undeclared_array() {
+        let content = r#"local args
+case "$OSTYPE" in
+  linux*)
+    args=( -s
+      '-t[specify file system type]:file system type:_file_systems'
+      ':dev or dir:->devordir'
+      ':mount point:_files -/'
+    )
+    ;;
+esac
+_arguments -C "$args[@]"
+"#;
+        let arrays = extract_array_specs(content);
+        let specs = arrays.get("args").unwrap_or_else(|| {
+            panic!("expected array 'args' to be tracked; got keys: {:?}", arrays.keys().collect::<Vec<_>>())
+        });
+        // We only keep specs with a "known action" — so `:dev or dir:->devordir`
+        // is filtered out (no known action) but `:mount point:_files -/` stays.
+        let joined = specs.join("\n");
+        assert!(
+            joined.contains("_files -/"),
+            "expected _files -/ spec in collected array contents, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_array_refs_recognises_expansion_forms() {
+        let mut out = std::collections::HashSet::new();
+        collect_array_refs("_arguments -C \"$args[@]\" && ret=0", &mut out);
+        collect_array_refs("_arguments ${opts[@]}", &mut out);
+        collect_array_refs("_arguments \"${bar[*]}\"", &mut out);
+        collect_array_refs("$lone_scalar is not an array", &mut out);
+        assert!(out.contains("args"));
+        assert!(out.contains("opts"));
+        assert!(out.contains("bar"));
+        assert!(!out.contains("lone_scalar"));
+    }
+
+    #[test]
+    fn test_array_specs_without_explicit_array_decl() {
+        // Reproduces the `_mount` pattern: `args` is declared `local args`
+        // (no -a), built up inside a case "$OSTYPE" branch as `args=(...)`,
+        // then passed to `_arguments "$args[@]"`. Before the fix, the first
+        // pass only tracked `-a`-declared arrays, so `args` was invisible
+        // and all its positional specs (including `:dev or dir:->devordir`)
+        // never reached the ArgSpec. Now the tracked set includes any
+        // variable that's referenced via "$NAME[@]" anywhere.
+        let content = r#"#compdef mount
+local curcontext="$curcontext" state line expl ret=1
+local args deffs=iso9660
+case "$OSTYPE" in
+  linux*)
+    args=( -s
+      '-t[specify file system type]:file system type:_file_systems'
+      ':dev or dir:->devordir'
+      ':mount point:_files -/'
+    )
+    ;;
+esac
+_arguments -C "$args[@]" && ret=0
+case "$state" in
+  devordir)
+    _alternative \
+      'hosts:host:_hosts -S :' \
+      'files:device or mount point:_files -g "*(-%b,-/)"' && ret=0
+    ;;
+esac
+return ret
+"#;
+        let spec = parse_arg_spec(content);
+        // Positional 1 goes through the ->devordir state. `_alternative`
+        // offers both _hosts and _files — the combined detection rule
+        // (has_files || has_dirs short-circuits to PATHS) resolves to
+        // PATHS, not HOSTS. This is the behaviour the user cares about:
+        // typing `mount ` and hitting `?` should not surface a list of
+        // SSH hostnames.
+        assert_eq!(
+            spec.positional.get(&1).copied(),
+            Some(trie::ARG_MODE_PATHS),
+            "positional 1 (devordir state) should resolve to PATHS via _alternative, got spec={spec:?}"
+        );
+        // The second `:mount point:_files -/` bare-positional spec maps
+        // to `spec.rest` (in _arguments syntax, `:desc:action` without a
+        // position number is the "next positional" / rest slot).
+        assert_eq!(
+            spec.rest,
+            Some(trie::ARG_MODE_DIRS_ONLY),
+            "rest should be dirs-only (from `_files -/`)"
+        );
+    }
 
     #[test]
     fn test_apt_install_call_program() {
