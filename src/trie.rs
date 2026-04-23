@@ -639,6 +639,12 @@ pub struct CommandTrie {
     /// `zsh-ios status` for introspection, not consumed by resolution.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub live_state: HashMap<String, String>,
+    /// Global aliases from `alias -g NAME=VALUE`. Substituted anywhere on
+    /// the command line (not just at command position) by `resolve_line`
+    /// before the trie walk.  Ingested from the plugin worker's
+    /// `dump-galiases` request.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub galiases: HashMap<String, String>,
 }
 
 impl CommandTrie {

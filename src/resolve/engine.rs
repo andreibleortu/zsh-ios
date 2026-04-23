@@ -14,6 +14,7 @@ use crate::trie::{self, ArgModeMap, ArgSpec, ArgSpecMap, CommandTrie, TrieNode};
 use super::escape::{escape_resolved_path, shell_escape_path};
 
 use std::sync::atomic::AtomicBool;
+use std::sync::LazyLock;
 
 use std::cell::RefCell;
 
@@ -137,6 +138,17 @@ pub fn resolve_line(
     if matches!(context_hint, ContextHint::Math | ContextHint::Condition) {
         return ResolveResult::Passthrough(input.to_string());
     }
+
+    // Expand global aliases before the trie walk. The owned string is kept
+    // alive for the duration of this call via `input_string`; `input_ref`
+    // points into it (or into the original `input` when no galiases exist).
+    let input_string;
+    let input: &str = if !trie.galiases.is_empty() {
+        input_string = crate::galiases::expand_galiases(input, &trie.galiases);
+        &input_string
+    } else {
+        input
+    };
 
     let parts = split_on_operators(input);
 
@@ -1235,28 +1247,28 @@ fn format_age(secs: u64) -> String {
 
 // --- Text/net format validators (private helpers for word_matches_type) ---
 
+static EMAIL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$").unwrap()
+});
+
+static URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://.+").unwrap()
+});
+
+static MAC_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$").unwrap()
+});
+
 fn is_plausible_email(s: &str) -> bool {
-    let Some((local, domain)) = s.split_once('@') else { return false; };
-    !local.is_empty()
-        && !domain.is_empty()
-        && domain.contains('.')
-        && !s.chars().any(char::is_whitespace)
+    EMAIL_RE.is_match(s)
 }
 
 fn is_plausible_url(s: &str) -> bool {
-    if let Some(idx) = s.find("://") {
-        let scheme = &s[..idx];
-        !scheme.is_empty()
-            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
-    }
+    URL_RE.is_match(s)
 }
 
 fn is_plausible_mac(s: &str) -> bool {
-    let parts: Vec<&str> = s.split([':', '-']).collect();
-    parts.len() == 6
-        && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+    MAC_RE.is_match(s)
 }
 
 fn is_valid_timezone(s: &str) -> bool {
@@ -4768,6 +4780,35 @@ mod tests {
             ResolveResult::Ambiguous(info) => {
                 panic!("unexpected Ambiguous in redirection context: {:?}", info.word);
             }
+        }
+    }
+
+    #[test]
+    fn resolve_line_expands_galiases_before_trie_walk() {
+        // Build a trie that knows about `grep` so the expanded form is resolvable.
+        let mut trie = CommandTrie::new();
+        trie.insert(&["find", "-type"]);
+        trie.insert(&["grep", "-r"]);
+        // Seed a global alias: G -> "| grep"
+        trie.galiases.insert("G".to_string(), "| grep".to_string());
+
+        let pins = Pins::default();
+
+        // "find . G foo" should expand G before the trie walk.
+        // After expansion: "find . | grep foo"
+        // resolve_line splits on `|`, resolves each segment, and returns Resolved.
+        let result = resolve_line("find . G foo", &trie, &pins, None, ContextHint::Unknown);
+        match result {
+            ResolveResult::Resolved(s) => {
+                assert!(s.contains("| grep"), "expected '| grep' in result, got: {}", s);
+                assert!(s.contains("find"), "expected 'find' in result, got: {}", s);
+            }
+            ResolveResult::Passthrough(s) => {
+                // A passthrough result is also acceptable if the segment was
+                // unchanged after expansion — as long as G was substituted.
+                assert!(s.contains("| grep"), "expected galias expansion in passthrough, got: {}", s);
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 }

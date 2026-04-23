@@ -37,6 +37,10 @@ pub struct UserConfig {
     /// favorite. Users who want reproducible resolution across machines
     /// and sessions turn this on.
     pub disable_statistics: bool,
+
+    /// When true, global aliases (alias -g) are NOT expanded before
+    /// resolution. Some users prefer the literal buffer intact.
+    pub disable_galiases: bool,
 }
 
 impl UserConfig {
@@ -87,6 +91,7 @@ mod tests {
         assert_eq!(c.stale_threshold(), DEFAULT_STALE_THRESHOLD_SECS);
         assert!(!c.disable_learning);
         assert!(!c.disable_statistics);
+        assert!(!c.disable_galiases);
         assert!(c.command_blocklist.is_empty());
         assert!(!c.is_blocklisted("git"));
     }

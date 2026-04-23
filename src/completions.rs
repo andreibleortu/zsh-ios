@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use crate::regex_args;
 use crate::trie::{self, ArgSpec, CommandTrie};
 
 /// Scan Zsh completion files for subcommand definitions and argument modes,
@@ -1023,6 +1024,30 @@ type ExtractedCompletions = (
     HashSet<String>,
 );
 
+/// Convert a [`regex_args::ParsedRegexArgs`] into an [`ArgSpec`].
+fn fold_regex_args_into_spec(ra: regex_args::ParsedRegexArgs) -> ArgSpec {
+    let mut spec = ArgSpec::default();
+    for (pos, arg_type) in ra.positional {
+        spec.positional.insert(pos, arg_type);
+    }
+    if let Some(t) = ra.rest {
+        spec.rest = Some(t);
+    }
+    let static_lists_len = ra.static_lists.len();
+    for (pos, items) in ra.static_lists {
+        // Store per-position static lists in rest_static only when pos==1
+        // and there is no other slot; otherwise skip (ArgSpec has no
+        // per-positional static list field — use rest_static as best-effort).
+        if pos == 1 && static_lists_len == 1 {
+            spec.rest_static_list.get_or_insert(items);
+        }
+    }
+    if let Some(items) = ra.rest_static {
+        spec.rest_static_list.get_or_insert(items);
+    }
+    spec
+}
+
 /// Extract subcommands and per-position argument specs from completion files.
 fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
     let mut subcmds: HashMap<String, Vec<String>> = HashMap::new();
@@ -1086,7 +1111,15 @@ fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
                 }
 
                 let spec = parse_arg_spec(&content);
-                if !spec.is_empty() {
+                let spec = if !spec.is_empty() {
+                    Some(spec)
+                } else {
+                    // Fallback: try the _regex_arguments DSL parser when
+                    // the standard _arguments extractor finds nothing.
+                    regex_args::parse_regex_arguments(&content)
+                        .map(fold_regex_args_into_spec)
+                };
+                if let Some(spec) = spec {
                     for c in &commands {
                         arg_specs.insert(c.clone(), spec.clone());
                     }
@@ -1157,7 +1190,7 @@ fn contains_func_name(s: &str, func: &str) -> bool {
     false
 }
 
-fn action_to_arg_type(action: &str) -> Option<u8> {
+pub(crate) fn action_to_arg_type(action: &str) -> Option<u8> {
     let action = action.trim().trim_matches('\'').trim_matches('"');
 
     // Commands / executables
@@ -6019,5 +6052,28 @@ _foo() {
         let subs = extract_case_based_subcommands(body, "foo");
         assert!(subs.contains(&"init".to_string()), "should contain init (brace form)");
         assert!(subs.contains(&"clean".to_string()), "should contain clean (brace form)");
+    }
+
+    #[test]
+    fn scan_extracts_regex_arguments_specs() {
+        // Synthetic completion file using _regex_arguments.
+        let content = r#"#compdef mytool
+_mytool() {
+  local context state line
+  _regex_arguments _mytool_parse \
+    "/$'[^\0]#\0'/" \
+    ':host:hostname:_hosts' \
+    ':file:file:_files'
+  _mytool_parse "$@"
+}
+_mytool "$@"
+"#;
+        // parse_arg_spec won't find anything (no _arguments), so the
+        // regex_args fallback path should populate the spec.
+        let ra = crate::regex_args::parse_regex_arguments(content);
+        assert!(ra.is_some(), "regex_args should extract from synthetic body");
+        let ra = ra.unwrap();
+        assert_eq!(ra.positional.get(&1), Some(&trie::ARG_MODE_HOSTS));
+        assert_eq!(ra.positional.get(&2), Some(&trie::ARG_MODE_PATHS));
     }
 }

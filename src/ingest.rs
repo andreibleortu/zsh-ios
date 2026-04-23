@@ -51,7 +51,7 @@ pub fn apply_ingest(trie: &mut crate::trie::CommandTrie, input: &str) {
         apply_aliases(trie, body);
     }
     if let Some(body) = sections.get("galiases") {
-        apply_aliases(trie, body);
+        apply_galiases(trie, body);
     }
     if let Some(body) = sections.get("saliases") {
         apply_aliases(trie, body);
@@ -134,6 +134,28 @@ pub fn apply_aliases(trie: &mut crate::trie::CommandTrie, body: &str) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Apply global-alias lines (`alias -g` output) to `trie.galiases`.
+///
+/// Each line has the form `name='value'` or `name=value`. The alias name is
+/// stored as-is; the value has surrounding single or double quotes stripped.
+/// Entries whose name is empty or contains whitespace are skipped.
+pub fn apply_galiases(trie: &mut crate::trie::CommandTrie, body: &str) {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            let name = name.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                continue;
+            }
+            let value = value.trim().trim_matches('\'').trim_matches('"');
+            trie.galiases.insert(name.to_string(), value.to_string());
         }
     }
 }
@@ -442,5 +464,56 @@ mod tests {
             trie.named_dirs.get("proj"),
             Some(&"/home/me/proj".to_string())
         );
+    }
+
+    // ── apply_galiases ────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_galiases_populates_trie_field() {
+        let mut trie = CommandTrie::new();
+        apply_galiases(&mut trie, "G='| grep'\nL='| less'\n");
+        assert_eq!(trie.galiases.get("G"), Some(&"| grep".to_string()));
+        assert_eq!(trie.galiases.get("L"), Some(&"| less".to_string()));
+    }
+
+    #[test]
+    fn apply_galiases_strips_double_quotes() {
+        let mut trie = CommandTrie::new();
+        apply_galiases(&mut trie, "NE=\"2>/dev/null\"\n");
+        assert_eq!(trie.galiases.get("NE"), Some(&"2>/dev/null".to_string()));
+    }
+
+    #[test]
+    fn apply_galiases_ignores_malformed() {
+        let mut trie = CommandTrie::new();
+        // Line with no `=` sign.
+        apply_galiases(&mut trie, "name without equals\nG='| grep'\n");
+        assert!(!trie.galiases.contains_key("name without equals"));
+        assert_eq!(trie.galiases.get("G"), Some(&"| grep".to_string()));
+    }
+
+    #[test]
+    fn apply_galiases_skips_names_with_whitespace() {
+        let mut trie = CommandTrie::new();
+        apply_galiases(&mut trie, "bad name='value'\n");
+        assert!(trie.galiases.is_empty());
+    }
+
+    #[test]
+    fn apply_galiases_does_not_insert_into_trie_root() {
+        // Unlike apply_aliases, apply_galiases must NOT touch trie.root.
+        let mut trie = CommandTrie::new();
+        apply_galiases(&mut trie, "G='| grep'\n");
+        assert!(trie.root.get_child("G").is_none());
+    }
+
+    #[test]
+    fn apply_ingest_routes_galiases_section() {
+        let mut trie = CommandTrie::new();
+        let input = "@galiases\nG='| grep'\n";
+        apply_ingest(&mut trie, input);
+        assert_eq!(trie.galiases.get("G"), Some(&"| grep".to_string()));
+        // Must NOT have been inserted into the trie root as a command.
+        assert!(trie.root.get_child("G").is_none());
     }
 }

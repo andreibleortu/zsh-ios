@@ -242,10 +242,13 @@ fn import_shell_functions(trie: &mut trie::CommandTrie) -> u32 {
 }
 
 fn cmd_resolve(line: &str, context: Option<&str>) {
-    let trie = load_trie();
+    let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
+    if user_cfg.disable_galiases {
+        trie.galiases.clear();
+    }
 
     // Blocklist pre-check: if the user typed the blocklisted name literally,
     // passthrough immediately so the engine does zero work.
@@ -339,10 +342,13 @@ fn print_path_ambiguity_shell(candidates: &[String]) {
 }
 
 fn cmd_complete(line: &str, context: Option<&str>) {
-    let trie = load_trie();
+    let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
+    if user_cfg.disable_galiases {
+        trie.galiases.clear();
+    }
     let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
     let output = resolve::complete(line, &trie, &pin_store, context_hint);
     print!("{}", output);
@@ -610,6 +616,11 @@ fn cmd_status() {
                 keys.sort_unstable();
                 println!("  Live state:  {} ({})", keys.len(), keys.join(", "));
             }
+            println!(
+                "  Global aliases: {} ({})",
+                trie.galiases.len(),
+                if user_cfg.disable_galiases { "disabled (config)" } else { "expanded" }
+            );
         }
     } else {
         println!("  Tree:        not built yet (run `zsh-ios rebuild`)");
@@ -644,10 +655,13 @@ fn cmd_explain(line: &str) {
         eprintln!("Usage: zsh-ios explain <command line>");
         process::exit(1);
     }
-    let trie = load_trie();
+    let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
+    if user_cfg.disable_galiases {
+        trie.galiases.clear();
+    }
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok());

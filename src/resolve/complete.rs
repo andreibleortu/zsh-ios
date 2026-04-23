@@ -36,6 +36,16 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: supe
         return String::new();
     }
 
+    // Expand global aliases so the `?` key sees the same expanded buffer
+    // that resolve_line would use.
+    let input_string;
+    let input: &str = if !trie.galiases.is_empty() {
+        input_string = crate::galiases::expand_galiases(input, &trie.galiases);
+        &input_string
+    } else {
+        input
+    };
+
     // Use only the last segment after any pipe/chain operator.
     // Preserve trailing whitespace — it tells complete_segment whether the user
     // has finished the current word (trailing space) or is still typing it.

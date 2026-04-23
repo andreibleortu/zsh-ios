@@ -12,12 +12,14 @@
 pub mod bash_completions;
 pub mod completions;
 pub mod config;
+pub mod galiases;
 pub mod fish_completions;
 pub mod history;
 pub mod ingest;
 pub mod locks;
 pub mod path_resolve;
 pub mod pins;
+pub mod regex_args;
 pub mod resolve;
 pub mod runtime_cache;
 pub mod runtime_complete;
