@@ -35,13 +35,13 @@ fn is_plausible_item(s: &str) -> bool {
 
     // Character whitelist: alphanumerics plus punctuation that can
     // legitimately appear in command arguments (paths, job specs, flags,
-    // URLs, email addresses, etc.). Anything with `{`, `}`, `#`, `*`, `\`,
-    // `$`, `(`, `)`, `[`, `]`, `&`, `|`, `;`, `<`, `>`, backtick, quote
-    // characters, whitespace — we treat as zsh syntax leakage rather than
-    // a real value.
+    // URLs, email addresses, wildcard items, etc.). Anything with `{`, `}`,
+    // `#`, `\`, `$`, `(`, `)`, `[`, `]`, `&`, `|`, `;`, `<`, `>`, backtick,
+    // quote characters, whitespace — we treat as zsh syntax leakage rather
+    // than a real value.
     let allowed = |c: char| {
         c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | ',' | '=' | '~')
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | ',' | '=' | '~' | '*')
     };
     if !t.chars().all(allowed) { return false; }
 
@@ -84,32 +84,45 @@ fn is_plausible_item(s: &str) -> bool {
         return false;
     }
 
-    // Single uppercase letters like `I` and `M` (sed s-command modifiers)
-    // are not useful as top-level completions.  Single lowercase alphanumerics
-    // and single digits are already accepted — we only block lone uppercase.
-    if t.len() == 1 && t.chars().next().unwrap().is_ascii_uppercase() {
-        return false;
-    }
-
     true
 }
 
 /// Tags that carry context-specific completions only meaningful after a flag
-/// (e.g. HTTP headers after `--header=`, URL schemes after `--url=`, ssh
-/// subsystem names inside `sftp://` completion).  Displaying these groups at
-/// the command root produces noise and confuses users.
+/// (e.g. URL schemes after `--url=`, ssh subsystem names inside `sftp://`
+/// completion). Displaying these groups at the command root produces noise.
+///
+/// Kept deliberately narrow. Names like `mods` and `headers` are ambiguous
+/// across commands — `mods` is sed s-command modifiers in sed but Apache
+/// modules for a2enmod; `headers` is HTTP headers in curl but mail headers
+/// in mh — so blocklisting by name alone silences legitimate completions.
 fn is_noisy_tag(tag: &str) -> bool {
     // Normalise to lowercase for comparison.
     let t = tag.to_lowercase();
     matches!(
         t.as_str(),
-        "headers"     // HTTP / mail headers
-        | "urls"      // URL scheme prefixes (ftp://, http://)
-        | "subsystems"// ssh subsystem names (sftp)
-        | "mods"      // sed s-command modifiers (I, M)
+        "urls"            // URL scheme prefixes (ftp://, http://)
+        | "subsystems"    // ssh subsystem names (sftp)
         | "address-forms" // sed address forms
-        | "steps"     // sed step values
+        | "steps"         // sed step values
     )
+}
+
+/// Tag groups enumerate *values*, not flags. When the parser scrapes a
+/// `_describe`/`_values` block that also contains flag option specs, the
+/// flag-form tokens (`--cask`, `-v`, …) can leak in. They're always out of
+/// place under a value tag-group header (e.g. `--cask` inside brew's
+/// `cask` group) — filter them at display time.
+fn is_flag_form_item(item: &str) -> bool {
+    let t = item.trim();
+    if !t.starts_with('-') || t.len() < 2 {
+        return false;
+    }
+    // Second char after a single `-` must look like a flag letter (alphanumeric)
+    // or another `-` (long flag). Values like `-1`, `-v`, `--cask` match;
+    // a bare `-` or a numeric literal like `-42.0` does not.
+    let rest = &t[1..];
+    let first = rest.chars().next().unwrap();
+    first == '-' || first.is_ascii_alphabetic()
 }
 
 /// When the parser grabbed a group's own tag or label as if it were an item,
@@ -150,8 +163,21 @@ fn titlecase(s: &str) -> String {
 /// back to the ZLE worker's tiered completion. Kept close to `complete()`
 /// so the two stay in sync; previously the plugin grepped for a bare
 /// `<enter argument>` placeholder, which was fragile.
+///
+/// Line-level match (not substring) so a description or item text that
+/// happens to contain the sentinel verbatim doesn't accidentally trigger
+/// the worker fallback. Sentinels are emitted as dedicated header lines,
+/// prefixed with the configurable picker-header character.
 pub fn is_generic_output(output: &str) -> bool {
-    output.contains("Expects: <argument>") || output.contains("No commands matching")
+    let header = crate::runtime_config::get().picker_header_prefix;
+    output.lines().any(|line| {
+        let body = line
+            .strip_prefix(header.as_str())
+            .unwrap_or(line)
+            .trim_start();
+        body == "Expects: <argument>"
+            || (body.starts_with("No commands matching \"") && body.ends_with('"'))
+    })
 }
 
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
@@ -557,13 +583,15 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         }
     }
 
-    // Skip trie when we're completing the value of a flag that takes a typed
-    // argument (e.g. `sudo -u <user>`).  The trie children here are learned
-    // prior invocations of the command, not values for this flag.
-    let in_flag_value_context = prev_word
-        .is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.flag_takes_value(p)));
+    // Skip trie when the previous word is a flag. If the flag takes a typed
+    // value the earlier `flag_call_programs` / `flag_static_lists` branches
+    // already produced the right output; if the spec doesn't know the flag's
+    // arg type, learned trie children are still the wrong answer — they were
+    // recorded as command positionals (hostnames, paths, etc.) at an earlier
+    // position, not as values for *this* flag.
+    let prev_is_flag = prev_word.is_some_and(|p| p.starts_with('-'));
 
-    let trie_matches = if in_flag_value_context || !cmd_in_trie {
+    let trie_matches = if prev_is_flag || !cmd_in_trie {
         vec![]
     } else {
         node.matcher_aware_search(prefix, &trie.matcher_rules)
@@ -630,6 +658,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
                     .filter(|i| is_plausible_item(i))
+                    .filter(|i| !is_flag_form_item(i))
                     .filter(|i| !matches_group_meta(i, &group.tag, &group.label))
                     .cloned()
                     .collect();
@@ -662,6 +691,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
                     .filter(|i| is_plausible_item(i))
+                    .filter(|i| !is_flag_form_item(i))
                     .filter(|i| !matches_group_meta(i, &group.tag, &group.label))
                     .map(String::as_str)
                     .collect();
@@ -1596,10 +1626,12 @@ mod tests {
     }
 
     #[test]
-    fn is_plausible_item_rejects_lone_uppercase() {
-        // Single uppercase letters (sed s-command modifiers I, M) must be filtered.
-        assert!(!is_plausible_item("I"), "lone uppercase I should be rejected");
-        assert!(!is_plausible_item("M"), "lone uppercase M should be rejected");
+    fn is_plausible_item_accepts_lone_uppercase() {
+        // Single uppercase letters are valid — e.g. `print -f %X` format
+        // specifiers (X, E, G). The old blanket filter broke those.
+        assert!(is_plausible_item("X"), "lone uppercase X should be accepted (printf format)");
+        assert!(is_plausible_item("E"), "lone uppercase E should be accepted");
+        assert!(is_plausible_item("G"), "lone uppercase G should be accepted");
         // Single lowercase and digits are fine (e.g. `v`, `1`).
         assert!(is_plausible_item("v"), "single lowercase should be accepted");
         assert!(is_plausible_item("1"), "single digit should be accepted");
@@ -1607,17 +1639,26 @@ mod tests {
         assert!(is_plausible_item("GET"), "multi-char uppercase should be accepted");
     }
 
+    #[test]
+    fn is_plausible_item_accepts_wildcard_in_multichar_items() {
+        // `*` is a legitimate static-list value in some completions — e.g.
+        // `v*`, `branch-*`, `--match=*`. sanitize_static_list lets them
+        // through; the display-time whitelist must match so they survive.
+        // Bare `*` is still dropped by the separate lone-punctuation rule.
+        assert!(is_plausible_item("v*"), "glob-suffixed token should be accepted");
+        assert!(is_plausible_item("branch-*"), "glob-suffixed name should be accepted");
+        assert!(is_plausible_item("--match=*"), "glob in flag value should be accepted");
+    }
+
     // --- is_noisy_tag filter tests ---
 
     #[test]
     fn is_noisy_tag_rejects_known_noisy_tags() {
-        assert!(is_noisy_tag("headers"),      "headers tag should be noisy");
         assert!(is_noisy_tag("urls"),         "urls tag should be noisy");
         assert!(is_noisy_tag("subsystems"),   "subsystems tag should be noisy");
-        assert!(is_noisy_tag("mods"),         "mods tag should be noisy");
         assert!(is_noisy_tag("address-forms"),"address-forms tag should be noisy");
         // Case-insensitive
-        assert!(is_noisy_tag("Headers"),      "Headers (mixed case) should be noisy");
+        assert!(is_noisy_tag("URLs"),         "URLs (mixed case) should be noisy");
     }
 
     #[test]
@@ -1625,6 +1666,10 @@ mod tests {
         assert!(!is_noisy_tag("commands"),  "commands tag should not be noisy");
         assert!(!is_noisy_tag("files"),     "files tag should not be noisy");
         assert!(!is_noisy_tag("branches"),  "branches tag should not be noisy");
+        // `mods` and `headers` are ambiguous across commands (a2enmod's
+        // Apache modules, mh's mail headers) so must not be blocklisted.
+        assert!(!is_noisy_tag("mods"),      "mods tag must stay allowed (a2enmod)");
+        assert!(!is_noisy_tag("headers"),   "headers tag must stay allowed (mh)");
     }
 
     // --- noisy tag group display suppression test ---
@@ -1633,22 +1678,79 @@ mod tests {
     fn complete_suppresses_noisy_tag_groups_at_root() {
         use crate::trie::{CommandTrie, TagGroup};
         let mut trie = CommandTrie::default();
-        trie.insert(&["wget"]);
-        // Inject noisy tag group (HTTP headers, like wget has in _wget)
+        trie.insert(&["curl"]);
+        // URL schemes tag group — always context-specific (only meaningful
+        // after `--url=`), so must not surface at the command root.
         trie.tag_groups.insert(
-            "wget".to_string(),
+            "curl".to_string(),
             vec![
                 TagGroup {
-                    tag: "headers".to_string(),
-                    label: "HTTP header".to_string(),
-                    items: vec!["Accept".to_string(), "Content-Type".to_string()],
+                    tag: "urls".to_string(),
+                    label: "URL scheme".to_string(),
+                    items: vec!["ftp".to_string(), "gopher".to_string()],
                 },
             ],
         );
         let pins = crate::pins::Pins::default();
-        // Even though the tag group has items, they should be suppressed.
-        let out = super::complete("wget ", &trie, &pins, super::super::engine::ContextHint::Unknown);
-        assert!(!out.contains("Accept"), "HTTP headers should not appear in wget root completions");
-        assert!(!out.contains("Content-Type"), "HTTP headers should not appear in wget root completions");
+        let out = super::complete("curl ", &trie, &pins, super::super::engine::ContextHint::Unknown);
+        assert!(!out.contains("ftp"), "URL scheme items should not appear at command root");
+        assert!(!out.contains("gopher"), "URL scheme items should not appear at command root");
+    }
+
+    #[test]
+    fn is_flag_form_item_recognises_flags_but_not_negatives() {
+        assert!(is_flag_form_item("--cask"));
+        assert!(is_flag_form_item("-v"));
+        assert!(is_flag_form_item("--"));
+        assert!(!is_flag_form_item("-"));
+        assert!(!is_flag_form_item("foo"));
+        assert!(!is_flag_form_item(""));
+        // Negative numeric literals are not flag-form — they're legitimate
+        // values (e.g. some tools accept `-1` as a count).
+        assert!(!is_flag_form_item("-1"));
+        assert!(!is_flag_form_item("-42"));
+    }
+
+    #[test]
+    fn complete_suppresses_trie_children_after_flag_word() {
+        // After `ssh -s `, the prev word is a flag. Even when the spec
+        // doesn't know -s's arg type, learned trie children (hostnames
+        // from prior `ssh fep.host` / `ssh pc.host` invocations) must
+        // not surface as "Possible subcommands" — they're positional
+        // values for the command, not values for this flag.
+        use crate::trie::CommandTrie;
+        let mut trie = CommandTrie::default();
+        trie.insert(&["ssh", "fep"]);
+        trie.insert(&["ssh", "pc"]);
+        let pins = crate::pins::Pins::default();
+        let out = super::complete(
+            "ssh -s ",
+            &trie,
+            &pins,
+            super::super::engine::ContextHint::Unknown,
+        );
+        assert!(
+            !out.contains("Possible subcommands"),
+            "no subcommand header after a flag word:\n{out}"
+        );
+        assert!(!out.contains("fep"), "learned positional must not leak after flag:\n{out}");
+        assert!(!out.contains("pc"),  "learned positional must not leak after flag:\n{out}");
+    }
+
+    #[test]
+    fn is_generic_output_matches_sentinel_lines_only() {
+        // Sentinel header lines must trigger.
+        assert!(super::is_generic_output("% Expects: <argument>\n"));
+        assert!(super::is_generic_output("% No commands matching \"foo\"\n"));
+
+        // A description or item body that happens to embed the sentinel
+        // text as a substring must NOT trigger — the old substring-contains
+        // implementation was fragile here.
+        let fake = "% Possible subcommands:\n  demo  Expects: <argument> (in docstring)\n";
+        assert!(!super::is_generic_output(fake));
+
+        // Empty / unrelated output stays non-generic.
+        assert!(!super::is_generic_output(""));
+        assert!(!super::is_generic_output("% Possible subcommands:\n  foo\n"));
     }
 }

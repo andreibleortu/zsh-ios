@@ -85,7 +85,11 @@ print "PD=${POSTDISPLAY}"
     [[ "$output" == *"PD=  git branch"* ]]
 }
 
-@test "region_highlight gets P0 entry when ghost is shown" {
+@test "region_highlight gets a styled range entry when ghost is shown" {
+    # The widget paints POSTDISPLAY by adding a range "<start> <end> <style>"
+    # to region_highlight, where start = #BUFFER and end = start + #POSTDISPLAY.
+    # (The old P0 predisplay form was removed — see plugin comment above
+    # _zsh_ios_ghost_preview_widget; it mis-covered BUFFER + POSTDISPLAY head.)
     export ZSH_IOS_STUB_RESOLVE_OUT="git branch"
     export ZSH_IOS_STUB_RESOLVE_EXIT=0
     run zsh_run '
@@ -94,10 +98,11 @@ typeset -ga region_highlight=()
 BUFFER="gi br"
 CURSOR=${#BUFFER}
 _zsh_ios_ghost_preview_widget
+# BUFFER=5 chars, POSTDISPLAY="  git branch"=12 chars → range "5 17".
 print "HL=${region_highlight[*]}"
 '
     [[ "$status" -eq 0 ]]
-    [[ "$output" == *"HL=P0"* ]]
+    [[ "$output" == *"HL=5 17 fg=240"* ]]
 }
 
 @test "passthrough exit code (2) leaves POSTDISPLAY empty" {

@@ -848,27 +848,44 @@ fn extract_case_prev_subs(
     }
 
     // --- Pass 2 ---
-    // Build the set of words produced by any FLAG arm (label starts with `-`).
-    // These words are flag values, not subcommands — any non-flag arm label
-    // that also appears in this set is a flag value and must not become a
-    // trie child.
+    // Identify flag arms whose *entire* word list consists of non-flag arm
+    // labels — that's the flag-value-dispatcher signature. When a flag arm's
+    // words are all case-arm labels, the words are flag values that dispatch
+    // further; the same-named non-flag arms are dispatcher branches, not real
+    // subcommands.
     //
     // Example (firewall-cmd):
     //   --passthrough|--*-chain|...)   → ipv4 ipv6 eb   ← flag arm, words are flag values
     //   ipv4|ipv6|eb)                  → nat filter mangle
-    // Without this filter, `ipv4`, `ipv6`, and `eb` would be inserted as
-    // `firewall-cmd → ipv4`, polluting the completion list.
-    let flag_words: std::collections::HashSet<String> = full
+    // All three flag-arm words (ipv4/ipv6/eb) are themselves arm labels, so
+    // the flag arm is a dispatcher and those labels are dropped.
+    //
+    // The earlier rule ("drop label if it appears in ANY flag arm's words")
+    // was too aggressive: a flag arm like `--format)  → json yaml text` would
+    // kill a legitimate `json` subcommand arm even though only one of the
+    // flag arm's words collides.
+    let nonflag_labels: std::collections::HashSet<String> = full
+        .keys()
+        .filter(|l| !l.starts_with('-'))
+        .cloned()
+        .collect();
+    let flag_value_labels: std::collections::HashSet<String> = full
         .iter()
         .filter(|(label, _)| label.starts_with('-'))
+        .filter(|(_, words)| {
+            !words.is_empty() && words.iter().all(|w| nonflag_labels.contains(w))
+        })
         .flat_map(|(_, words)| words.clone())
         .collect();
 
     for (label, words) in full {
         // Keep only non-flag labels that:
         // (a) look like plausible command/subcommand names, AND
-        // (b) do NOT appear as completion words for flag arms.
-        if !label.starts_with('-') && is_likely_cmd_name(&label) && !flag_words.contains(&label) {
+        // (b) are not flagged as flag-value dispatcher branches.
+        if !label.starts_with('-')
+            && is_likely_cmd_name(&label)
+            && !flag_value_labels.contains(&label)
+        {
             result.entry(label).or_default().extend(words);
         }
     }
@@ -1167,6 +1184,49 @@ complete -F _firewall firewall
             );
             assert!(node.get_child("eb").is_none(), "eb should not be a subcommand");
         }
+    }
+
+    #[test]
+    fn case_prev_preserves_subcommand_when_flag_arm_is_not_dispatcher() {
+        // A flag arm that enumerates plain values (e.g. `--format) → json yaml text`)
+        // must NOT poison the matching `json)` subcommand arm. The pass-2 rule is
+        // "drop only when the flag arm's entire word list is arm labels" (the
+        // dispatcher pattern). Here only `json` overlaps; `yaml` and `text`
+        // aren't arm labels, so the flag arm is a plain value enumeration and
+        // `json` must survive as a subcommand.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("fmtcli.bash");
+        fs::write(
+            &f,
+            r#"_fmtcli() {
+    local cur prev
+    _init_completion || return
+
+    case $prev in
+        --format)
+            COMPREPLY=( $(compgen -W "json yaml text" -- "$cur") )
+            ;;
+        json)
+            COMPREPLY=( $(compgen -W "pretty compact" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _fmtcli fmtcli
+"#,
+        )
+        .unwrap();
+
+        let mut trie = CommandTrie::new();
+        scan_bash_dirs(&mut trie, &[dir.path().to_str().unwrap()]);
+
+        let node = trie
+            .root
+            .get_child("fmtcli")
+            .expect("fmtcli should be in trie — its `json)` arm yields a subcommand");
+        assert!(
+            node.get_child("json").is_some(),
+            "json must survive as a subcommand (flag arm has non-label words yaml/text — not a dispatcher)"
+        );
     }
 
     #[test]
