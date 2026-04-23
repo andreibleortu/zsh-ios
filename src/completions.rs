@@ -179,6 +179,46 @@ fn extract_descriptions_from_content(
         }
     }
 
+    // Derive the parent key used for descriptions of this command's subcommands.
+    let parent_key = if cmd_name.contains('-') {
+        cmd_name.replacen('-', " ", 1)
+    } else {
+        cmd_name.to_string()
+    };
+
+    // Collect descriptions from `_values` invocations: items like `'push[send to remote]'`.
+    for (name, opt_desc) in parse_values_spec(content) {
+        if let Some(desc) = opt_desc
+            && !name.is_empty() && !desc.is_empty()
+        {
+            result
+                .entry(parent_key.clone())
+                .or_default()
+                .entry(name)
+                .or_insert(desc);
+        }
+    }
+
+    // Collect descriptions from local array declarations referenced by `_describe`.
+    // Only descriptions from arrays that are actually passed to `_describe` or
+    // `compadd -a` are plausibly subcommand lists.
+    let array_data = collect_local_arrays(content);
+    for (var, descs) in &array_data.descriptions {
+        if descs.is_empty() {
+            continue;
+        }
+        // Only include if this variable name appears alongside _describe or compadd -a.
+        let as_describe = content.contains("_describe") && content.contains(var.as_str());
+        let as_compadd_a = content.contains("-a ") && content.contains(var.as_str());
+        if !as_describe && !as_compadd_a {
+            continue;
+        }
+        let entry = result.entry(parent_key.clone()).or_default();
+        for (name, desc) in descs {
+            entry.entry(name.clone()).or_insert_with(|| desc.clone());
+        }
+    }
+
     result
 }
 
@@ -1299,6 +1339,363 @@ enum StateAction {
     CallProgram(String, Vec<String>),
     /// A fixed enumeration of literal completion items.
     StaticList(Vec<String>),
+    /// A fixed enumeration of literal completion items with per-item
+    /// descriptions. Descriptions carried here are currently unused by the
+    /// ArgSpec consumer (which has no description field); the parallel path
+    /// in `extract_descriptions_from_content` re-derives them independently.
+    /// Kept as a distinct variant so future consumers can pick them up
+    /// without another grammar pass.
+    StaticListWithDescs(Vec<String>, #[allow(dead_code)] HashMap<String, String>),
+}
+
+/// Local array declarations extracted from a body of Zsh code.
+/// Used to resolve `_describe ... VAR` and `compadd -a VAR` references.
+pub(super) struct ArrayData {
+    /// Variable name → list of item names.
+    pub items: HashMap<String, Vec<String>>,
+    /// Variable name → (item name → description).
+    pub descriptions: HashMap<String, HashMap<String, String>>,
+}
+
+impl ArrayData {
+    fn new() -> Self {
+        ArrayData {
+            items: HashMap::new(),
+            descriptions: HashMap::new(),
+        }
+    }
+}
+
+/// Scan a body of Zsh code for local array declarations and collect the items.
+///
+/// Recognises:
+/// - `local -a NAME=(item1 item2 ...)`  (single-line)
+/// - `NAME=(item1 item2 ...)`           (no `local -a` prefix)
+/// - Multi-line: opening `(` with `)` on a later line
+///
+/// Item forms:
+/// - Bare word: `foo`           → name = "foo", no description
+/// - Single-quoted: `'foo'`     → name = "foo", no description
+/// - Description form: `'foo[description]'` → name = "foo", desc = "description"
+pub(super) fn collect_local_arrays(body: &str) -> ArrayData {
+    let mut data = ArrayData::new();
+    let lines: Vec<&str> = body.lines().collect();
+    let n = lines.len();
+    let mut i = 0;
+
+    while i < n {
+        let line = lines[i].trim();
+
+        // Strip optional `local -a ` / `typeset -a ` / `declare -a ` prefix.
+        let after_decl = if let Some(r) = line.strip_prefix("local -a ") {
+            r.trim()
+        } else if let Some(r) = line.strip_prefix("typeset -a ") {
+            r.trim()
+        } else if let Some(r) = line.strip_prefix("declare -a ") {
+            r.trim()
+        } else {
+            line
+        };
+
+        // Must have `NAME=(` assignment.
+        let Some(eq_pos) = after_decl.find("=(") else {
+            i += 1;
+            continue;
+        };
+
+        let var_name: String = after_decl[..eq_pos]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        if var_name.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Collect content from the `(` to the matching `)`, possibly spanning lines.
+        let content_start = eq_pos + 2; // skip `=(`
+        let mut collected = after_decl[content_start..].to_string();
+        let mut depth: i32 = 1;
+        let mut j = i;
+
+        // Count parens to find end; if depth reaches 0 we are done.
+        'paren: loop {
+            let chunk = if j == i {
+                after_decl[content_start..].to_string()
+            } else {
+                let l = lines[j].trim().to_string();
+                collected.push(' ');
+                collected.push_str(&l);
+                l
+            };
+            for ch in chunk.chars() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth <= 0 {
+                            break 'paren;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+            if j >= n {
+                break;
+            }
+        }
+
+        // Strip trailing `)` if present.
+        let inner = collected.trim_end_matches(')').trim().to_string();
+        // Advance past all consumed lines.
+        i = j + 1;
+
+        // Tokenize inner content with quote awareness to extract items.
+        let raw_items = tokenize_array_content(&inner);
+
+        let mut item_names: Vec<String> = Vec::new();
+        let mut item_descs: HashMap<String, String> = HashMap::new();
+
+        for raw in raw_items {
+            let (name, desc) = parse_array_item(&raw);
+            if !name.is_empty() {
+                item_names.push(name.clone());
+                if let Some(d) = desc {
+                    item_descs.insert(name, d);
+                }
+            }
+        }
+
+        if !item_names.is_empty() {
+            data.items.entry(var_name.clone()).or_default().extend(item_names);
+            if !item_descs.is_empty() {
+                data.descriptions.entry(var_name).or_default().extend(item_descs);
+            }
+        }
+    }
+
+    data
+}
+
+/// Tokenize the content inside `( ... )` of a Zsh array assignment.
+/// Returns individual items, respecting single and double quotes.
+fn tokenize_array_content(inner: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            '\'' => {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+                // A single-quoted token ends here; flush it.
+                let tok = current.trim().to_string();
+                if !tok.is_empty() {
+                    tokens.push(tok);
+                }
+                current = String::new();
+            }
+            '"' => {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '"' {
+                        break;
+                    }
+                    current.push(c);
+                }
+                let tok = current.trim().to_string();
+                if !tok.is_empty() {
+                    tokens.push(tok);
+                }
+                current = String::new();
+            }
+            ' ' | '\t' | '\n' | '\r' => {
+                let tok = current.trim().to_string();
+                if !tok.is_empty() {
+                    tokens.push(tok);
+                }
+                current = String::new();
+                chars.next();
+            }
+            '\\' => {
+                chars.next(); // skip backslash
+                if let Some(&nc) = chars.peek() {
+                    chars.next();
+                    current.push(nc);
+                }
+            }
+            _ => {
+                current.push(ch);
+                chars.next();
+            }
+        }
+    }
+    let tok = current.trim().to_string();
+    if !tok.is_empty() {
+        tokens.push(tok);
+    }
+    tokens
+}
+
+/// Parse a single array item token into (name, optional_description).
+/// Handles `name[description text]` form.
+fn parse_array_item(raw: &str) -> (String, Option<String>) {
+    let raw = raw.trim();
+    if let Some(bracket_pos) = raw.find('[') {
+        let name = raw[..bracket_pos].trim().to_string();
+        let rest = &raw[bracket_pos + 1..];
+        let desc = if let Some(close) = rest.rfind(']') {
+            rest[..close].trim().to_string()
+        } else {
+            rest.trim().to_string()
+        };
+        if name.is_empty() {
+            (raw.to_string(), None)
+        } else {
+            (name, if desc.is_empty() { None } else { Some(desc) })
+        }
+    } else {
+        (raw.to_string(), None)
+    }
+}
+
+/// Parse `_values` invocations from a body of Zsh code.
+///
+/// Returns a list of `(item_name, Option<description>)` pairs for all items
+/// found across all `_values` calls in the body.
+///
+/// Handles flags `-s SEP`, `-S SEP`, `-w`, `-C`, `-O VAR` — all skipped.
+/// The first non-flag argument is the tag/group label and is also skipped.
+/// Remaining arguments are items in `name[desc]` or bare `name` form.
+pub(super) fn parse_values_spec(body: &str) -> Vec<(String, Option<String>)> {
+    let mut result = Vec::new();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Find _values — may appear anywhere in the line.
+        let Some(pos) = trimmed.find("_values") else { continue };
+        // Ensure it is a standalone token (not `_values_something`).
+        let after = &trimmed[pos + "_values".len()..];
+        let boundary_ok = after.is_empty()
+            || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '\'' || c == '"');
+        if !boundary_ok {
+            continue;
+        }
+        // Also verify what's before is not an identifier character.
+        if pos > 0 {
+            let before_ch = trimmed.as_bytes().get(pos - 1).copied().unwrap_or(b' ');
+            if before_ch.is_ascii_alphanumeric() || before_ch == b'_' {
+                continue;
+            }
+        }
+
+        let tokens = shell_tokenize(&trimmed[pos..]);
+        // tokens[0] == "_values"
+        let mut idx = 1usize;
+        // Skip flags.
+        while idx < tokens.len() {
+            let t = &tokens[idx];
+            if t.starts_with('-') {
+                idx += 1;
+                // Flags that take an argument.
+                if matches!(t.as_str(), "-s" | "-S" | "-O") {
+                    idx += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        // Skip the tag/group label (first non-flag token).
+        if idx < tokens.len() {
+            idx += 1;
+        }
+        // Collect items.
+        while idx < tokens.len() {
+            let t = tokens[idx].trim().to_string();
+            if t.starts_with('$') || matches!(t.as_str(), "&&" | "||" | ";" | "&" | "|") {
+                break;
+            }
+            let (name, desc) = parse_array_item(&t);
+            if !name.is_empty() {
+                result.push((name, desc));
+            }
+            idx += 1;
+        }
+    }
+
+    result
+}
+
+/// Look for `_describe ... VAR` / `_describe -t TAG 'label' VAR` / `compadd -a VAR`
+/// in an arm body and return the referenced variable name, if found.
+fn find_array_ref_in_arm(arm: &str) -> Option<String> {
+    for line in arm.lines() {
+        let trimmed = line.trim();
+        // `_describe [-t TAG] 'label' VAR`
+        if trimmed.contains("_describe") {
+            let tokens = shell_tokenize(trimmed);
+            let mut idx = 1usize;
+            // Skip optional flags with arguments (-t TAG, -s SEP, etc.)
+            while idx < tokens.len() && tokens[idx].starts_with('-') {
+                idx += 1;
+                // -t, -s take a value argument
+                if matches!(tokens.get(idx - 1).map(|s| s.as_str()), Some("-t") | Some("-s")) {
+                    idx += 1;
+                }
+            }
+            // Next token: the label string (skip it).
+            if idx < tokens.len() {
+                idx += 1;
+            }
+            // Next token: the array variable name (may be `VAR` or `$VAR` or `${VAR}`).
+            if let Some(var_tok) = tokens.get(idx) {
+                let var = strip_dollar(var_tok);
+                if !var.is_empty() && !var.starts_with('\'') && !var.starts_with('"') {
+                    return Some(var.to_string());
+                }
+            }
+        }
+
+        // `compadd -a VAR`
+        if trimmed.contains("compadd") && trimmed.contains("-a") {
+            let tokens = shell_tokenize(trimmed);
+            let mut idx = 1usize;
+            while idx < tokens.len() {
+                if tokens[idx] == "-a"
+                    && let Some(var_tok) = tokens.get(idx + 1)
+                {
+                    let var = strip_dollar(var_tok);
+                    if !var.is_empty() {
+                        return Some(var.to_string());
+                    }
+                }
+                idx += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Strip leading `$` / `${` and trailing `}` from a variable reference token.
+fn strip_dollar(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("${") {
+        inner.trim_end_matches('}')
+    } else if let Some(inner) = s.strip_prefix('$') {
+        inner
+    } else {
+        s
+    }
 }
 
 /// Parse `case $state in` / `case "$lstate" in` blocks from a Zsh completion
@@ -1306,13 +1703,18 @@ enum StateAction {
 ///
 /// Each case arm is scanned with a priority order:
 ///   1. `_call_program tag cmd ...` → CallProgram
-///   2. `compadd - items` / `_values 'desc' items` → StaticList
-///   3. Known function names (`_ssh_hosts`, `__git_branch_names`, …) → ArgType
-///   4. `_files` / `_directories` → ArgType(PATHS / DIRS_ONLY)
+///   2. `_describe ... VAR` / `compadd -a VAR` resolved via local arrays → StaticListWithDescs
+///   3. `compadd - items` / `_values 'desc' items` → StaticList / StaticListWithDescs
+///   4. Known function names (`_ssh_hosts`, `__git_branch_names`, …) → ArgType
+///   5. `_files` / `_directories` → ArgType(PATHS / DIRS_ONLY)
 ///
 /// Only the first recognisable completion in each arm is recorded.
 fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
     let mut result = HashMap::new();
+
+    // Collect local array declarations from the whole function body so that
+    // individual arm handlers can look up VAR references.
+    let arrays = collect_local_arrays(body);
 
     // Find `case $state in` or `case "$lstate" in` or `case "${state}" in` etc.
     let case_pat = ["case $state in", "case \"$state\" in",
@@ -1357,7 +1759,7 @@ fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
         }
 
         // Scan the arm body for a recognisable completion
-        let action = extract_state_arm_action(arm);
+        let action = extract_state_arm_action_with_arrays(arm, &arrays);
         if let Some(action) = action {
             result.entry(name).or_insert(action);
         }
@@ -1367,7 +1769,22 @@ fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
 }
 
 /// Given the raw text of a `case` arm, return the first completion action found.
+/// Delegates to the richer version with an empty array context.
 fn extract_state_arm_action(arm: &str) -> Option<StateAction> {
+    let empty = ArrayData::new();
+    extract_state_arm_action_with_arrays(arm, &empty)
+}
+
+/// Given the raw text of a `case` arm and the local arrays collected from the
+/// enclosing function body, return the first completion action found.
+///
+/// Priority:
+///   1. `_call_program` → CallProgram
+///   2. `_describe ... VAR` / `compadd -a VAR` resolved via `arrays` → StaticListWithDescs
+///   3. `_values 'tag' item[desc] ...` → StaticListWithDescs (or StaticList if no descs)
+///   4. `compadd - item ...` → StaticList
+///   5. detect_type_in_block → ArgType
+fn extract_state_arm_action_with_arrays(arm: &str, arrays: &ArrayData) -> Option<StateAction> {
     // Priority 1: _call_program
     if arm.contains("_call_program")
         && let Some((tag, argv)) = parse_call_program(arm)
@@ -1375,12 +1792,47 @@ fn extract_state_arm_action(arm: &str) -> Option<StateAction> {
         return Some(StateAction::CallProgram(tag, argv));
     }
 
-    // Priority 2: static list via compadd / _values
-    if arm.contains("compadd") || arm.contains("_values") {
-        // Find the compadd / _values call — look for the line that contains it
+    // Priority 2: _describe ... VAR / compadd -a VAR resolved via local arrays.
+    let has_describe = arm.contains("_describe");
+    let has_compadd_a = arm.contains("compadd") && arm.contains("-a");
+    if (has_describe || has_compadd_a)
+        && let Some(var) = find_array_ref_in_arm(arm)
+        && let Some(items) = arrays.items.get(&var)
+        && !items.is_empty()
+    {
+        let descs = arrays.descriptions.get(&var).cloned().unwrap_or_default();
+        return Some(if descs.is_empty() {
+            StateAction::StaticList(items.clone())
+        } else {
+            StateAction::StaticListWithDescs(items.clone(), descs)
+        });
+    }
+
+    // Priority 3: _values with optional [desc] items.
+    if arm.contains("_values") {
+        let values_items = parse_values_spec(arm);
+        if !values_items.is_empty() {
+            let mut names: Vec<String> = Vec::new();
+            let mut descs: HashMap<String, String> = HashMap::new();
+            for (name, desc) in values_items {
+                names.push(name.clone());
+                if let Some(d) = desc {
+                    descs.insert(name, d);
+                }
+            }
+            return Some(if descs.is_empty() {
+                StateAction::StaticList(names)
+            } else {
+                StateAction::StaticListWithDescs(names, descs)
+            });
+        }
+    }
+
+    // Priority 4: static list via compadd
+    if arm.contains("compadd") {
         for line in arm.lines() {
             let line = line.trim();
-            if (line.contains("compadd") || line.starts_with("_values"))
+            if line.contains("compadd")
                 && let Some(items) = action_to_static_list(line)
                 && !items.is_empty()
             {
@@ -1389,7 +1841,7 @@ fn extract_state_arm_action(arm: &str) -> Option<StateAction> {
         }
     }
 
-    // Priority 3: detect_type_in_block scans every line and combines all types
+    // Priority 5: detect_type_in_block scans every line and combines all types
     // (handles _alternative blocks with mixed __git_cached_files + _directories → PATHS,
     // plain _files/_directories, direct function calls, quoted action specs, etc.)
     if let Some(t) = detect_type_in_block(arm) {
@@ -2597,6 +3049,15 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                             .or_insert_with(|| (tag, argv));
                     }
                     (StateRefKind::Flag(flag), StateAction::StaticList(items)) => {
+                        spec.flag_static_lists.entry(flag).or_insert(items);
+                    }
+                    (StateRefKind::Rest, StateAction::StaticListWithDescs(items, _)) => {
+                        spec.rest_static_list.get_or_insert(items);
+                    }
+                    (StateRefKind::Positional(_), StateAction::StaticListWithDescs(items, _)) => {
+                        spec.rest_static_list.get_or_insert(items);
+                    }
+                    (StateRefKind::Flag(flag), StateAction::StaticListWithDescs(items, _)) => {
                         spec.flag_static_lists.entry(flag).or_insert(items);
                     }
                 }
@@ -4948,5 +5409,148 @@ _git-checkout() {
             sorted.len(),
             "completion_dirs must not contain duplicates",
         );
+    }
+
+    // --- Tests for collect_local_arrays ---
+
+    #[test]
+    fn collect_local_arrays_single_line() {
+        let body = "local -a cmds=(foo bar baz)\n";
+        let data = collect_local_arrays(body);
+        let items = data.items.get("cmds").expect("cmds should be present");
+        assert_eq!(items, &["foo", "bar", "baz"]);
+        assert!(data.descriptions.get("cmds").is_none_or(|m| m.is_empty()));
+    }
+
+    #[test]
+    fn collect_local_arrays_multi_line() {
+        let body = "local -a cmds=(\n  foo\n  bar\n  baz\n)\n";
+        let data = collect_local_arrays(body);
+        let items = data.items.get("cmds").expect("cmds should be present");
+        assert!(items.contains(&"foo".to_string()));
+        assert!(items.contains(&"bar".to_string()));
+        assert!(items.contains(&"baz".to_string()));
+    }
+
+    #[test]
+    fn collect_local_arrays_with_descriptions() {
+        let body = "local -a cmds=(\n  'push[send to remote]'\n  'pull[fetch and merge]'\n  'fetch'\n)\n";
+        let data = collect_local_arrays(body);
+        let items = data.items.get("cmds").expect("cmds should be present");
+        assert!(items.contains(&"push".to_string()));
+        assert!(items.contains(&"pull".to_string()));
+        assert!(items.contains(&"fetch".to_string()));
+        let descs = data.descriptions.get("cmds").expect("descriptions should be present");
+        assert_eq!(descs.get("push"), Some(&"send to remote".to_string()));
+        assert_eq!(descs.get("pull"), Some(&"fetch and merge".to_string()));
+        assert!(!descs.contains_key("fetch"), "fetch has no description");
+    }
+
+    #[test]
+    fn collect_local_arrays_without_local_prefix() {
+        let body = "cmds=(a b c)\n";
+        let data = collect_local_arrays(body);
+        let items = data.items.get("cmds").expect("cmds should be present");
+        assert_eq!(items, &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn collect_local_arrays_mixed_quotes() {
+        let body = "local -a opts=('foo' \"bar\" baz)\n";
+        let data = collect_local_arrays(body);
+        let items = data.items.get("opts").expect("opts should be present");
+        assert!(items.contains(&"foo".to_string()));
+        assert!(items.contains(&"bar".to_string()));
+        assert!(items.contains(&"baz".to_string()));
+    }
+
+    // --- Tests for parse_values_spec ---
+
+    #[test]
+    fn parse_values_simple() {
+        let body = "_values 'commands' 'push[desc]' 'pull'\n";
+        let items = parse_values_spec(body);
+        assert_eq!(items.len(), 2);
+        let push = items.iter().find(|(n, _)| n == "push").expect("push missing");
+        assert_eq!(push.1, Some("desc".to_string()));
+        let pull = items.iter().find(|(n, _)| n == "pull").expect("pull missing");
+        assert_eq!(pull.1, None);
+    }
+
+    #[test]
+    fn parse_values_with_flags() {
+        let body = "_values -s , -S = 'tag' 'foo[f]' 'bar[b]'\n";
+        let items = parse_values_spec(body);
+        assert_eq!(items.len(), 2);
+        let foo = items.iter().find(|(n, _)| n == "foo").expect("foo missing");
+        assert_eq!(foo.1, Some("f".to_string()));
+        let bar = items.iter().find(|(n, _)| n == "bar").expect("bar missing");
+        assert_eq!(bar.1, Some("b".to_string()));
+    }
+
+    // --- Tests for _describe + local array integration ---
+
+    #[test]
+    fn describe_via_local_array() {
+        let body = r#"
+local -a cmds=(
+  'push[send commits to remote]'
+  'pull[fetch and merge]'
+  'fetch[download objects]'
+)
+
+case $state in
+  (subcmd)
+    _describe 'command' cmds
+    ;;
+esac
+"#;
+        let handlers = extract_state_handlers(body);
+        let action = handlers.get("subcmd").expect("subcmd state should be present");
+        match action {
+            StateAction::StaticListWithDescs(items, descs) => {
+                assert!(items.contains(&"push".to_string()));
+                assert!(items.contains(&"pull".to_string()));
+                assert!(items.contains(&"fetch".to_string()));
+                assert_eq!(descs.get("push"), Some(&"send commits to remote".to_string()));
+                assert_eq!(descs.get("pull"), Some(&"fetch and merge".to_string()));
+            }
+            StateAction::StaticList(items) => {
+                // Acceptable if no descriptions were extracted
+                assert!(items.contains(&"push".to_string()));
+            }
+            other => panic!("unexpected action: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn describe_bare_array_reference() {
+        // No `local -a` prefix, but VAR is defined earlier in the body.
+        let body = r#"
+subcmds=(
+  'start[start a process]'
+  'stop[stop a process]'
+)
+
+case $state in
+  (action)
+    _describe 'action' subcmds
+    ;;
+esac
+"#;
+        let handlers = extract_state_handlers(body);
+        let action = handlers.get("action").expect("action state should be present");
+        match action {
+            StateAction::StaticListWithDescs(items, descs) => {
+                assert!(items.contains(&"start".to_string()));
+                assert!(items.contains(&"stop".to_string()));
+                assert_eq!(descs.get("start"), Some(&"start a process".to_string()));
+                assert_eq!(descs.get("stop"), Some(&"stop a process".to_string()));
+            }
+            StateAction::StaticList(items) => {
+                assert!(items.contains(&"start".to_string()));
+            }
+            other => panic!("unexpected action: {:?}", other),
+        }
     }
 }
