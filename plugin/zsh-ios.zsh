@@ -1057,7 +1057,7 @@ compadd() {
     fi
 }
 
-# Configure the approximate completer for the `approximate` request type.
+# Configure the approximate completer for the 'approximate' request type.
 # max-errors 2 numeric — tolerate up to 2 typos (insertion/deletion/swap),
 # shown as numeric substitutions in the prompt.  Applies only when we opt
 # into it via compstate[completer].
