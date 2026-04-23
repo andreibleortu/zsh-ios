@@ -18,6 +18,52 @@ fn hdr() -> String {
     crate::runtime_config::get().picker_header_prefix
 }
 
+/// Heuristic filter for tag-group item noise. The `_description` /
+/// `_wanted` extractor sometimes grabs raw zsh code fragments —
+/// matcher-list patterns (`r:|/=*`), parameter expansions (`${…}`),
+/// internal cache-var names (`_git_refs_cache`), lone backslashes, etc.
+/// Displaying those as completion items is confusing; drop anything
+/// that doesn't look like a plausible argument value.
+///
+/// Conservative — prefers keeping over dropping. Only rejects strings
+/// that clearly originate from zsh source rather than from a compadd
+/// argument list. Legit items like `%1` (job spec), `--flag`, `v2.0`
+/// must survive.
+fn is_plausible_item(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() { return false; }
+    // Lone punctuation (`\`, `|`, `&`, etc.).
+    if t.len() == 1 && !t.chars().next().unwrap().is_ascii_alphanumeric() {
+        return false;
+    }
+    // Zsh matcher-list fragments: `r:|…=*`, `l:|…=*`, `b:=*`, `e:=*`.
+    if (t.starts_with("r:") || t.starts_with("l:") || t.starts_with("b:") || t.starts_with("e:"))
+        && t.contains('*')
+    {
+        return false;
+    }
+    // Unexpanded parameter or command substitution.
+    if t.contains("${") || t.contains("$(") {
+        return false;
+    }
+    // Bare `$varname` — starts with `$` followed by an identifier char.
+    if let Some(rest) = t.strip_prefix('$')
+        && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return false;
+    }
+    // Backslash-escaped content (line continuations, escape sequences).
+    if t.contains('\\') || t.contains('\n') {
+        return false;
+    }
+    // Internal cache / helper names (zsh convention: `_git_cache`,
+    // `__git_describe`, etc.). Regular flags starting with `-` are fine.
+    if t.starts_with('_') {
+        return false;
+    }
+    true
+}
+
 /// Uppercase the first character of a string, leave the rest unchanged.
 fn titlecase(s: &str) -> String {
     let mut chars = s.chars();
@@ -467,6 +513,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                     .items
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+                    .filter(|i| is_plausible_item(i))
                     .cloned()
                     .collect();
                 all_items.extend(filtered);
@@ -482,14 +529,22 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                 group_output.push_str(&format_columns(&refs, 80));
             }
         } else {
-            // Per-tag headers (default behavior).
+            // Per-tag headers (default behavior). Skip empty groups entirely
+            // — the old "empty-group stub" path printed a header with no
+            // items below it, which is noise when the parser attached a
+            // label but no list (happens a lot with `_description TAG expl`
+            // calls whose compadd runs on a separate line we don't thread).
             for group in groups {
                 let filtered: Vec<&str> = group
                     .items
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+                    .filter(|i| is_plausible_item(i))
                     .map(String::as_str)
                     .collect();
+                if filtered.is_empty() {
+                    continue;
+                }
                 let header_label = {
                     let raw = titlecase(&group.label);
                     match format_template {
@@ -497,19 +552,14 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                         None => raw,
                     }
                 };
-                if filtered.is_empty() && prefix.is_empty() && !group.label.is_empty() {
-                    // Show an empty-group stub: label only, no items
-                    group_output.push_str(&format!("% {}:\n", header_label));
-                } else if !filtered.is_empty() {
-                    group_output.push_str(&format!("% {}:\n", header_label));
-                    if use_colors {
-                        let display: Vec<String> =
-                            filtered.iter().map(|i| colorize_item(i)).collect();
-                        let refs: Vec<&str> = display.iter().map(String::as_str).collect();
-                        group_output.push_str(&format_columns(&refs, 80));
-                    } else {
-                        group_output.push_str(&format_columns(&filtered, 80));
-                    }
+                group_output.push_str(&format!("% {}:\n", header_label));
+                if use_colors {
+                    let display: Vec<String> =
+                        filtered.iter().map(|i| colorize_item(i)).collect();
+                    let refs: Vec<&str> = display.iter().map(String::as_str).collect();
+                    group_output.push_str(&format_columns(&refs, 80));
+                } else {
+                    group_output.push_str(&format_columns(&filtered, 80));
                 }
             }
         }

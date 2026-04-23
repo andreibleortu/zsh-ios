@@ -592,6 +592,156 @@ fn apply_yaml_to_trie(yaml: &str, trie: &mut CommandTrie) -> (u32, u32, u32) {
     apply_spec_to_trie(&spec, &[], trie, &HashMap::new())
 }
 
+// ── carapace-fetch ────────────────────────────────────────────────────────────
+
+/// Download the latest carapace-bin release into the cache dir and dump every
+/// builtin completer's YAML spec there. Subsequent `zsh-ios rebuild` reads
+/// those YAMLs and folds them into the trie.
+pub fn cmd_carapace_fetch() -> Result<(), Box<dyn std::error::Error>> {
+    let cache_root = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let bin_dir = cache_root.join("zsh-ios").join("carapace-bin");
+    let specs_dir = cache_root.join("zsh-ios").join("carapace-specs");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(&specs_dir)?;
+
+    let bin_path = bin_dir.join("carapace");
+
+    let url = resolve_carapace_url()?;
+    eprintln!("Fetching {}", url);
+
+    download_and_extract(&url, &bin_dir, "carapace")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let version = version_string(&bin_path)?;
+    eprintln!("Using carapace {}", version);
+
+    let commanders = list_completers(&bin_path)?;
+    eprintln!("Dumping {} completers...", commanders.len());
+
+    let mut written = 0u32;
+    for name in &commanders {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.starts_with('-')
+        {
+            continue;
+        }
+        let spec = dump_spec(&bin_path, name)?;
+        if !spec.trim().is_empty() {
+            let dest = specs_dir.join(format!("{}.yaml", name));
+            std::fs::write(&dest, spec)?;
+            written += 1;
+        }
+    }
+    eprintln!("Wrote {} specs to {}", written, specs_dir.display());
+    Ok(())
+}
+
+fn resolve_carapace_url() -> Result<String, Box<dyn std::error::Error>> {
+    let os_token = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "windows",
+        other => return Err(format!("unsupported OS: {}", other).into()),
+    };
+    let arch_token = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => return Err(format!("unsupported arch: {}", other).into()),
+    };
+
+    let api = "https://api.github.com/repos/carapace-sh/carapace-bin/releases/latest";
+    let output = std::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--location", "--user-agent", "zsh-ios", api])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("curl failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let assets = parsed
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .ok_or("no assets in release JSON")?;
+    for asset in assets {
+        let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.contains(os_token)
+            && name.contains(arch_token)
+            && name.ends_with(".tar.gz")
+            && let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str())
+        {
+            return Ok(url.to_string());
+        }
+    }
+    Err(format!("no matching asset for {}-{}", os_token, arch_token).into())
+}
+
+fn download_and_extract(
+    url: &str,
+    dest_dir: &std::path::Path,
+    wanted_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell_cmd = format!(
+        "curl --silent --show-error --location {} | tar -xz -C {} {}",
+        fetch_shell_quote(url),
+        fetch_shell_quote(&dest_dir.to_string_lossy()),
+        fetch_shell_quote(wanted_name),
+    );
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&shell_cmd)
+        .status()?;
+    if !status.success() {
+        return Err(
+            format!("download/extract failed (curl | tar exit {:?})", status.code()).into(),
+        );
+    }
+    Ok(())
+}
+
+/// Shell-quote a string using single quotes.
+fn fetch_shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn version_string(bin: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new(bin).arg("--version").output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn list_completers(bin: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new(bin).arg("_list").output()?;
+    if !out.status.success() {
+        return Err("carapace _list failed".into());
+    }
+    Ok(parse_completer_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse the output of `carapace _list` into a list of command names.
+/// Each line may have a name followed by whitespace and a description.
+/// Exported for unit testing.
+pub(crate) fn parse_completer_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(String::from))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn dump_spec(bin: &std::path::Path, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new(bin).args([name, "_spec"]).output()?;
+    if !out.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -916,5 +1066,38 @@ flags:
         // We inserted 0 nodes with an empty-name spec at root level.
         assert_eq!(s, 0, "expected 0 subs from empty-name spec; got {}", s);
         let _ = c;
+    }
+
+    // --- carapace-fetch helper tests ---
+
+    #[test]
+    fn shell_quote_preserves_apostrophes() {
+        assert_eq!(fetch_shell_quote("can't"), "'can'\\''t'");
+    }
+
+    #[test]
+    fn shell_quote_plain_string() {
+        assert_eq!(fetch_shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn list_completers_parses_tab_separated() {
+        let input = "git\tversion control\ncargo\tRust build tool\ndocker\n";
+        let names = parse_completer_list(input);
+        assert_eq!(names, vec!["git", "cargo", "docker"]);
+    }
+
+    #[test]
+    fn list_completers_skips_blank_lines() {
+        let input = "git\n\ncargo\n\n";
+        let names = parse_completer_list(input);
+        assert_eq!(names, vec!["git", "cargo"]);
+    }
+
+    #[test]
+    fn list_completers_parses_space_separated() {
+        let input = "helm Kubernetes package manager\nterraform Infrastructure as code\n";
+        let names = parse_completer_list(input);
+        assert_eq!(names, vec!["helm", "terraform"]);
     }
 }

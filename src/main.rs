@@ -118,6 +118,11 @@ enum Commands {
     /// Requires Node.js and pnpm (or npm) on PATH. Run once per upstream update.
     #[command(name = "fig-fetch")]
     FigFetch,
+    /// Download the latest carapace-bin release into the cache dir and dump
+    /// every builtin completer's YAML spec there. Subsequent `zsh-ios rebuild`
+    /// reads those YAMLs and folds them into the trie.
+    #[command(name = "carapace-fetch")]
+    CarapaceFetch,
 }
 
 fn main() {
@@ -143,6 +148,12 @@ fn main() {
         Commands::RegexArgsIngest => cmd_regex_args_ingest(),
         Commands::Preset { name, show, force } => presets::cmd_preset(name.as_deref(), show, force),
         Commands::FigFetch => fig_completions::cmd_fig_fetch(),
+        Commands::CarapaceFetch => {
+            if let Err(e) = carapace_completions::cmd_carapace_fetch() {
+                eprintln!("carapace-fetch: {}", e);
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -261,6 +272,7 @@ fn cmd_build(aliases_stdin: bool) {
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
         "status", "explain", "ingest", "regex-args-ingest", "preset", "fig-fetch",
+        "carapace-fetch",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }

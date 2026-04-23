@@ -77,6 +77,8 @@ The command trie is built from:
 
     When the `carapace` binary is also on PATH and `disable_build_time_shell_exec` is off, zsh-ios additionally shells to `carapace _list` to enumerate every builtin completer, then `carapace <cmd> _spec` to dump each as YAML. The dumps cache under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/<cmd>.yaml` keyed by `carapace --version`, so subsequent builds read the cache until `carapace` itself upgrades.
 
+    A third path — for users who do not want to install carapace system-wide — is `zsh-ios carapace-fetch`: it downloads the latest carapace-bin release tarball (via `curl | tar`) into `$XDG_CACHE_HOME/zsh-ios/carapace-bin/` and dumps every builtin completer's YAML into the same `carapace-specs/` directory that `build` already reads. Run it once and the downloaded specs persist across rebuilds; rerun when you want the latest upstream completers.
+
 11. **Fig / withfig/autocomplete** -- 500+ TypeScript specs fetched from [`github.com/withfig/autocomplete`](https://github.com/withfig/autocomplete). The pipeline is a one-time `zsh-ios fig-fetch`:
     - `git clone` (or `git pull`) into `$XDG_CACHE_HOME/zsh-ios/fig-autocomplete/`
     - `pnpm install` + `pnpm build` (falls back to `npm` if `pnpm` isn't installed; both require Node on PATH)
