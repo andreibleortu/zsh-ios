@@ -25,6 +25,7 @@ typeset -g _zsh_ios_ghost_style="fg=240"
 typeset -g _zsh_ios_ghost_prefix="  "
 typeset -g _zsh_ios_ghost_last_buffer=""
 typeset -g _zsh_ios_ghost_last_postdisplay=""
+typeset -g _zsh_ios_ghost_last_highlight=""
 
 # Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
 # have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
@@ -286,7 +287,10 @@ _zsh_ios_quote_args() {
 # --- ZLE Widget: Enter key (resolve + execute) ---
 _zsh_ios_accept_line() {
     POSTDISPLAY=""
-    region_highlight=("${(@)region_highlight:#P0 *}")
+    if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
+        region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
+        _zsh_ios_ghost_last_highlight=""
+    fi
     _zsh_ios_ghost_last_buffer=""
 
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
@@ -390,7 +394,10 @@ _zsh_ios_expand_or_complete() {
                 BUFFER="$output"
                 CURSOR=${#BUFFER}
                 POSTDISPLAY=""
-                region_highlight=("${(@)region_highlight:#P0 *}")
+                if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
+                    region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
+                    _zsh_ios_ghost_last_highlight=""
+                fi
                 _zsh_ios_ghost_last_buffer=""
             else
                 zle expand-or-complete
@@ -1634,10 +1641,21 @@ add-zle-hook-widget line-init _zsh_ios_worker_lazy_start 2>/dev/null
 # --- ZLE Widget: ghost-text preview (hooked into line-pre-redraw) ---
 # Shows the fully-resolved command as faint text after the cursor via
 # POSTDISPLAY so it never touches BUFFER or CURSOR.
+#
+# region_highlight ranges are measured in *display columns* starting at
+# column 0 of BUFFER.  To paint POSTDISPLAY we use the range
+# [#BUFFER, #BUFFER + #POSTDISPLAY] — positions that are literally past
+# the end of BUFFER, which zsh then resolves into POSTDISPLAY at render
+# time.  (The `P0` prefix form is for predisplay, a different beast; using
+# it here made the range mistakenly cover BUFFER + the start of POSTDISPLAY
+# while the tail of POSTDISPLAY stayed unstyled.)
 _zsh_ios_ghost_preview_widget() {
-    # Always start clean so stale ghosts don't linger across redraws.
+    # Drop any previous ghost entry before adding a fresh one.
+    if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
+        region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
+        _zsh_ios_ghost_last_highlight=""
+    fi
     POSTDISPLAY=""
-    region_highlight=("${(@)region_highlight:#P0 *}")
 
     (( _zsh_ios_ghost_disabled )) && return 0
     _zsh_ios_is_disabled && return 0
@@ -1648,7 +1666,10 @@ _zsh_ios_ghost_preview_widget() {
     if [[ "$BUFFER" == "$_zsh_ios_ghost_last_buffer" ]]; then
         POSTDISPLAY="$_zsh_ios_ghost_last_postdisplay"
         if [[ -n "$POSTDISPLAY" ]]; then
-            region_highlight+=("P0 ${#POSTDISPLAY} $_zsh_ios_ghost_style")
+            local _start=${#BUFFER}
+            local _end=$(( _start + ${#POSTDISPLAY} ))
+            _zsh_ios_ghost_last_highlight="$_start $_end $_zsh_ios_ghost_style"
+            region_highlight+=("$_zsh_ios_ghost_last_highlight")
         fi
         return 0
     fi
@@ -1659,7 +1680,10 @@ _zsh_ios_ghost_preview_widget() {
 
     if (( rc == 0 )) && [[ -n "$resolved" && "$resolved" != "$BUFFER" ]]; then
         POSTDISPLAY="${_zsh_ios_ghost_prefix}${resolved}"
-        region_highlight+=("P0 ${#POSTDISPLAY} $_zsh_ios_ghost_style")
+        local _start=${#BUFFER}
+        local _end=$(( _start + ${#POSTDISPLAY} ))
+        _zsh_ios_ghost_last_highlight="$_start $_end $_zsh_ios_ghost_style"
+        region_highlight+=("$_zsh_ios_ghost_last_highlight")
     fi
 
     _zsh_ios_ghost_last_buffer="$BUFFER"
