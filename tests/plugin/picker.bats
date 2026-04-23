@@ -188,6 +188,43 @@ print -r -- "ZLE=${_zle_calls[*]}"
     [[ "$output" == *"reset-prompt"* ]]
 }
 
+@test "save-mode: plain digit pick does NOT write a pin" {
+    export ZSH_IOS_STUB_LOG="$(mktemp)"
+    keystrokes '2'
+    run zsh_run "$three_opts_prologue"
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=cd"* ]]
+    # No pin subcommand should have been invoked.
+    run grep -c '^pin|' "$ZSH_IOS_STUB_LOG"
+    [[ "$output" == "0" ]]
+    rm -f "$ZSH_IOS_STUB_LOG"
+}
+
+@test "save-mode: !<digit> pick DOES write a pin" {
+    export ZSH_IOS_STUB_LOG="$(mktemp)"
+    keystrokes '!2'
+    run zsh_run "$three_opts_prologue"
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=cd"* ]]
+    [[ "$output" == *"Saved pin:"* ]]
+    run grep -c '^pin|' "$ZSH_IOS_STUB_LOG"
+    [[ "$output" == "1" ]]
+    rm -f "$ZSH_IOS_STUB_LOG"
+}
+
+@test "save-mode: toggle on then off with ! does not save" {
+    export ZSH_IOS_STUB_LOG="$(mktemp)"
+    # First `!` enters save mode, second `!` leaves it.
+    keystrokes '!!2'
+    run zsh_run "$three_opts_prologue"
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=cd"* ]]
+    [[ "$output" != *"Saved pin:"* ]]
+    run grep -c '^pin|' "$ZSH_IOS_STUB_LOG"
+    [[ "$output" == "0" ]]
+    rm -f "$ZSH_IOS_STUB_LOG"
+}
+
 @test "accept mode: commits AND calls accept-line" {
     # Same payload but accept mode — should call accept-line.
     local snippet='

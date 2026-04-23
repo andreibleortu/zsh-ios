@@ -18,7 +18,7 @@ print -r -- "$result"
 
 @test "infer_quote: returns 'double' when buffer ends inside a double-quoted string" {
     run zsh_run '
-result=$(_zsh_ios_infer_quote 'echo "g')
+result=$(_zsh_ios_infer_quote '\''echo "g'\'')
 print -r -- "$result"
 '
     [[ "$status" -eq 0 ]]
@@ -53,7 +53,7 @@ print -r -- "$result"
 
 @test "infer_param_context: returns 1 when buffer ends inside unclosed \${" {
     run zsh_run '
-result=$(_zsh_ios_infer_param_context "echo ${HOM")
+result=$(_zsh_ios_infer_param_context "echo \${HOM")
 print -r -- "$result"
 '
     [[ "$status" -eq 0 ]]

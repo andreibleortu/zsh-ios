@@ -758,9 +758,8 @@ _zsh_ios_handle_ambiguity() {
     local -a abbrev_words=( ${(z)BUFFER} )
     local abbrev_str="${(j: :)abbrev_words[1,$((_zio_position+1))]}"
 
-    echo ""
     echo "${_zsh_ios_picker_prefix:-%} Ambiguous command: \"$abbrev_str\""
-    echo "  Pick a number to save as shorthand (Enter to cancel):"
+    echo "  Pick one (prefix ! to also save as pin; Esc/Enter to cancel):"
     local i=1
     for item in "${menu_display[@]}"; do
         echo "    $i) $item"
@@ -769,30 +768,52 @@ _zsh_ios_handle_ambiguity() {
 
     echo -n "  > "
 
-    # Keystroke-by-keystroke picker. Three input modes, freely intermixed:
+    # Keystroke-by-keystroke picker. Input modes, freely intermixed:
     #   • Digits: accept as soon as the buffered digits uniquely identify an
     #     option (no Enter needed). `5` fires instantly in a 5-option menu;
     #     `1` in a 20-option menu waits for a second digit because 10-19 are
     #     still reachable; `13` fires instantly.
-    #   • Tab: advance a cycle highlight through the options (wraps). The
-    #     prompt line redraws to `> [N] <choice>`. Enter or another Tab-pick
-    #     commits. Useful when the user wants to eyeball options rather than
-    #     map digits to positions.
+    #   • Tab / arrows: advance (or reverse) a cycle highlight through the
+    #     options (wraps). The prompt redraws to `> [N] <choice>`. Enter or
+    #     another Tab commits.
+    #   • `!` (as the first char): toggles "save as pin" mode — the current
+    #     pick will also be written to the pins file. Prompt redraws with a
+    #     leading `!` so the mode is visible.
     #   • Enter on empty: cancel. Enter while cycling: commit the highlight.
-    #     Any other key cancels.
+    #     Esc or any other unhandled key cancels.
     local choice=""
     local cycle_idx=0
+    local save_mode=0
     local max=${#menu_display}
     local key trial extendable k sk
     # Redraw the `> ` prompt line showing the current cycle highlight (or
-    # empty if cycle_idx==0). \r returns to column 0; \e[K clears to EOL.
+    # buffered digits) and the `!` save-mode indicator. \r returns to
+    # column 0; \e[K clears to EOL.
     _zsh_ios_pick_redraw_cycle() {
+        local _prefix="  > "
+        (( save_mode )) && _prefix="  > !"
         if (( cycle_idx == 0 )); then
-            printf '\r  > \e[K'
+            if [[ -n "$choice" ]]; then
+                printf '\r%s%s\e[K' "$_prefix" "$choice"
+            else
+                printf '\r%s\e[K' "$_prefix"
+            fi
         else
-            printf '\r  > [%d] %s\e[K' "$cycle_idx" "${menu_display[$cycle_idx]}"
+            printf '\r%s[%d] %s\e[K' "$_prefix" "$cycle_idx" "${menu_display[$cycle_idx]}"
         fi
     }
+
+    # Put the terminal into cbreak / no-echo for the duration of the picker
+    # loop so single-byte reads deliver arrow-key escape sequences correctly
+    # instead of being line-buffered and echoed as literal ^[[A bytes. Only
+    # meaningful on the real /dev/tty path — tests feed keystrokes through
+    # $_ZSH_IOS_TEST_INPUT_FD, which doesn't go through the tty.
+    local _saved_stty=""
+    if [[ -z "$_ZSH_IOS_TEST_INPUT_FD" ]]; then
+        _saved_stty=$(stty -g </dev/tty 2>/dev/null)
+        [[ -n "$_saved_stty" ]] && stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
+    fi
+    {
     while true; do
         _zsh_ios_read_picker_key key
         case "$key" in
@@ -812,13 +833,24 @@ _zsh_ios_handle_ambiguity() {
                 (( cycle_idx = cycle_idx % max + 1 ))
                 _zsh_ios_pick_redraw_cycle
                 ;;
+            '!')
+                # `!` toggles save-as-pin mode. The next commit will also
+                # write a pin. Only meaningful before any digit has been
+                # entered; pressing `!` mid-digit-entry also toggles.
+                save_mode=$(( 1 - save_mode ))
+                _zsh_ios_pick_redraw_cycle
+                ;;
             $'\x7f'|$'\b')
-                # Backspace: erase one digit, or step back one cycle position.
+                # Backspace: erase one digit, step back one cycle position,
+                # or turn off save-mode if that's the only active state.
                 if [[ -n "$choice" ]]; then
                     choice="${choice%?}"
-                    echo -n $'\b \b'
+                    _zsh_ios_pick_redraw_cycle
                 elif (( cycle_idx > 0 )); then
                     (( cycle_idx-- ))
+                    _zsh_ios_pick_redraw_cycle
+                elif (( save_mode )); then
+                    save_mode=0
                     _zsh_ios_pick_redraw_cycle
                 fi
                 ;;
@@ -826,7 +858,6 @@ _zsh_ios_handle_ambiguity() {
                 # Switching from cycle → digits: clear the highlight display.
                 if (( cycle_idx > 0 )); then
                     cycle_idx=0
-                    _zsh_ios_pick_redraw_cycle
                 fi
                 trial="$choice$key"
                 # Is any option number strictly longer than `trial` that
@@ -844,7 +875,7 @@ _zsh_ios_handle_ambiguity() {
                 # `0` at any time) is a typo and gets silently dropped.
                 if (( trial >= 1 && trial <= max )) || (( extendable )); then
                     choice="$trial"
-                    echo -n "$key"
+                    _zsh_ios_pick_redraw_cycle
                     if (( !extendable )); then
                         echo ""
                         break
@@ -903,6 +934,12 @@ _zsh_ios_handle_ambiguity() {
                 ;;
         esac
     done
+    } always {
+        # Restore the terminal to its pre-picker mode on every exit path
+        # (normal commit, cancel, typo, Esc, error). If we leave the tty in
+        # cbreak/no-echo, the shell prompt after a cancel is unusable.
+        [[ -n "$_saved_stty" ]] && stty "$_saved_stty" </dev/tty 2>/dev/null
+    }
     unfunction _zsh_ios_pick_redraw_cycle 2>/dev/null
 
     # Cycle commit: if Enter/Tab-commit-digit path didn't populate `choice`
@@ -928,16 +965,18 @@ _zsh_ios_handle_ambiguity() {
         return
     fi
 
-    # Pin the full abbreviated sequence -> full expansion
-    # abbrev = all typed words up to and including the ambiguous word
-    # expanded = the full resolved command (resolved_prefix + selected)
+    # Pin the full abbreviated sequence -> full expansion, but only when the
+    # user explicitly opted in via the `!` prefix during selection. A plain
+    # digit / Tab / arrow pick is one-shot: useful for the current command
+    # line without committing the abbreviation to the pins file forever.
     local pin_expanded="$selected_display"
-
-    "$ZSH_IOS_BIN" pin "$abbrev_str" --to "$pin_expanded" 2>/dev/null
-    local display_path="${_zio_pins_path/#$HOME/~}"
-    echo "  Saved: \"$abbrev_str\" → \"$pin_expanded\""
-    echo "  In $display_path"
-    _zsh_ios_last_pin="$abbrev_str"
+    if (( save_mode )); then
+        "$ZSH_IOS_BIN" pin "$abbrev_str" --to "$pin_expanded" 2>/dev/null
+        local display_path="${_zio_pins_path/#$HOME/~}"
+        echo "  Saved pin: \"$abbrev_str\" → \"$pin_expanded\""
+        echo "  In $display_path"
+        _zsh_ios_last_pin="$abbrev_str"
+    fi
 
     # Build the full command to execute
     local full_cmd="$selected_display"
