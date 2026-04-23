@@ -1666,6 +1666,14 @@ _zsh_ios_ghost_preview_widget() {
     # POSTDISPLAY or region_highlight — the widget will finalize them.
     (( _zsh_ios_ghost_suspended )) && return 0
 
+    # Skip during input bursts — paste, auto-type, or very fast typing.
+    # $PENDING is zsh's count of bytes already read from the terminal but
+    # not yet processed by ZLE. When it's nonzero we're behind on input,
+    # so computing a ghost now would burn a subprocess per buffered key
+    # for no visible gain (the next redraw will immediately replace it).
+    # Leave any prior ghost visible so there's no flicker during paste.
+    (( ${PENDING:-0} > 0 )) && return 0
+
     # Drop any previous ghost entry before adding a fresh one.
     if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
         region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
