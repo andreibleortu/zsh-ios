@@ -156,7 +156,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // --- Flag completion mode ---
     // When typing a flag prefix (starts with '-'), show known flags + their expected arg types.
     if prefix.starts_with('-') {
-        return complete_flags(prefix, spec, node, output);
+        return complete_flags(prefix, spec, node, &completed_words, output);
     }
 
     // --- Trie-based completion (subcommands) ---
@@ -310,10 +310,13 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
 
 /// Complete a flag prefix: show matching flags from spec and trie.
 /// If the prefix exactly matches a single flag that takes an argument, show what it expects.
+/// `prior_words` is the list of already-completed words on the command line; flags in exclusion
+/// groups where a sibling is already present are filtered out.
 pub(super) fn complete_flags(
     prefix: &str,
     spec: Option<&trie::ArgSpec>,
     node: &TrieNode,
+    prior_words: &[&str],
     mut output: String,
 ) -> String {
     // Collect flags from ArgSpec (flags that take typed arguments)
@@ -335,6 +338,25 @@ pub(super) fn complete_flags(
             if flag.starts_with(prefix) && !known_flags.iter().any(|(f, _)| f == flag) {
                 known_flags.push((flag.clone(), None));
             }
+        }
+
+        // Filter out flags that are mutually exclusive with a flag already on the line.
+        if !spec.flag_exclusions.is_empty() {
+            known_flags.retain(|(flag, _)| {
+                for group in &spec.flag_exclusions {
+                    if group.contains(flag) {
+                        // If any OTHER flag in this exclusion group is already present, drop this one.
+                        let sibling_present = group
+                            .iter()
+                            .filter(|g| *g != flag)
+                            .any(|g| prior_words.contains(&g.as_str()));
+                        if sibling_present {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
         }
     }
 
@@ -805,5 +827,35 @@ mod tests {
     fn test_resolve_first_word_no_match() {
         let trie = build_test_trie();
         assert_eq!(resolve_first_word("zzz", &trie), "zzz");
+    }
+
+    #[test]
+    fn complete_omits_excluded_flags() {
+        use crate::trie::ArgSpec;
+        // ArgSpec: flag_exclusions [["-a", "-v"]], flag_args for both.
+        let spec = ArgSpec {
+            flag_args: [
+                ("-a".into(), crate::trie::ARG_MODE_PATHS),
+                ("-v".into(), crate::trie::ARG_MODE_PATHS),
+            ]
+            .into_iter()
+            .collect(),
+            flag_exclusions: vec![vec!["-a".to_string(), "-v".to_string()]],
+            ..Default::default()
+        };
+
+        let trie = build_test_trie();
+        let node = trie.root.get_child("git").unwrap();
+
+        // prior_words contains "-a" → "-v" should be omitted
+        let prior: Vec<&str> = vec!["-a"];
+        let out = complete_flags("-", Some(&spec), node, &prior, String::new());
+        assert!(out.contains("-a"), "should still list -a");
+        assert!(!out.contains("-v"), "should omit -v because -a is in prior_words");
+
+        // prior_words empty → both should appear
+        let out2 = complete_flags("-", Some(&spec), node, &[], String::new());
+        assert!(out2.contains("-a"), "should list -a when no prior");
+        assert!(out2.contains("-v"), "should list -v when no prior");
     }
 }

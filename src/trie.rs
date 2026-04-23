@@ -386,6 +386,16 @@ pub struct ArgSpec {
     /// Evaluated at completion time by checking the typed words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_rules: Vec<ContextRule>,
+    /// Flag alias groups: each inner Vec holds flags that refer to the same
+    /// underlying option (e.g. `["-f", "--force"]`). Parsed from brace-expanded
+    /// `{-f,--force}` forms in `_arguments` specs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_aliases: Vec<Vec<String>>,
+    /// Flag exclusion groups: each inner Vec is a list of flags that are
+    /// mutually exclusive. Parsed from the `(flag1 flag2)` prefix of
+    /// `_arguments` spec strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_exclusions: Vec<Vec<String>>,
 }
 
 impl ArgSpec {
@@ -395,16 +405,49 @@ impl ArgSpec {
     }
 
     /// Get the argument type expected after a flag.
-    /// Also checks the flag with trailing `=` stripped (e.g., `--output=` → `--output`).
+    /// Also checks the flag with trailing `=` stripped (e.g., `--output=` → `--output`),
+    /// then falls back to checking alias groups so `-f` resolves when only `--force` is stored.
     pub fn type_after_flag(&self, flag: &str) -> Option<u8> {
         if let Some(&t) = self.flag_args.get(flag) {
             return Some(t);
         }
         let stripped = flag.trim_end_matches('=');
-        if stripped != flag {
-            return self.flag_args.get(stripped).copied();
+        if stripped != flag && let Some(&t) = self.flag_args.get(stripped) {
+            return Some(t);
+        }
+        // Alias lookup: if this flag is in an alias group, retry with each sibling.
+        let canonical = self.canonical_flag(flag);
+        if canonical != flag {
+            if let Some(&t) = self.flag_args.get(canonical) {
+                return Some(t);
+            }
+            let can_stripped = canonical.trim_end_matches('=');
+            if can_stripped != canonical && let Some(&t) = self.flag_args.get(can_stripped) {
+                return Some(t);
+            }
+        }
+        // Try every sibling in the alias group.
+        for group in &self.flag_aliases {
+            if group.iter().any(|g| g == flag || g == stripped) {
+                for sibling in group {
+                    if sibling != flag && let Some(&t) = self.flag_args.get(sibling) {
+                        return Some(t);
+                    }
+                }
+            }
         }
         None
+    }
+
+    /// Return the canonical (first) flag name for any alias.
+    /// Used by disambiguation engines to normalise flags before counting hits.
+    pub fn canonical_flag<'a>(&'a self, flag: &'a str) -> &'a str {
+        for group in &self.flag_aliases {
+            if group.iter().any(|g| g == flag) {
+                return group.first().map(String::as_str).unwrap_or(flag);
+            }
+        }
+        flag
     }
 
     /// Convenience: is this spec non-empty?
@@ -417,13 +460,32 @@ impl ArgSpec {
             && self.flag_static_lists.is_empty()
             && self.rest_static_list.is_none()
             && self.context_rules.is_empty()
+            && self.flag_aliases.is_empty()
+            && self.flag_exclusions.is_empty()
     }
 
     /// Whether a flag consumes the next word (either via typed arg, call_program, or static list).
+    /// Checks aliases so `-f` matches when only `--force` is stored.
     pub fn flag_takes_value(&self, flag: &str) -> bool {
-        self.type_after_flag(flag).is_some()
-            || self.flag_call_programs.contains_key(flag)
-            || self.flag_static_lists.contains_key(flag)
+        if self.type_after_flag(flag).is_some() {
+            return true;
+        }
+        if self.flag_call_programs.contains_key(flag) || self.flag_static_lists.contains_key(flag) {
+            return true;
+        }
+        // Check aliases.
+        for group in &self.flag_aliases {
+            if group.iter().any(|g| g == flag) {
+                for sibling in group {
+                    if self.flag_call_programs.contains_key(sibling)
+                        || self.flag_static_lists.contains_key(sibling)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Merge another `ArgSpec` into this one (pure gap-fill).
@@ -468,6 +530,24 @@ impl ArgSpec {
             if !already_covered {
                 self.context_rules.push(other_rule.clone());
             }
+        }
+        // Gap-fill alias groups: only add groups whose flags are not yet represented.
+        'outer_alias: for other_group in &other.flag_aliases {
+            for self_group in &self.flag_aliases {
+                if other_group.iter().any(|f| self_group.contains(f)) {
+                    continue 'outer_alias;
+                }
+            }
+            self.flag_aliases.push(other_group.clone());
+        }
+        // Gap-fill exclusion groups.
+        'outer_excl: for other_excl in &other.flag_exclusions {
+            for self_excl in &self.flag_exclusions {
+                if other_excl.iter().any(|f| self_excl.contains(f)) {
+                    continue 'outer_excl;
+                }
+            }
+            self.flag_exclusions.push(other_excl.clone());
         }
     }
 }
@@ -1039,5 +1119,71 @@ mod tests {
             loaded.schema_version, 0,
             "missing field should default to 0"
         );
+    }
+
+    #[test]
+    fn canonical_flag_returns_primary() {
+        let mut spec = ArgSpec::default();
+        spec.flag_aliases.push(vec!["-f".to_string(), "--force".to_string()]);
+        assert_eq!(spec.canonical_flag("-f"), "-f");
+        assert_eq!(spec.canonical_flag("--force"), "-f");
+        assert_eq!(spec.canonical_flag("--other"), "--other");
+    }
+
+    #[test]
+    fn type_after_flag_resolves_via_alias() {
+        let mut spec = ArgSpec::default();
+        spec.flag_args.insert("-f".to_string(), ARG_MODE_PATHS);
+        spec.flag_aliases.push(vec!["-f".to_string(), "--file".to_string()]);
+        // Direct hit
+        assert_eq!(spec.type_after_flag("-f"), Some(ARG_MODE_PATHS));
+        // Via alias group
+        assert_eq!(spec.type_after_flag("--file"), Some(ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn flag_takes_value_respects_aliases() {
+        let mut spec = ArgSpec::default();
+        spec.flag_args.insert("--force".to_string(), ARG_MODE_PATHS);
+        spec.flag_aliases.push(vec!["-f".to_string(), "--force".to_string()]);
+        assert!(spec.flag_takes_value("-f"), "-f should take value via alias");
+        assert!(spec.flag_takes_value("--force"), "--force should take value directly");
+    }
+
+    #[test]
+    fn arg_spec_is_empty_respects_new_fields() {
+        let mut spec = ArgSpec::default();
+        assert!(spec.is_empty());
+        spec.flag_aliases.push(vec!["-f".to_string(), "--force".to_string()]);
+        assert!(!spec.is_empty());
+
+        let mut spec2 = ArgSpec::default();
+        spec2.flag_exclusions.push(vec!["-a".to_string(), "-v".to_string()]);
+        assert!(!spec2.is_empty());
+    }
+
+    #[test]
+    fn merge_gap_fills_aliases_and_exclusions() {
+        let mut a = ArgSpec::default();
+        a.flag_aliases.push(vec!["-f".to_string(), "--force".to_string()]);
+        a.flag_exclusions.push(vec!["-a".to_string(), "-v".to_string()]);
+
+        let mut b = ArgSpec::default();
+        // Overlapping alias group — should not be duplicated
+        b.flag_aliases.push(vec!["-f".to_string(), "--file".to_string()]);
+        // New alias group
+        b.flag_aliases.push(vec!["-q".to_string(), "--quiet".to_string()]);
+        // Overlapping exclusion — should not be duplicated
+        b.flag_exclusions.push(vec!["-a".to_string(), "-b".to_string()]);
+        // New exclusion
+        b.flag_exclusions.push(vec!["-x".to_string(), "-y".to_string()]);
+
+        a.merge(&b);
+        // The overlapping alias group from b (containing -f) should be dropped
+        assert_eq!(a.flag_aliases.len(), 2);
+        assert!(a.flag_aliases.iter().any(|g| g.contains(&"-q".to_string())));
+        // The overlapping exclusion group from b (containing -a) should be dropped
+        assert_eq!(a.flag_exclusions.len(), 2);
+        assert!(a.flag_exclusions.iter().any(|g| g.contains(&"-x".to_string())));
     }
 }

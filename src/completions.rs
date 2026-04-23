@@ -1076,6 +1076,11 @@ fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
                 }
 
                 let subs = extract_subcommands_from_content(cmd, &content);
+                let subs = if subs.is_empty() {
+                    extract_case_based_subcommands(&content, cmd)
+                } else {
+                    subs
+                };
                 if !subs.is_empty() {
                     subcmds.entry(cmd.to_string()).or_default().extend(subs);
                 }
@@ -1341,6 +1346,111 @@ fn action_to_arg_type(action: &str) -> Option<u8> {
         return Some(trie::ARG_MODE_PIP_PACKAGE);
     }
 
+    // _sequence: strip the wrapper and recurse on the inner action.
+    // Forms: `_sequence actual-action`, `_sequence -s sep actual-action`
+    if action.contains("_sequence")
+        && let Some(inner) = strip_sequence_wrapper(action)
+    {
+        return action_to_arg_type(&inner);
+    }
+
+    // _guard: conditional hint only — no meaningful type to return.
+    if action.contains("_guard") {
+        return None;
+    }
+
+    // _call_function: map well-known helper names to types.
+    if action.contains("_call_function")
+        && let Some(fname) = extract_call_function_name(action)
+    {
+        return well_known_helper_type(&fname);
+    }
+
+    None
+}
+
+/// Strip `_sequence [-s sep] [-d delim]` wrapper and return the inner action string.
+fn strip_sequence_wrapper(action: &str) -> Option<String> {
+    let pos = action.find("_sequence")?;
+    let after = action[pos + "_sequence".len()..].trim_start();
+
+    // Skip optional `-s SEP` and `-d DELIM` flags
+    let mut words = after.split_whitespace();
+    let mut inner_parts: Vec<&str> = Vec::new();
+    let skip_flags = ["-s", "-d"];
+    let mut skip_next = false;
+    for w in &mut words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if skip_flags.contains(&w) {
+            skip_next = true;
+            continue;
+        }
+        inner_parts.push(w);
+    }
+
+    if inner_parts.is_empty() {
+        None
+    } else {
+        Some(inner_parts.join(" "))
+    }
+}
+
+/// Extract the function name from a `_call_function retvar funcname args...` action.
+fn extract_call_function_name(action: &str) -> Option<String> {
+    let pos = action.find("_call_function")?;
+    let after = action[pos + "_call_function".len()..].trim_start();
+    let mut parts = after.split_whitespace();
+    // First word is the return variable; second is the function name.
+    parts.next()?; // skip retvar
+    let fname = parts.next()?;
+    Some(fname.to_string())
+}
+
+/// Map well-known completion helper function names to ARG_MODE_* types.
+fn well_known_helper_type(name: &str) -> Option<u8> {
+    // Git helpers
+    if name.contains("__git_branch") || name == "__git_heads" {
+        return Some(trie::ARG_MODE_GIT_BRANCHES);
+    }
+    if name.contains("__git_tag") {
+        return Some(trie::ARG_MODE_GIT_TAGS);
+    }
+    if name.contains("__git_remote") {
+        return Some(trie::ARG_MODE_GIT_REMOTES);
+    }
+    if name.contains("__git_file") || name.contains("__git_cached") || name.contains("__git_modified") {
+        return Some(trie::ARG_MODE_GIT_FILES);
+    }
+    if name.contains("__git_commit") || name.contains("__git_revision") {
+        return Some(trie::ARG_MODE_GIT_BRANCHES);
+    }
+    // Docker helpers
+    if name.contains("__docker_container") || name.contains("__docker_complete_container") {
+        return Some(trie::ARG_MODE_DOCKER_CONTAINER);
+    }
+    if name.contains("__docker_image") || name.contains("__docker_complete_image") {
+        return Some(trie::ARG_MODE_DOCKER_IMAGE);
+    }
+    // Kubernetes
+    if name.contains("__kubectl_pod") {
+        return Some(trie::ARG_MODE_K8S_POD);
+    }
+    if name.contains("__kubectl_namespace") {
+        return Some(trie::ARG_MODE_K8S_NAMESPACE);
+    }
+    // System
+    if name.contains("_hosts") || name.contains("_ssh_host") {
+        return Some(trie::ARG_MODE_HOSTS);
+    }
+    if name.contains("_users") {
+        return Some(trie::ARG_MODE_USERS);
+    }
+    if name.contains("_files") {
+        return Some(trie::ARG_MODE_PATHS);
+    }
     None
 }
 
@@ -2977,6 +3087,12 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
         for spec_str in extract_argument_specs(trimmed) {
             process_spec_string(&spec_str, &mut spec);
         }
+        // Extract flag alias groups from brace-expanded specs on this line.
+        for alias_group in extract_brace_alias_groups(trimmed) {
+            if !spec.flag_aliases.iter().any(|g| g.iter().any(|f| alias_group.contains(f))) {
+                spec.flag_aliases.push(alias_group);
+            }
+        }
 
         // Also catch bare _files/_directories calls used as direct actions
         // in non-_arguments style completions (e.g., `_diff_options ... ':file:_files'`)
@@ -3282,6 +3398,82 @@ fn extract_brace_expanded_specs(line: &str) -> Vec<String> {
     result
 }
 
+/// Extract flag alias groups from brace-expanded `_arguments` patterns on a single line.
+///
+/// For each `{-f,--force}` group followed by a quoted spec, returns the flags as one alias group.
+/// Only groups with ≥2 flag entries are returned (single-flag braces are not useful as aliases).
+fn extract_brace_alias_groups(line: &str) -> Vec<Vec<String>> {
+    let mut result = Vec::new();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+
+        let brace_start = i;
+        let mut depth = 0u32;
+        let mut j = i;
+        while j < len {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let brace_end = j;
+        let brace_content = &line[brace_start + 1..brace_end];
+
+        if !brace_content.contains('-') {
+            i = brace_end + 1;
+            continue;
+        }
+
+        // Must be followed (after optional whitespace) by a single-quoted spec
+        let mut k = brace_end + 1;
+        while k < len && bytes[k] == b' ' {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b'\'' {
+            i = brace_end + 1;
+            continue;
+        }
+
+        // Collect flags from the brace group
+        let flags: Vec<String> = brace_content
+            .split(',')
+            .map(|f| {
+                f.trim()
+                    .trim_end_matches('+')
+                    .trim_end_matches('=')
+                    .to_string()
+            })
+            .filter(|f| f.starts_with('-') && f.len() > 1)
+            .collect();
+
+        if flags.len() >= 2 {
+            result.push(flags);
+        }
+
+        i = brace_end + 1;
+    }
+
+    result
+}
+
 /// Parse a `_call_program tag cmd [args...]` action string.
 /// Returns `(tag, argv)` where argv is the command to run.
 ///
@@ -3427,8 +3619,41 @@ fn store_static_list(spec_str: &str, items: Vec<String>, spec: &mut ArgSpec) {
     }
 }
 
+/// Parse exclusion flags from a leading `(flag1 flag2 ...)` prefix of a spec string.
+/// Returns flag names only (ignores position references like `1`, `*`, bare `-`).
+fn parse_exclusion_prefix(spec_str: &str) -> Vec<String> {
+    let s = spec_str.trim();
+    if !s.starts_with('(') {
+        return vec![];
+    }
+    let close = match s.find(')') {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let inner = &s[1..close];
+    inner
+        .split_whitespace()
+        .filter(|tok| {
+            tok.starts_with('-') && tok.len() > 1 // flag names only
+        })
+        .map(|tok| tok.to_string())
+        .collect()
+}
+
 /// Process a single _arguments spec string and add to the ArgSpec.
 fn process_spec_string(spec_str: &str, spec: &mut ArgSpec) {
+    // Parse and record leading exclusion group, e.g. `(-a --all)-a[...]`
+    let excl_flags = parse_exclusion_prefix(spec_str);
+    if excl_flags.len() >= 2 {
+        let already = spec
+            .flag_exclusions
+            .iter()
+            .any(|g| g.iter().any(|f| excl_flags.contains(f)));
+        if !already {
+            spec.flag_exclusions.push(excl_flags);
+        }
+    }
+
     // Find the action: it's after the last colon that isn't inside brackets
     let action = match find_action_in_spec(spec_str) {
         Some(a) => a,
@@ -3581,6 +3806,8 @@ fn has_known_action(s: &str) -> bool {
         "__git_committishs",
         "__git_revisions",
         "_call_program",
+        "_call_function",
+        "_guard",
         "compadd",
         "_values",
         "_sequence",
@@ -3691,6 +3918,75 @@ fn extract_subcommands_from_content(cmd: &str, content: &str) -> Vec<String> {
                 subs.push(subcmd);
             }
         }
+    }
+
+    subs.sort();
+    subs.dedup();
+    subs
+}
+
+/// Extract subcommand names from a handwritten `case $words[2] in ... esac` pattern.
+///
+/// Many older or site-local completion functions dispatch on the second word directly
+/// instead of using `_arguments` with `->state`.  This walks the case arms and collects
+/// arm labels that look like subcommand names.
+///
+/// Arm labels separated by `|` yield multiple entries.  The catch-all `*` arm is ignored.
+pub(super) fn extract_case_based_subcommands(body: &str, _cmd: &str) -> Vec<String> {
+    let mut subs = Vec::new();
+    let lines: Vec<&str> = body.lines().collect();
+    let n = lines.len();
+    let mut i = 0;
+
+    // Find `case $words[2] in` or `case ${words[2]} in`
+    while i < n {
+        let line = lines[i].trim();
+        if (line.starts_with("case $words[2]") || line.starts_with("case ${words[2]}"))
+            && line.contains(" in")
+        {
+            // Collect arms until `esac`
+            i += 1;
+            let mut depth: i32 = 1; // nesting depth for case/esac
+            while i < n && depth > 0 {
+                let arm = lines[i].trim();
+                if arm.starts_with("case ") && arm.contains(" in") {
+                    depth += 1;
+                } else if arm == "esac" || arm.starts_with("esac;") || arm.starts_with("esac ") {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+
+                // Arm label lines end with `)` before optional comment
+                // e.g. `start|stop|restart)` or `(create)`
+                if depth == 1 {
+                    let arm_stripped = arm.trim_start_matches('(');
+                    if let Some(paren_pos) = arm_stripped.find(')') {
+                        let label_part = &arm_stripped[..paren_pos];
+                        // Each label separated by `|`
+                        for label in label_part.split('|') {
+                            let label = label.trim().trim_matches('\'').trim_matches('"');
+                            // Skip wildcards and empty
+                            if label.is_empty() || label == "*" {
+                                continue;
+                            }
+                            // Only accept plausible subcommand names (no spaces, not flags)
+                            if !label.starts_with('-')
+                                && !label.contains(' ')
+                                && label.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                                && label.len() < 40
+                            {
+                                subs.push(label.to_string());
+                            }
+                        }
+                    }
+                }
+
+                i += 1;
+            }
+        }
+        i += 1;
     }
 
     subs.sort();
@@ -5566,5 +5862,162 @@ esac
             }
             other => panic!("unexpected action: {:?}", other),
         }
+    }
+
+    // --- Tests for option alias linking ---
+
+    #[test]
+    fn option_alias_linking_recorded() {
+        let spec = parse_arg_spec("'(-f --force)'{-f,--force}'[force it]:label:_files'\n");
+        assert!(
+            spec.flag_aliases.iter().any(|g| g.contains(&"-f".to_string()) && g.contains(&"--force".to_string())),
+            "flag_aliases should contain [-f, --force], got: {:?}", spec.flag_aliases
+        );
+    }
+
+    #[test]
+    fn option_alias_linking_not_recorded_for_single_flag() {
+        // A single-entry brace {-f} should not produce an alias group.
+        let spec = parse_arg_spec("'{-f}'[desc]:label:_files'\n");
+        // No alias group for a single flag
+        assert!(
+            spec.flag_aliases.iter().all(|g| g.len() >= 2),
+            "alias groups with only one entry should not be created"
+        );
+    }
+
+    // --- Tests for flag exclusion groups ---
+
+    #[test]
+    fn flag_exclusions_parsed() {
+        // Single-quoted spec with leading exclusion group, as found in _arguments.
+        let spec = parse_arg_spec("'(-a -v)-a[show all]:label:_files'\n");
+        assert!(
+            spec.flag_exclusions.iter().any(|g| g.contains(&"-a".to_string()) && g.contains(&"-v".to_string())),
+            "flag_exclusions should contain [-a, -v], got: {:?}", spec.flag_exclusions
+        );
+    }
+
+    #[test]
+    fn flag_exclusions_ignores_positional_tokens() {
+        // Tokens `1`, `*`, bare `-` inside exclusion prefix should not produce flag groups
+        // because they are not proper flag names.  Only `-x` is a flag, so the group
+        // has only one entry and should not be stored.
+        let spec = parse_arg_spec("'(1 * -)-x[exclusive]:label:_files'\n");
+        // No exclusion group should be emitted (only one flag token in the parens)
+        for g in &spec.flag_exclusions {
+            assert!(g.len() >= 2, "exclusion group needs >= 2 flags");
+            for flag in g {
+                assert!(flag.starts_with('-') && flag.len() > 1, "non-flag in exclusion group: {flag}");
+            }
+        }
+    }
+
+    // --- Tests for _sequence / _guard / _call_function ---
+
+    #[test]
+    fn action_to_arg_type_handles_sequence() {
+        assert_eq!(
+            action_to_arg_type("_sequence _hosts"),
+            Some(trie::ARG_MODE_HOSTS)
+        );
+    }
+
+    #[test]
+    fn action_to_arg_type_handles_sequence_with_separator_flag() {
+        assert_eq!(
+            action_to_arg_type("_sequence -s , _files"),
+            Some(trie::ARG_MODE_PATHS)
+        );
+    }
+
+    #[test]
+    fn action_to_arg_type_handles_guard() {
+        // _guard provides no type — should return None.
+        assert_eq!(action_to_arg_type("_guard '[a-z]' description"), None);
+    }
+
+    #[test]
+    fn action_to_arg_type_handles_call_function_git_branches() {
+        assert_eq!(
+            action_to_arg_type("_call_function ret __git_branch_names"),
+            Some(trie::ARG_MODE_GIT_BRANCHES)
+        );
+    }
+
+    #[test]
+    fn action_to_arg_type_handles_call_function_unknown() {
+        // Unknown helper → None
+        assert_eq!(
+            action_to_arg_type("_call_function ret _some_unknown_helper"),
+            None
+        );
+    }
+
+    // --- Tests for extract_case_based_subcommands ---
+
+    #[test]
+    fn extract_case_based_subcommands_basic() {
+        let body = r#"
+_mycmd() {
+    case $words[2] in
+        start)    _message "start it" ;;
+        stop)     _message "stop it" ;;
+        status)   _files ;;
+    esac
+}
+"#;
+        let subs = extract_case_based_subcommands(body, "mycmd");
+        assert!(subs.contains(&"start".to_string()), "should contain start");
+        assert!(subs.contains(&"stop".to_string()), "should contain stop");
+        assert!(subs.contains(&"status".to_string()), "should contain status");
+    }
+
+    #[test]
+    fn extract_case_based_subcommands_multi_label() {
+        let body = r#"
+_svc() {
+    case $words[2] in
+        start|stop|restart)    _message "lifecycle op" ;;
+        logs)                  _files ;;
+    esac
+}
+"#;
+        let subs = extract_case_based_subcommands(body, "svc");
+        assert!(subs.contains(&"start".to_string()), "should contain start");
+        assert!(subs.contains(&"stop".to_string()), "should contain stop");
+        assert!(subs.contains(&"restart".to_string()), "should contain restart");
+        assert!(subs.contains(&"logs".to_string()), "should contain logs");
+    }
+
+    #[test]
+    fn extract_case_based_subcommands_ignores_wildcard() {
+        let body = r#"
+_tool() {
+    case $words[2] in
+        build)  _files ;;
+        *)      _message "unknown" ;;
+    esac
+}
+"#;
+        let subs = extract_case_based_subcommands(body, "tool");
+        assert!(subs.contains(&"build".to_string()), "should contain build");
+        assert!(!subs.contains(&"*".to_string()), "wildcard arm should be skipped");
+    }
+
+    #[test]
+    fn extract_case_based_subcommands_handles_brace_form() {
+        // Some completers write `(start)` instead of bare `start`
+        let body = r#"
+_foo() {
+    case $words[2] in
+        (init) _files ;;
+        (clean) _files ;;
+    esac
+}
+"#;
+        let subs = extract_case_based_subcommands(body, "foo");
+        assert!(subs.contains(&"init".to_string()), "should contain init (brace form)");
+        assert!(subs.contains(&"clean".to_string()), "should contain clean (brace form)");
     }
 }

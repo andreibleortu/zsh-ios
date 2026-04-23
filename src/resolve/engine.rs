@@ -960,9 +960,27 @@ pub(super) fn narrow_by_flag_match<'a>(
                     .iter()
                     .filter(|f| {
                         let bare = f.split_once('=').map(|(k, _)| k).unwrap_or(f);
-                        spec.flag_args.contains_key(bare)
+                        // Direct lookup
+                        if spec.flag_args.contains_key(bare)
                             || spec.flag_call_programs.contains_key(bare)
                             || spec.flag_static_lists.contains_key(bare)
+                        {
+                            return true;
+                        }
+                        // Alias lookup: check every sibling in the group containing `bare`.
+                        for group in &spec.flag_aliases {
+                            if group.iter().any(|g| g == bare) {
+                                for sibling in group {
+                                    if spec.flag_args.contains_key(sibling)
+                                        || spec.flag_call_programs.contains_key(sibling)
+                                        || spec.flag_static_lists.contains_key(sibling)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        false
                     })
                     .count(),
                 None => 0,
@@ -4485,5 +4503,34 @@ mod tests {
             "expected no output for non-walkable prefix; got: {:?}",
             out
         );
+    }
+
+    #[test]
+    fn narrow_by_flag_match_respects_aliases() {
+        // Spec only has `--force` in flag_args, but `-f` is declared as an alias.
+        // Typing `-f` should still count as a hit via the alias group.
+        let mut t = CommandTrie::new();
+        t.insert(&["git", "commit"]);
+        t.insert(&["git", "clean"]);
+        t.insert_command("git");
+
+        let mut spec = ArgSpec {
+            flag_args: [("--force".into(), trie::ARG_MODE_PATHS)].into_iter().collect(),
+            flag_aliases: vec![vec!["-f".to_string(), "--force".to_string()]],
+            ..Default::default()
+        };
+        spec.flag_exclusions = vec![];
+        t.arg_specs.insert("git commit".into(), spec);
+        // clean has no spec
+
+        let git_node = t.root.get_child("git").unwrap();
+        let commit_node = git_node.get_child("commit").unwrap();
+        let clean_node = git_node.get_child("clean").unwrap();
+        let candidates = vec![("commit", commit_node), ("clean", clean_node)];
+        let prefix = vec!["git".to_string()];
+        // User typed `-f`; commit's spec only lists `--force` directly, but alias group maps them.
+        let narrowed = narrow_by_flag_match(&candidates, &prefix, &["-f"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 1, "should narrow to commit via alias");
+        assert_eq!(narrowed[0].0, "commit");
     }
 }
