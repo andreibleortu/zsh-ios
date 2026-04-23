@@ -90,6 +90,8 @@ Directories scanned: `~/.config/carapace/specs/`, `/usr/share/carapace/specs/`, 
 
 If the `carapace` binary is on PATH and `disable_build_time_shell_exec` is false, the scanner additionally shells to `carapace _list` to enumerate every builtin completer, then `carapace <cmd> _spec` to dump each as YAML. Dumps cache under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/<name>.yaml` keyed by `carapace --version` so upgrades invalidate automatically. The cached files are then read the same way as user-authored specs.
 
+A third sourcing path is `zsh-ios carapace-fetch`: it downloads the latest carapace-bin release tarball from GitHub (using `curl | tar`, no system install required) into `$XDG_CACHE_HOME/zsh-ios/carapace-bin/carapace`, then calls `carapace _list` and `carapace <cmd> _spec` on that private binary and writes the resulting YAMLs directly into `$XDG_CACHE_HOME/zsh-ios/carapace-specs/`. Subsequent `zsh-ios rebuild` reads them from that same directory via `scan_carapace_dirs` without any code changes.
+
 Each spec's `name` / `description` / `flags` / `persistentflags` / `commands[]` / `completion.positional[N]` / `completion.flag[flag]` / `completion.positionalany` are recursively folded into `trie.root`, `trie.descriptions`, and `trie.arg_specs`. Action strings are resolved via:
 
 - `$files` / `$files(pattern)` → `ARG_MODE_PATHS`

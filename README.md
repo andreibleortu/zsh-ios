@@ -167,6 +167,8 @@ zsh-ios preset power    # Apply the power-user preset (backs up existing config)
 zsh-ios preset deterministic --show   # Print preset YAML without writing
 zsh-ios fig-fetch       # Clone + build withfig/autocomplete, dump specs to JSON cache
                         # (one-time; requires Node + pnpm/npm; re-run after upstream updates)
+zsh-ios carapace-fetch  # Download carapace-bin and dump every builtin completer's YAML spec
+                        # (one-time; requires curl + tar; no carapace system install needed)
 ```
 
 ### Debugging resolution
