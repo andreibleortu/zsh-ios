@@ -667,6 +667,17 @@ fn cmd_status() {
                     total_groups
                 );
             }
+            if !trie.completion_styles.is_empty() {
+                let s = &trie.completion_styles;
+                println!(
+                    "  Styles:      formats={} group-names={} list-colors={} menu={} completer-chain={}",
+                    s.formats.len(),
+                    s.group_names.len(),
+                    s.list_colors.len(),
+                    s.menu_threshold.map(|n| format!("select={n}")).unwrap_or_else(|| "off".to_string()),
+                    s.completer_chain.len(),
+                );
+            }
         }
     } else {
         println!("  Tree:        not built yet (run `zsh-ios rebuild`)");

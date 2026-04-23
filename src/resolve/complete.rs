@@ -307,22 +307,87 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && !groups.is_empty()
         && !prefix.starts_with('-')
     {
+        // Resolve the format template for tag-group headers (from zstyle format).
+        let format_template: Option<&str> = trie
+            .completion_styles
+            .formats
+            .iter()
+            .find(|(k, _)| k.contains(":descriptions"))
+            .map(|(_, v)| v.as_str());
+
+        // Resolve the group-name setting (empty string = per-tag headers, which is default).
+        let group_name: Option<&str> = trie
+            .completion_styles
+            .group_names
+            .iter()
+            .find(|(k, _)| k.as_str() == ":completion:*" || k.starts_with(":completion:*:"))
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty());
+
+        // Determine whether stdout is a TTY (for list-colors).
+        let use_colors = !trie.completion_styles.list_colors.is_empty() && is_stdout_tty();
+
         let mut group_output = String::new();
-        for group in groups {
-            let filtered: Vec<&str> = group
-                .items
-                .iter()
-                .filter(|i| prefix.is_empty() || i.starts_with(prefix))
-                .map(String::as_str)
-                .collect();
-            if filtered.is_empty() && prefix.is_empty() && !group.label.is_empty() {
-                // Show an empty-group stub: label only, no items
-                group_output.push_str(&format!("% {}:\n", titlecase(&group.label)));
-            } else if !filtered.is_empty() {
-                group_output.push_str(&format!("% {}:\n", titlecase(&group.label)));
-                group_output.push_str(&format_columns(&filtered, 80));
+
+        if let Some(gname) = group_name {
+            // Flatten all groups under one combined header.
+            let header_label = match format_template {
+                Some(tpl) => apply_format(tpl, gname),
+                None => gname.to_string(),
+            };
+            let mut all_items: Vec<String> = Vec::new();
+            for group in groups {
+                let filtered: Vec<String> = group
+                    .items
+                    .iter()
+                    .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                all_items.extend(filtered);
+            }
+            if !all_items.is_empty() {
+                group_output.push_str(&format!("% {}:\n", header_label));
+                let display: Vec<String> = if use_colors {
+                    all_items.iter().map(|i| colorize_item(i)).collect()
+                } else {
+                    all_items.clone()
+                };
+                let refs: Vec<&str> = display.iter().map(String::as_str).collect();
+                group_output.push_str(&format_columns(&refs, 80));
+            }
+        } else {
+            // Per-tag headers (default behavior).
+            for group in groups {
+                let filtered: Vec<&str> = group
+                    .items
+                    .iter()
+                    .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+                    .map(String::as_str)
+                    .collect();
+                let header_label = {
+                    let raw = titlecase(&group.label);
+                    match format_template {
+                        Some(tpl) => apply_format(tpl, &raw),
+                        None => raw,
+                    }
+                };
+                if filtered.is_empty() && prefix.is_empty() && !group.label.is_empty() {
+                    // Show an empty-group stub: label only, no items
+                    group_output.push_str(&format!("% {}:\n", header_label));
+                } else if !filtered.is_empty() {
+                    group_output.push_str(&format!("% {}:\n", header_label));
+                    if use_colors {
+                        let display: Vec<String> =
+                            filtered.iter().map(|i| colorize_item(i)).collect();
+                        let refs: Vec<&str> = display.iter().map(String::as_str).collect();
+                        group_output.push_str(&format_columns(&refs, 80));
+                    } else {
+                        group_output.push_str(&format_columns(&filtered, 80));
+                    }
+                }
             }
         }
+
         if !group_output.is_empty() {
             output.push_str(&group_output);
             return output;
@@ -393,6 +458,37 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     }
 
     output
+}
+
+/// Substitute `%d` tokens in a zstyle format string with the given description.
+fn apply_format(raw_format: &str, description: &str) -> String {
+    raw_format.replace("%d", description)
+}
+
+/// Apply ANSI cyan color to items that look like directories (end with `/`).
+/// Used when `list-colors` is set and stdout is a TTY.
+fn colorize_item(item: &str) -> String {
+    if item.ends_with('/') {
+        format!("\x1b[36m{item}\x1b[0m")
+    } else {
+        item.to_string()
+    }
+}
+
+/// Return true when stdout is connected to a terminal.
+fn is_stdout_tty() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::RawFd;
+        unsafe extern "C" {
+            fn isatty(fd: RawFd) -> i32;
+        }
+        unsafe { isatty(1) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Complete a flag prefix: show matching flags from spec and trie.
@@ -991,6 +1087,79 @@ mod tests {
         assert!(out.contains("% Possible subcommands:"), "expected flat subcommand header, got: {:?}", out);
         // Must not have tag-style headers
         assert!(!out.contains("% Process:"), "should not have tag-group header");
+    }
+
+    #[test]
+    fn complete_applies_format_to_tag_header() {
+        use crate::trie::{CompletionStyles, TagGroup};
+        let mut trie = CommandTrie::new();
+        trie.insert_command("kill");
+        trie.tag_groups.insert(
+            "kill".to_string(),
+            vec![TagGroup {
+                tag: "processes".to_string(),
+                label: "process".to_string(),
+                items: vec!["123".to_string()],
+            }],
+        );
+        // Set format template: "[%d]"
+        trie.completion_styles = CompletionStyles {
+            formats: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(":completion:*:descriptions".to_string(), "[%d]".to_string());
+                m
+            },
+            ..Default::default()
+        };
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        let out = super::complete("kill ", &trie, &pins, ContextHint::Argument);
+        assert!(
+            out.contains("% [Process]:"),
+            "expected '% [Process]:' with format applied, got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn complete_merges_when_group_name_set() {
+        use crate::trie::{CompletionStyles, TagGroup};
+        let mut trie = CommandTrie::new();
+        trie.insert_command("kill");
+        trie.tag_groups.insert(
+            "kill".to_string(),
+            vec![
+                TagGroup {
+                    tag: "processes".to_string(),
+                    label: "process".to_string(),
+                    items: vec!["123".to_string()],
+                },
+                TagGroup {
+                    tag: "jobs".to_string(),
+                    label: "job".to_string(),
+                    items: vec!["%1".to_string()],
+                },
+            ],
+        );
+        // Set non-empty group-name: all items under one header.
+        trie.completion_styles = CompletionStyles {
+            group_names: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(":completion:*".to_string(), "all".to_string());
+                m
+            },
+            ..Default::default()
+        };
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        let out = super::complete("kill ", &trie, &pins, ContextHint::Argument);
+        // Should have a single combined header "% all:" and both items.
+        assert!(out.contains("% all:"), "expected '% all:' merged header, got: {:?}", out);
+        assert!(out.contains("123"), "expected item '123' in merged output");
+        assert!(out.contains("%1"), "expected item '%1' in merged output");
+        // Must NOT have per-tag headers.
+        assert!(!out.contains("% Process:"), "should not have separate Process header");
+        assert!(!out.contains("% Job:"), "should not have separate Job header");
     }
 
     #[test]

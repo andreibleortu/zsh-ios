@@ -1,4 +1,4 @@
-use crate::trie::MatcherRule;
+use crate::trie::{CompletionStyles, MatcherRule};
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -75,9 +75,12 @@ pub fn apply_ingest(trie: &mut crate::trie::CommandTrie, input: &str) {
         }
     }
     if let Some(body) = sections.get("zstyle") {
-        let rules = parse_zstyle_matchers(body);
+        let (rules, styles) = parse_zstyle_output(body);
         if !rules.is_empty() {
             trie.matcher_rules = rules;
+        }
+        if !styles.is_empty() {
+            trie.completion_styles = styles;
         }
     }
 }
@@ -258,35 +261,98 @@ pub fn apply_dirstack(trie: &mut crate::trie::CommandTrie, body: &str) {
     trie.dir_stack = stack;
 }
 
-/// Parse `zstyle -L` output and extract matcher-list rules.
+/// Parse `zstyle -L` output and extract matcher-list rules plus style settings.
 ///
-/// Only lines of the form `zstyle '<context>' matcher-list <args>` are
-/// examined; all other `zstyle` lines are ignored.  Each quoted argument
-/// after `matcher-list` is a single matcher string; within it, individual
-/// specs are whitespace-separated.
-pub fn parse_zstyle_matchers(body: &str) -> Vec<MatcherRule> {
+/// Returns `(matcher_rules, completion_styles)`.  The following keys are
+/// recognised:
+/// - `matcher-list` → existing MatcherRule path
+/// - `format`       → `styles.formats`
+/// - `group-name`   → `styles.group_names`
+/// - `list-colors`  → `styles.list_colors`
+/// - `menu`         → `styles.menu_threshold` (when args contain `yes` and `select=N`)
+/// - `completer`    → `styles.completer_chain`
+///
+/// Everything else is silently skipped.
+pub fn parse_zstyle_output(body: &str) -> (Vec<MatcherRule>, CompletionStyles) {
     let mut rules = Vec::new();
+    let mut styles = CompletionStyles::default();
+
     for line in body.lines() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix("zstyle ") else {
             continue;
         };
-        // Skip the context argument (first quoted token).
-        let Some(after_context) = skip_quoted(rest) else {
-            continue;
+        // Extract the context string (first quoted/bare token).
+        let (context, after_context) = match extract_quoted_value(rest) {
+            Some(pair) => pair,
+            None => continue,
         };
         let after_context = after_context.trim_start();
-        let Some(after_key) = after_context.strip_prefix("matcher-list") else {
-            continue;
+
+        // Determine the key (next bare word before args).
+        let (key, after_key) = {
+            let end = after_context
+                .find(char::is_whitespace)
+                .unwrap_or(after_context.len());
+            (&after_context[..end], &after_context[end..])
         };
-        // Each remaining quoted token is one matcher string.
-        for matcher in split_quoted_args(after_key) {
-            for spec in matcher.split_whitespace() {
-                rules.push(classify_matcher_spec(spec));
+
+        match key {
+            "matcher-list" => {
+                for matcher in split_quoted_args(after_key) {
+                    for spec in matcher.split_whitespace() {
+                        rules.push(classify_matcher_spec(spec));
+                    }
+                }
             }
+            "format" => {
+                let args = split_quoted_args(after_key);
+                if let Some(value) = args.into_iter().next() {
+                    styles.formats.insert(context.to_string(), value.to_string());
+                }
+            }
+            "group-name" => {
+                let args = split_quoted_args(after_key);
+                // Empty string group-name is valid — it means "use default per-tag headers".
+                let value = args.into_iter().next().unwrap_or("").to_string();
+                styles.group_names.insert(context.to_string(), value);
+            }
+            "list-colors" => {
+                for arg in split_quoted_args(after_key) {
+                    styles.list_colors.push(arg.to_string());
+                }
+            }
+            "menu" => {
+                let args = split_quoted_args(after_key);
+                // Honour `menu yes select=N`: look for `yes` and `select=N`.
+                let has_yes = args.contains(&"yes");
+                if has_yes {
+                    for arg in &args {
+                        if let Some(n_str) = arg.strip_prefix("select=")
+                            && let Ok(n) = n_str.parse::<u32>()
+                        {
+                            styles.menu_threshold = Some(n);
+                        }
+                    }
+                }
+            }
+            "completer" => {
+                for arg in split_quoted_args(after_key) {
+                    styles.completer_chain.push(arg.to_string());
+                }
+            }
+            _ => {} // silently skip
         }
     }
-    rules
+
+    (rules, styles)
+}
+
+/// Parse `zstyle -L` output and extract matcher-list rules only.
+///
+/// Thin compatibility wrapper around [`parse_zstyle_output`].
+pub fn parse_zstyle_matchers(body: &str) -> Vec<MatcherRule> {
+    parse_zstyle_output(body).0
 }
 
 /// Classify one zstyle match spec into a `MatcherRule`.
@@ -319,12 +385,12 @@ fn classify_matcher_spec(spec: &str) -> MatcherRule {
     MatcherRule::Unknown(spec.to_string())
 }
 
-/// Advance past the first shell-quoted token in `s` and return the remainder.
+/// Extract the first shell-quoted token from `s`, returning `(content, remainder)`.
 ///
-/// Handles single-quoted (`'...'`) and double-quoted (`"..."`) tokens as well
-/// as bare (unquoted) tokens terminated by whitespace.  Returns `None` when
-/// `s` is empty after trimming leading whitespace.
-fn skip_quoted(s: &str) -> Option<&str> {
+/// The returned `content` has outer quotes stripped.  `remainder` starts just
+/// after the closing quote / end of bare token.  Returns `None` when `s` is
+/// empty after trimming leading whitespace.
+fn extract_quoted_value(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
     if s.is_empty() {
         return None;
@@ -337,12 +403,14 @@ fn skip_quoted(s: &str) -> Option<&str> {
         while i < bytes.len() && bytes[i] != quote {
             i += 1;
         }
-        // i now points at the closing quote (or end-of-string).
-        Some(&s[i.saturating_add(1)..])
+        // i points at the closing quote (or end-of-string).
+        let content = &s[1..i];
+        let rest = &s[i.saturating_add(1)..];
+        Some((content, rest))
     } else {
         // Bare token — advance until whitespace.
         let end = s.find(char::is_whitespace).unwrap_or(s.len());
-        Some(&s[end..])
+        Some((&s[..end], &s[end..]))
     }
 }
 
@@ -658,6 +726,92 @@ mod tests {
         assert_eq!(trie.galiases.get("G"), Some(&"| grep".to_string()));
         // Must NOT have been inserted into the trie root as a command.
         assert!(trie.root.get_child("G").is_none());
+    }
+
+    // ── parse_zstyle_output ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_zstyle_output_format() {
+        let body = "zstyle ':completion:*:descriptions' format '%d'\n";
+        let (_, styles) = parse_zstyle_output(body);
+        assert_eq!(
+            styles.formats.get(":completion:*:descriptions"),
+            Some(&"%d".to_string()),
+            "format not parsed"
+        );
+    }
+
+    #[test]
+    fn parse_zstyle_output_group_name() {
+        let body = "zstyle ':completion:*' group-name ''\n";
+        let (_, styles) = parse_zstyle_output(body);
+        assert_eq!(
+            styles.group_names.get(":completion:*"),
+            Some(&String::new()),
+            "group-name not parsed"
+        );
+    }
+
+    #[test]
+    fn parse_zstyle_output_list_colors() {
+        let body = "zstyle ':completion:*' list-colors '${(s.:.)LS_COLORS}'\n";
+        let (_, styles) = parse_zstyle_output(body);
+        assert!(!styles.list_colors.is_empty(), "list_colors should be non-empty");
+        assert!(
+            styles.list_colors[0].contains("LS_COLORS"),
+            "list_colors[0] should reference LS_COLORS, got: {:?}",
+            styles.list_colors[0]
+        );
+    }
+
+    #[test]
+    fn parse_zstyle_output_menu_select() {
+        let body = "zstyle ':completion:*' menu yes select=5\n";
+        let (_, styles) = parse_zstyle_output(body);
+        assert_eq!(styles.menu_threshold, Some(5), "menu_threshold should be Some(5)");
+    }
+
+    #[test]
+    fn parse_zstyle_output_completer_chain() {
+        let body = "zstyle ':completion:*' completer _complete _approximate _ignored\n";
+        let (_, styles) = parse_zstyle_output(body);
+        assert_eq!(
+            styles.completer_chain,
+            vec!["_complete", "_approximate", "_ignored"],
+            "completer_chain mismatch"
+        );
+    }
+
+    #[test]
+    fn apply_ingest_populates_completion_styles() {
+        let mut trie = CommandTrie::new();
+        let input = concat!(
+            "@zstyle\n",
+            "zstyle ':completion:*:descriptions' format '%d'\n",
+            "zstyle ':completion:*' group-name ''\n",
+            "zstyle ':completion:*' list-colors '${(s.:.)LS_COLORS}'\n",
+            "zstyle ':completion:*' menu yes select=5\n",
+            "zstyle ':completion:*' completer _complete _approximate _ignored\n",
+        );
+        apply_ingest(&mut trie, input);
+        let s = &trie.completion_styles;
+        assert_eq!(
+            s.formats.get(":completion:*:descriptions"),
+            Some(&"%d".to_string()),
+            "formats not populated"
+        );
+        assert_eq!(
+            s.group_names.get(":completion:*"),
+            Some(&String::new()),
+            "group_names not populated"
+        );
+        assert!(!s.list_colors.is_empty(), "list_colors not populated");
+        assert_eq!(s.menu_threshold, Some(5), "menu_threshold not populated");
+        assert_eq!(
+            s.completer_chain,
+            vec!["_complete", "_approximate", "_ignored"],
+            "completer_chain not populated"
+        );
     }
 
     // ── parse_zstyle_matchers ─────────────────────────────────────────────────

@@ -730,6 +730,42 @@ pub type DescriptionMap = HashMap<String, HashMap<String, String>>;
 
 pub const TREE_SCHEMA_VERSION: u32 = 2;
 
+/// Parsed zstyle settings beyond `matcher-list`, populated from the worker's
+/// `zstyle -L` dump by `ingest::parse_zstyle_output`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompletionStyles {
+    /// `format` values indexed by context.
+    /// Example: `:completion:*:descriptions` → `%d`
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub formats: HashMap<String, String>,
+    /// `group-name` values by context. Empty string = each tag rendered
+    /// as its own group (zsh default when unset).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub group_names: HashMap<String, String>,
+    /// Raw `list-colors` spec list (we honour the `zsh/LS_COLORS` form
+    /// by looking up LS_COLORS from the environment; explicit color
+    /// rules beyond that are recorded verbatim and NOT applied).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_colors: Vec<String>,
+    /// Menu threshold: `:completion:*' menu yes select=N` → Some(N).
+    /// None = not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_threshold: Option<u32>,
+    /// `completer` chain — the completers the user wants tried, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completer_chain: Vec<String>,
+}
+
+impl CompletionStyles {
+    pub fn is_empty(&self) -> bool {
+        self.formats.is_empty()
+            && self.group_names.is_empty()
+            && self.list_colors.is_empty()
+            && self.menu_threshold.is_none()
+            && self.completer_chain.is_empty()
+    }
+}
+
 /// The full command trie with serialization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandTrie {
@@ -779,6 +815,13 @@ pub struct CommandTrie {
     /// (e.g. "kill" or "git checkout"). Value = list of TagGroup.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tag_groups: HashMap<String, Vec<TagGroup>>,
+    /// Parsed zstyle settings beyond matcher-list. Each entry is one
+    /// `(context, value)` pair as it appeared in `zstyle -L`. We keep the
+    /// context string alongside the value because several keys are
+    /// context-sensitive: `:completion:*:descriptions'` format targets the
+    /// descriptions tag specifically, etc.
+    #[serde(default, skip_serializing_if = "CompletionStyles::is_empty")]
+    pub completion_styles: CompletionStyles,
 }
 
 impl CommandTrie {
