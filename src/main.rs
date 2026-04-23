@@ -2,32 +2,7 @@ use zsh_ios::*;
 
 use clap::{Parser, Subcommand};
 use std::fs::OpenOptions;
-use std::path::Path;
 use std::process;
-
-/// Acquire an exclusive advisory lock on a sibling `.lock` file for the
-/// given path. The lock is released when the returned file handle drops.
-/// Used to serialize concurrent `learn` / `build` / `pin` writers that the
-/// Zsh plugin spawns in the background after every command.
-fn lock_for(path: &Path) -> Option<std::fs::File> {
-    let lock_path = {
-        let mut s = path.as_os_str().to_os_string();
-        s.push(".lock");
-        std::path::PathBuf::from(s)
-    };
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    file.lock().ok()?;
-    Some(file)
-}
 
 #[derive(Parser)]
 #[command(
@@ -95,6 +70,8 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         line: Vec<String>,
     },
+    /// Ingest structured shell state from stdin (aliases, functions, named dirs)
+    Ingest,
 }
 
 fn main() {
@@ -112,6 +89,7 @@ fn main() {
         Commands::Rebuild => cmd_rebuild(),
         Commands::Status => cmd_status(),
         Commands::Explain { line } => cmd_explain(&line.join(" ")),
+        Commands::Ingest => ingest::cmd_ingest(),
     }
 }
 
@@ -122,7 +100,7 @@ fn cmd_build(aliases_stdin: bool) {
     });
 
     // Serialize against concurrent `learn` writers.
-    let _lock = lock_for(&config::tree_path());
+    let _lock = locks::lock_for(&config::tree_path());
 
     let mut ct = trie::CommandTrie::new();
 
@@ -194,7 +172,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
-        "status", "explain",
+        "status", "explain", "ingest",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }
@@ -364,7 +342,7 @@ fn cmd_learn(command: &str, exit_code: i32) {
     let tree_path = config::tree_path();
     // Hold a lock across load-mutate-save so background `learn` processes
     // spawned in rapid succession don't race and truncate the trie file.
-    let _lock = lock_for(&tree_path);
+    let _lock = locks::lock_for(&tree_path);
     let mut trie = match trie::CommandTrie::load(&tree_path) {
         Ok(t) => t,
         Err(_) => return,
@@ -426,7 +404,7 @@ fn cmd_pin(abbrev: &str, expanded: &str) {
         process::exit(1);
     });
 
-    let _lock = lock_for(&pins_path);
+    let _lock = locks::lock_for(&pins_path);
 
     // Remove existing pin for this abbreviation first
     let _ = pins::Pins::remove(&pins_path, &abbrev_words);
@@ -442,7 +420,7 @@ fn cmd_pin(abbrev: &str, expanded: &str) {
 fn cmd_unpin(abbrev: &str) {
     let abbrev_words: Vec<&str> = abbrev.split_whitespace().collect();
     let pins_path = config::pins_path();
-    let _lock = lock_for(&pins_path);
+    let _lock = locks::lock_for(&pins_path);
 
     match pins::Pins::remove(&pins_path, &abbrev_words) {
         Ok(true) => eprintln!("Removed pin: {}", abbrev),

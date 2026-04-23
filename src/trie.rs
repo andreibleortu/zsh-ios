@@ -483,6 +483,11 @@ pub struct CommandTrie {
     /// Schema version stamped at save time. 0 means pre-versioned (legacy).
     #[serde(default)]
     pub schema_version: u32,
+    /// User-defined named directories from `hash -d` (or .zshrc equivalents).
+    /// Maps name -> absolute path.  Populated by `zsh-ios ingest` from the
+    /// plugin worker's `hash -d` dump.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub named_dirs: HashMap<String, String>,
 }
 
 impl CommandTrie {

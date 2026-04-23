@@ -15,6 +15,10 @@ ZSH_IOS_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh-ios"
 # unchanged buffer sees the match and enters the picker instead.
 typeset -g _zsh_ios_last_tab_buffer=""
 
+# One-shot ingest guard: set to 1 after the first worker-state ingest so
+# subsequent precmd invocations don't re-run it.
+typeset -g _zsh_ios_ingested=0
+
 # Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
 # have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
 # an already-open file descriptor containing the simulated keystrokes.
@@ -104,6 +108,10 @@ _zsh_ios_precmd() {
     fi
     unset _zsh_ios_pending_cmd
     unset _zsh_ios_last_pin
+    if (( ! _zsh_ios_ingested )) && _zsh_ios_worker_is_ready; then
+        _zsh_ios_ingested=1
+        ( _zsh_ios_ingest_worker_state & ) &>/dev/null
+    fi
 }
 
 autoload -Uz add-zsh-hook
@@ -781,18 +789,40 @@ compadd() {
     fi
 }
 
-# Override accept-line: when a request file exists, run completion instead of
-# accepting input.  The parent triggers this by sending a newline via zpty -w.
+# Override accept-line: when a request file exists, handle the request instead
+# of accepting input.  The parent triggers this by sending a newline via zpty -w.
 _zio_accept_line() {
     local _req="${_ZSH_IOS_WORKER_DIR}/request"
     if [[ -f "\$_req" ]]; then
         source "\$_req"
-        BUFFER="\$_ZIO_BUFFER"
-        CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
         : > "\$_ZIO_RF"
-        zle complete-word 2>/dev/null
-        BUFFER=""
-        CURSOR=0
+        case "\${_ZIO_REQUEST:-complete-word}" in
+            complete-word)
+                BUFFER="\$_ZIO_BUFFER"
+                CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+                zle complete-word 2>/dev/null
+                BUFFER=""
+                CURSOR=0
+                ;;
+            dump-aliases)
+                alias >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-galiases)
+                alias -g >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-saliases)
+                alias -s >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-functions)
+                print -l "\${(k)functions}" >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-nameddirs)
+                hash -d >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+            dump-zstyle)
+                zstyle -L >> "\$_ZIO_RF" 2>/dev/null
+                ;;
+        esac
         [[ -n "\$_ZIO_DF" ]] && touch "\$_ZIO_DF"
         rm -f "\$_req"
         return
@@ -871,6 +901,63 @@ EOF
     if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
     rm -f "$_rf" "$_df" "$_bf" "$_req"
     return $_rc
+}
+
+_zsh_ios_worker_dump() {
+    _zsh_ios_worker_is_ready || return 1
+    local kind="$1"
+    [[ -n "$kind" ]] || return 1
+
+    # Drain accumulated pty output (same pattern as _zsh_ios_worker_complete).
+    local _zio_drain_buf _zio_drain_n=0
+    while zpty -t _zsh_ios_worker 2>/dev/null; do
+        zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        (( ++_zio_drain_n > 200 )) && break
+    done
+
+    local _rf; _rf=$(mktemp "${TMPDIR:-/tmp}/zio-dump.XXXXXX") || return 1
+    local _df="${_rf}.done"
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+
+    cat > "$_req" <<EOF
+_ZIO_REQUEST='dump-${kind}'
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+EOF
+
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null || {
+        rm -f "$_rf" "$_df" "$_req"; return 1
+    }
+
+    local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
+    for _i in $(seq 1 $_slices); do
+        [[ -f "$_df" ]] && break
+        sleep 0.01
+        while zpty -t _zsh_ios_worker 2>/dev/null; do
+            zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        done
+    done
+    local _rc=1
+    if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
+    rm -f "$_rf" "$_df" "$_req"
+    return $_rc
+}
+
+_zsh_ios_ingest_worker_state() {
+    # One-shot; runs in background.  Concatenates worker dumps with @<kind>
+    # section markers and pipes into `zsh-ios ingest` for trie integration.
+    {
+        print "@aliases"
+        _zsh_ios_worker_dump aliases
+        print "@galiases"
+        _zsh_ios_worker_dump galiases
+        print "@saliases"
+        _zsh_ios_worker_dump saliases
+        print "@functions"
+        _zsh_ios_worker_dump functions
+        print "@nameddirs"
+        _zsh_ios_worker_dump nameddirs
+    } | "$ZSH_IOS_BIN" ingest 2>/dev/null
 }
 
 _zsh_ios_worker_cleanup() {

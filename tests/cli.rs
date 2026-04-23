@@ -664,3 +664,47 @@ fn learn_success_sets_last_used() {
     let last_used = trie.root.get_child("git").expect("git node").last_used;
     assert!(last_used > 0, "last_used should be set after success learn");
 }
+
+#[test]
+fn ingest_applies_aliases_and_nameddirs_to_trie() {
+    use std::io::Write;
+    use zsh_ios::trie::CommandTrie;
+
+    let td = tempfile::tempdir().unwrap();
+    // Seed an empty trie so ingest has something to load and mutate.
+    seed_trie_with(td.path(), &[]);
+
+    let payload = concat!(
+        "@aliases\n",
+        "ll='ls -la'\n",
+        "gs='git status'\n",
+        "@functions\n",
+        "myfn\n",
+        "@nameddirs\n",
+        "proj=/home/me/proj\n",
+    );
+
+    let mut child = cmd_in(td.path())
+        .arg("ingest")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "ingest exited non-zero");
+
+    let trie = CommandTrie::load(&tree_path_of(td.path())).unwrap();
+    assert!(trie.root.get_child("ll").is_some(), "'ll' alias not ingested");
+    assert!(trie.root.get_child("gs").is_some(), "'gs' alias not ingested");
+    assert!(trie.root.get_child("myfn").is_some(), "'myfn' function not ingested");
+    assert_eq!(
+        trie.named_dirs.get("proj"),
+        Some(&"/home/me/proj".to_string()),
+        "named dir 'proj' not ingested"
+    );
+}
