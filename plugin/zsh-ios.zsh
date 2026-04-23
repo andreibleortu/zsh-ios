@@ -160,7 +160,10 @@ _zsh_ios_precmd() {
     unset _zsh_ios_last_pin
     if (( ! _zsh_ios_ingested )) && _zsh_ios_worker_is_ready; then
         _zsh_ios_ingested=1
-        ( _zsh_ios_ingest_worker_state; _zsh_ios_harvest_regex_args ) &>/dev/null &
+        # `&|` = start in background AND disown, so zsh doesn't print
+        # the `[N] pid` and `[N] + exit …` job-control notifications
+        # that a plain `&` would emit on every new shell.
+        ( _zsh_ios_ingest_worker_state; _zsh_ios_harvest_regex_args ) &>/dev/null &|
     fi
 }
 
