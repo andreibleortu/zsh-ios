@@ -191,6 +191,12 @@ mod tests {
             ARG_MODE_LERNA_PACKAGE,
             ARG_MODE_YARN_WORKSPACE,
             ARG_MODE_PIPENV_SCRIPT,
+            // Live state
+            ARG_MODE_JOB_SPEC,
+            ARG_MODE_ZSH_WIDGET,
+            ARG_MODE_ZSH_KEYMAP,
+            ARG_MODE_ZSH_MODULE,
+            ARG_MODE_HASHED_COMMAND,
         ] {
             assert!(REGISTRY.contains(mode), "mode {} missing", mode);
         }

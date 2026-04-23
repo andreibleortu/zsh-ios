@@ -828,6 +828,19 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         // --- systemd user/timer variants ---
         ("systemctl list-timers", &[], Some(ARG_MODE_SYSTEMD_TIMER), &[]),
         ("systemctl list-sockets", &[], Some(ARG_MODE_SYSTEMD_SOCKET), &[]),
+
+        // --- Live shell state ---
+        // Job control: %N, %+, %-, %cmd-prefix
+        ("fg", &[(1, ARG_MODE_JOB_SPEC)], Some(ARG_MODE_JOB_SPEC), &[]),
+        ("bg", &[(1, ARG_MODE_JOB_SPEC)], Some(ARG_MODE_JOB_SPEC), &[]),
+        ("disown", &[(1, ARG_MODE_JOB_SPEC)], Some(ARG_MODE_JOB_SPEC), &[]),
+        ("wait", &[(1, ARG_MODE_JOB_SPEC)], Some(ARG_MODE_JOB_SPEC), &[]),
+        // ZLE / bindkey
+        ("zle -N", &[(1, ARG_MODE_ZSH_WIDGET)], None, &[]),
+        ("zle -D", &[(1, ARG_MODE_ZSH_WIDGET)], None, &[]),
+        ("bindkey", &[], None, &[("-M", ARG_MODE_ZSH_KEYMAP), ("-A", ARG_MODE_ZSH_KEYMAP), ("-N", ARG_MODE_ZSH_KEYMAP)]),
+        // Modules
+        ("zmodload", &[(1, ARG_MODE_ZSH_MODULE)], Some(ARG_MODE_ZSH_MODULE), &[]),
     ];
 
     // Commands whose rest/positional completions come from an external program.

@@ -249,6 +249,7 @@ fn cmd_resolve(line: &str, context: Option<&str>) {
     if user_cfg.disable_galiases {
         trie.galiases.clear();
     }
+    hydrate_live_state(&trie);
 
     // Blocklist pre-check: if the user typed the blocklisted name literally,
     // passthrough immediately so the engine does zero work.
@@ -349,9 +350,34 @@ fn cmd_complete(line: &str, context: Option<&str>) {
     if user_cfg.disable_galiases {
         trie.galiases.clear();
     }
+    hydrate_live_state(&trie);
     let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
     let output = resolve::complete(line, &trie, &pin_store, context_hint);
     print!("{}", output);
+}
+
+/// Populate the runtime_complete live-state cache from the trie's stored dumps.
+/// Called at CLI entry so the JobSpec / ShellParameter / Widget / Module /
+/// HashedCommand resolvers see the shell's current state.
+fn hydrate_live_state(trie: &trie::CommandTrie) {
+    use std::collections::HashMap;
+    let mut parsed: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(s) = trie.live_state.get("jobs") {
+        parsed.insert("jobs".into(), runtime_complete::parse_jobs_output(s));
+    }
+    if let Some(s) = trie.live_state.get("parameters") {
+        parsed.insert("parameters".into(), runtime_complete::parse_parameters_output(s));
+    }
+    if let Some(s) = trie.live_state.get("widgets") {
+        parsed.insert("widgets".into(), runtime_complete::parse_widgets_output(s));
+    }
+    if let Some(s) = trie.live_state.get("modules") {
+        parsed.insert("modules".into(), runtime_complete::parse_modules_output(s));
+    }
+    if let Some(s) = trie.live_state.get("commands") {
+        parsed.insert("hashed".into(), runtime_complete::parse_hashed_commands_output(s));
+    }
+    runtime_complete::set_live_state(parsed);
 }
 
 fn cmd_learn(command: &str, exit_code: i32, cwd: Option<&str>) {
@@ -674,6 +700,7 @@ fn cmd_explain(line: &str) {
     if user_cfg.disable_galiases {
         trie.galiases.clear();
     }
+    hydrate_live_state(&trie);
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok());

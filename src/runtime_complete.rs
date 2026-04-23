@@ -2932,7 +2932,16 @@ impl TypeResolver for ShellAliasResolver {
 pub struct ShellVarResolver;
 impl TypeResolver for ShellVarResolver {
     fn list(&self, _ctx: &Ctx) -> Vec<String> {
-        std::env::vars().map(|(k, _)| k).collect()
+        // Union the env-exported vars with the worker's `parameters` dump so
+        // non-exported shell parameters also show up.
+        let mut out: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+        let live = live_state_for("parameters");
+        for name in live {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
     }
     fn cache_ttl(&self) -> Duration {
         Duration::from_secs(30)
@@ -3032,6 +3041,219 @@ impl TypeResolver for HistoryEntryResolver {
     }
 }
 
+// --- Live shell-state cache (populated from trie.live_state at CLI entry) ---
+
+static LIVE_STATE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::OnceLock::new();
+
+/// Replace the cached live shell state. Called from the CLI entry points
+/// (`cmd_resolve` / `cmd_complete`) after loading the trie, with the trie's
+/// raw `live_state` dumps already parsed via the functions below.
+pub fn set_live_state(kind_to_parsed: HashMap<String, Vec<String>>) {
+    let lock = LIVE_STATE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(mut m) = lock.lock() {
+        *m = kind_to_parsed;
+    }
+}
+
+/// Look up the parsed list for a given live_state kind. Returns an empty
+/// vec if the kind wasn't set (or the cache was never initialized).
+pub fn live_state_for(kind: &str) -> Vec<String> {
+    LIVE_STATE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|m| m.get(kind).cloned())
+        .unwrap_or_default()
+}
+
+// --- Parsers for each live_state dump kind ---
+
+/// Parse `jobs` output into a list of job specs.
+///
+/// Lines look like `[N]  [+-] <status>  <command...>`. Emits:
+///   - `%N` for every numbered job
+///   - `%+` / `%-` when the marker column had `+` or `-`
+///   - `%<first-word-of-command>` so users can reference jobs by name prefix
+pub fn parse_jobs_output(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix('[') else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else { continue; };
+        let n = &rest[..close];
+        if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        out.push(format!("%{n}"));
+        let after = rest[close + 1..].trim_start();
+        // marker column: + or - then whitespace
+        let mut chars = after.chars();
+        let has_marker = if let Some(m) = chars.next()
+            && matches!(m, '+' | '-')
+            && chars.next().is_some_and(|c| c.is_whitespace())
+        {
+            let marker = format!("%{m}");
+            if !out.contains(&marker) {
+                out.push(marker);
+            }
+            true
+        } else {
+            false
+        };
+        // After the `]`, the layout is: [marker] status command...
+        // With marker: toks = [marker, status, cmd, ...] → cmd at index 2.
+        // Without:     toks = [status, cmd, ...]          → cmd at index 1.
+        let toks: Vec<&str> = after.split_whitespace().collect();
+        let cmd_idx = if has_marker { 2 } else { 1 };
+        if let Some(cmd) = toks.get(cmd_idx) {
+            let short = format!("%{cmd}");
+            if !out.contains(&short) {
+                out.push(short);
+            }
+        }
+    }
+    out
+}
+
+/// Parse `typeset +m '*'` output. Each non-empty line is one parameter name.
+pub fn parse_parameters_output(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            // Attribute-decorated lines like `-x HOME` or `readonly -i PATH` — take the last token.
+            let last = l.split_whitespace().last()?;
+            if last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !last.is_empty() {
+                Some(last.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse `zle -l` output: one widget name per line.
+pub fn parse_widgets_output(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        // lines can be `foo (.bar)` for user-bound aliases — take first token
+        .map(|l| l.split_whitespace().next().unwrap_or(l).to_string())
+        .collect()
+}
+
+/// Standard zsh keymaps. Users can define more but the default set is the
+/// 80%-useful case for `bindkey -M <keymap>` completion.
+pub fn default_keymaps() -> Vec<String> {
+    vec![
+        "emacs".into(),
+        "vicmd".into(),
+        "viins".into(),
+        "viopp".into(),
+        "main".into(),
+        "command".into(),
+        "menuselect".into(),
+        "isearch".into(),
+        "listscroll".into(),
+        ".safe".into(),
+    ]
+}
+
+/// Parse `zmodload` output: one module name per line (first column).
+pub fn parse_modules_output(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split_whitespace().next().unwrap_or(l).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Parse `hash -L` output: lines like `hash -d name=path` or
+/// `hash name=path`. Returns the names.
+pub fn parse_hashed_commands_output(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            let body = t
+                .strip_prefix("hash -d ")
+                .or_else(|| t.strip_prefix("hash "))
+                .unwrap_or(t);
+            body.split_once('=').map(|(n, _)| n.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// --- Resolvers ---
+
+pub struct JobSpecResolver;
+impl TypeResolver for JobSpecResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        live_state_for("jobs")
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn id(&self) -> &'static str {
+        "job-spec"
+    }
+}
+
+pub struct ZshWidgetResolver;
+impl TypeResolver for ZshWidgetResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        live_state_for("widgets")
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "zsh-widget"
+    }
+}
+
+pub struct ZshKeymapResolver;
+impl TypeResolver for ZshKeymapResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        default_keymaps()
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn id(&self) -> &'static str {
+        "zsh-keymap"
+    }
+}
+
+pub struct ZshModuleResolver;
+impl TypeResolver for ZshModuleResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        live_state_for("modules")
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    fn id(&self) -> &'static str {
+        "zsh-module"
+    }
+}
+
+pub struct HashedCommandResolver;
+impl TypeResolver for HashedCommandResolver {
+    fn list(&self, _ctx: &Ctx) -> Vec<String> {
+        live_state_for("hashed")
+    }
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn id(&self) -> &'static str {
+        "hashed-command"
+    }
+}
+
 pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_USERS, Box::new(UsersResolver));
     r.register(ARG_MODE_GROUPS, Box::new(GroupsResolver));
@@ -3108,6 +3330,14 @@ pub fn register_builtins(r: &mut Registry) {
     r.register(ARG_MODE_SHELL_VAR, Box::new(ShellVarResolver));
     r.register(ARG_MODE_NAMED_DIR, Box::new(NamedDirResolver));
     r.register(ARG_MODE_HISTORY_ENTRY, Box::new(HistoryEntryResolver));
+    // Live shell state (populated from trie.live_state by the CLI entry points).
+    // Note: JOB_SPEC (61) and SHELL_VAR (58) reuse constants reserved during
+    // the Phase 0.1 taxonomy expansion.
+    r.register(ARG_MODE_JOB_SPEC, Box::new(JobSpecResolver));
+    r.register(ARG_MODE_ZSH_WIDGET, Box::new(ZshWidgetResolver));
+    r.register(ARG_MODE_ZSH_KEYMAP, Box::new(ZshKeymapResolver));
+    r.register(ARG_MODE_ZSH_MODULE, Box::new(ZshModuleResolver));
+    r.register(ARG_MODE_HASHED_COMMAND, Box::new(HashedCommandResolver));
 }
 
 /// Invalidate the `_call_program` cache. Exposed for tests only so a test
@@ -3181,6 +3411,11 @@ pub fn type_hint(arg_type: u8) -> &'static str {
         trie::ARG_MODE_LERNA_PACKAGE => "<lerna-package>",
         trie::ARG_MODE_YARN_WORKSPACE => "<workspace-package>",
         trie::ARG_MODE_PIPENV_SCRIPT => "<pipenv-script>",
+        trie::ARG_MODE_JOB_SPEC => "<job>",
+        trie::ARG_MODE_ZSH_WIDGET => "<widget>",
+        trie::ARG_MODE_ZSH_KEYMAP => "<keymap>",
+        trie::ARG_MODE_ZSH_MODULE => "<module>",
+        trie::ARG_MODE_HASHED_COMMAND => "<command>",
         _ => "<arg>",
     }
 }
@@ -5415,5 +5650,85 @@ lint = \"flake8 .\"
         ] {
             assert!(r.contains(mode), "mode {} missing from registry", mode);
         }
+    }
+
+    // ---- Live-state parser tests ----
+
+    #[test]
+    fn parse_jobs_emits_numbered_and_marker_specs() {
+        let raw = "[1]  + running  sleep 10\n[2]  - done     echo hello\n[3]    running  my-script.sh arg1\n";
+        let out = parse_jobs_output(raw);
+        assert!(out.contains(&"%1".to_string()));
+        assert!(out.contains(&"%2".to_string()));
+        assert!(out.contains(&"%3".to_string()));
+        assert!(out.contains(&"%+".to_string()));
+        assert!(out.contains(&"%-".to_string()));
+        assert!(out.contains(&"%sleep".to_string()));
+        assert!(out.contains(&"%echo".to_string()));
+        assert!(out.contains(&"%my-script.sh".to_string()));
+    }
+
+    #[test]
+    fn parse_jobs_empty_returns_empty() {
+        assert!(parse_jobs_output("").is_empty());
+    }
+
+    #[test]
+    fn parse_parameters_strips_attributes() {
+        let raw = "HOME\n-x PATH\nreadonly -i UID\nNAMED-WITH-DASH\n_underscore\n";
+        let out = parse_parameters_output(raw);
+        assert!(out.contains(&"HOME".to_string()));
+        assert!(out.contains(&"PATH".to_string()));
+        assert!(out.contains(&"UID".to_string()));
+        assert!(out.contains(&"_underscore".to_string()));
+        // Names with non-alphanumeric chars are skipped (safety filter).
+        assert!(!out.iter().any(|n| n.contains('-')));
+    }
+
+    #[test]
+    fn parse_widgets_takes_first_token() {
+        let raw = "accept-line\nbackward-char\nmy-custom (.builtin)\n";
+        let out = parse_widgets_output(raw);
+        assert_eq!(
+            out,
+            vec!["accept-line".to_string(), "backward-char".to_string(), "my-custom".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_keymaps_includes_common() {
+        let k = default_keymaps();
+        for expected in ["emacs", "vicmd", "viins", "main"] {
+            assert!(k.iter().any(|s| s == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn parse_modules_takes_first_token() {
+        let raw = "zsh/files\nzsh/stat\nzsh/zle  +loaded\n";
+        let out = parse_modules_output(raw);
+        assert_eq!(out, vec!["zsh/files".to_string(), "zsh/stat".to_string(), "zsh/zle".to_string()]);
+    }
+
+    #[test]
+    fn parse_hashed_commands_extracts_names() {
+        let raw = "hash -d proj=/home/me/proj\nhash foo=/usr/local/bin/foo\n";
+        let out = parse_hashed_commands_output(raw);
+        assert!(out.contains(&"proj".to_string()));
+        assert!(out.contains(&"foo".to_string()));
+    }
+
+    #[test]
+    fn live_state_job_spec_resolves() {
+        use crate::type_resolver::{Ctx, TypeResolver};
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("jobs".into(), vec!["%1".into(), "%+".into(), "%sleep".into()]);
+        set_live_state(parsed);
+        let items = JobSpecResolver.list(&Ctx::default());
+        assert!(items.iter().any(|s| s == "%1"));
+        assert!(items.iter().any(|s| s == "%+"));
+        assert!(items.iter().any(|s| s == "%sleep"));
+        // Clean up so other tests in the same process aren't confused.
+        set_live_state(std::collections::HashMap::new());
     }
 }

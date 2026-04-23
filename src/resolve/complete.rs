@@ -179,6 +179,28 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         apply_context_rules(spec, &resolved_words, base)
     };
 
+    // --- Parameter reference completion ---
+    // When the prefix looks like `$NAME` (not `$(...)` or `${NAME}`),
+    // offer shell parameter names from the worker's live-state dump.
+    if let Some(param_prefix) = prefix.strip_prefix('$')
+        && !param_prefix.starts_with('(')
+        && !param_prefix.starts_with('{')
+        && param_prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        let params = runtime_complete::live_state_for("parameters");
+        let hits: Vec<String> = params
+            .iter()
+            .filter(|p| p.starts_with(param_prefix))
+            .map(|p| format!("${p}"))
+            .collect();
+        if !hits.is_empty() {
+            output.push_str("% Expects: <$parameter>\n");
+            let refs: Vec<&str> = hits.iter().map(String::as_str).collect();
+            output.push_str(&format_columns(&refs, 80));
+            return output;
+        }
+    }
+
     // --- Flag completion mode ---
     // When typing a flag prefix (starts with '-'), show known flags + their expected arg types.
     if prefix.starts_with('-') {

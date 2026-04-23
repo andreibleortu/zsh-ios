@@ -369,6 +369,15 @@ pub const ARG_MODE_LERNA_PACKAGE: u8 = 77;
 pub const ARG_MODE_YARN_WORKSPACE: u8 = 78;
 pub const ARG_MODE_PIPENV_SCRIPT: u8 = 79;
 
+// Live shell state (from the zpty worker's ingest dumps).
+// ARG_MODE_JOB_SPEC (61) and ARG_MODE_SHELL_VAR (58) were reserved
+// during the Phase 0.1 taxonomy expansion; reused here for the
+// live-state resolvers rather than introducing duplicates.
+pub const ARG_MODE_ZSH_WIDGET: u8 = 80;
+pub const ARG_MODE_ZSH_KEYMAP: u8 = 81;
+pub const ARG_MODE_ZSH_MODULE: u8 = 82;
+pub const ARG_MODE_HASHED_COMMAND: u8 = 83;
+
 /// Returns a short human-readable label for an ARG_MODE_* constant.
 /// Returns "?" for unknown values.
 pub fn arg_mode_name(mode: u8) -> &'static str {
@@ -452,6 +461,10 @@ pub fn arg_mode_name(mode: u8) -> &'static str {
         ARG_MODE_LERNA_PACKAGE => "lerna-package",
         ARG_MODE_YARN_WORKSPACE => "yarn-workspace",
         ARG_MODE_PIPENV_SCRIPT => "pipenv-script",
+        ARG_MODE_ZSH_WIDGET => "zsh-widget",
+        ARG_MODE_ZSH_KEYMAP => "zsh-keymap",
+        ARG_MODE_ZSH_MODULE => "zsh-module",
+        ARG_MODE_HASHED_COMMAND => "hashed-command",
         _ => "?",
     }
 }
@@ -1050,7 +1063,7 @@ mod tests {
 
     #[test]
     fn arg_mode_name_covers_all_modes() {
-        for mode in 1u8..=72 {
+        for mode in 1u8..=83 {
             assert_ne!(
                 arg_mode_name(mode),
                 "?",
@@ -1068,12 +1081,12 @@ mod tests {
     #[test]
     fn arg_mode_names_unique() {
         use std::collections::HashSet;
-        let labels: Vec<&str> = (1u8..=72).map(arg_mode_name).collect();
+        let labels: Vec<&str> = (1u8..=83).map(arg_mode_name).collect();
         let unique: HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(
             unique.len(),
             labels.len(),
-            "duplicate label found among modes 1..=72"
+            "duplicate label found among modes 1..=83"
         );
     }
 
