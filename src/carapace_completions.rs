@@ -215,15 +215,16 @@ fn apply_spec_to_trie(
         subs_added += 1;
     }
 
-    // Description: store under parent → child so the `?` key can surface it.
+    // Description: store under parent → child so the `?` key can surface it (richest wins).
     if !spec.description.is_empty() && key_words.len() >= 2 {
         let (child_name, rest) = key_words.split_last().unwrap();
         let parent_key = rest.join(" ");
-        trie.descriptions
-            .entry(parent_key)
-            .or_default()
-            .entry((*child_name).to_string())
-            .or_insert_with(|| spec.description.clone());
+        crate::trie::merge_description(
+            &mut trie.descriptions,
+            parent_key,
+            (*child_name).to_string(),
+            spec.description.clone(),
+        );
     }
 
     // Merge persistent flags: inherited ∪ this spec's own.
@@ -774,17 +775,17 @@ commands:
     }
 
     #[test]
-    fn does_not_overwrite_existing_zsh_descriptions() {
+    fn description_merge_keeps_longer() {
         let dir = tempfile::tempdir().unwrap();
         let yaml_path = dir.path().join("mycmd.yaml");
         std::fs::write(&yaml_path, SAMPLE_YAML).unwrap();
 
         let mut trie = CommandTrie::new();
-        // Pre-populate with a Zsh-sourced description.
+        // "Start the service" (carapace) is longer than "short" (zsh) → carapace wins.
         trie.descriptions
             .entry("mycmd".into())
             .or_default()
-            .insert("start".into(), "from zsh".into());
+            .insert("start".into(), "short".into());
 
         scan_carapace_dirs(&mut trie, &[dir.path()]);
 
@@ -793,7 +794,28 @@ commands:
             .get("mycmd")
             .and_then(|m| m.get("start"))
             .map(String::as_str);
-        assert_eq!(desc, Some("from zsh"), "Zsh description was overwritten by carapace");
+        assert_eq!(desc, Some("Start the service"), "longer carapace description should win");
+
+        // Also verify: if zsh had a longer description it should be preserved.
+        let dir2 = tempfile::tempdir().unwrap();
+        let yaml_path2 = dir2.path().join("mycmd.yaml");
+        std::fs::write(&yaml_path2, SAMPLE_YAML).unwrap();
+
+        let mut trie2 = CommandTrie::new();
+        trie2.descriptions
+            .entry("mycmd".into())
+            .or_default()
+            .insert("start".into(), "A very detailed description from zsh that is longer".into());
+
+        scan_carapace_dirs(&mut trie2, &[dir2.path()]);
+
+        let desc2 = trie2
+            .descriptions
+            .get("mycmd")
+            .and_then(|m| m.get("start"))
+            .map(String::as_str);
+        assert_eq!(desc2, Some("A very detailed description from zsh that is longer"),
+            "longer zsh description should be preserved over shorter carapace one");
     }
 
     #[test]

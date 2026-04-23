@@ -291,15 +291,16 @@ fn apply_fig_spec(spec: &FigSpec, parent_path: &[&str], trie: &mut CommandTrie) 
             subs += 1;
         }
 
-        // Description.
+        // Description (richest wins).
         if !spec.description.is_empty() && full.len() >= 2 {
             let parent_key = full[..full.len() - 1].join(" ");
             let child_name = full[full.len() - 1];
-            trie.descriptions
-                .entry(parent_key)
-                .or_default()
-                .entry(child_name.to_string())
-                .or_insert_with(|| spec.description.clone());
+            crate::trie::merge_description(
+                &mut trie.descriptions,
+                parent_key,
+                child_name.to_string(),
+                spec.description.clone(),
+            );
         }
 
         // The trie key used for arg_specs and descriptions at this level.

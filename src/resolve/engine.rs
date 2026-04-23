@@ -1129,11 +1129,13 @@ pub(super) fn narrow_by_arg_type<'a>(
             without_evidence.push((name, node));
             continue;
         };
-        let Some(expected) = spec.type_at(1) else {
+        let types = spec.types_at(1);
+        if types.is_empty() {
             without_evidence.push((name, node));
             continue;
-        };
-        if word_matches_type(probe, expected) {
+        }
+        let matched = types.iter().any(|&t| word_matches_type(probe, t));
+        if matched {
             with_evidence.push((name, node));
         } else {
             without_evidence.push((name, node));
@@ -5094,5 +5096,66 @@ mod tests {
         let _ = result;
 
         crate::runtime_config::set(crate::runtime_config::RuntimeConfig::default());
+    }
+
+    // ── alternatives-aware narrowing ──────────────────────────────────────────
+
+    #[test]
+    fn narrow_by_arg_type_accepts_any_alternative() {
+        // Scenario: two commands — "cmd foo" expects PATHS primary (pos 1),
+        // with DIRS_ONLY as an alternative; "cmd bar" expects EXECS_ONLY.
+        // Probe word is a directory that exists → matches DIRS_ONLY (alternative
+        // of foo) but not EXECS_ONLY → foo wins.
+        let _g = CWD_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let orig = std::env::current_dir().ok();
+        std::env::set_current_dir(td.path()).unwrap();
+        std::fs::create_dir("mydir").unwrap();
+
+        let mut t = CommandTrie::new();
+        t.insert(&["cmd", "foo"]);
+        t.insert(&["cmd", "bar"]);
+        let mut foo_spec = ArgSpec::default();
+        foo_spec.positional.insert(1, trie::ARG_MODE_PATHS);
+        foo_spec.positional_alternatives.insert(1, vec![trie::ARG_MODE_DIRS_ONLY]);
+        t.arg_specs.insert("cmd foo".into(), foo_spec);
+        let mut bar_spec = ArgSpec::default();
+        bar_spec.positional.insert(1, trie::ARG_MODE_EXECS_ONLY);
+        t.arg_specs.insert("cmd bar".into(), bar_spec);
+
+        let cmd_node = t.root.get_child("cmd").unwrap();
+        let foo_node = cmd_node.get_child("foo").unwrap();
+        let bar_node = cmd_node.get_child("bar").unwrap();
+        let candidates = vec![("foo", foo_node), ("bar", bar_node)];
+        let prefix = vec!["cmd".to_string()];
+
+        // "mydir" is a directory: matches DIRS_ONLY (alternative of foo), not EXECS_ONLY.
+        let narrowed = narrow_by_arg_type(&candidates, &prefix, &["mydir"], &t.arg_specs);
+        assert_eq!(narrowed.len(), 1, "expected foo to win via alternative");
+        assert_eq!(narrowed[0].0, "foo");
+
+        if let Some(o) = orig { let _ = std::env::set_current_dir(o); }
+    }
+
+    #[test]
+    fn complete_display_shows_also_accepts() {
+        // Build a trie with a single command whose spec has positional alt types.
+        let mut trie = CommandTrie::new();
+        trie.insert_command("mycmd");
+        let mut spec = ArgSpec::default();
+        // Primary type at pos 1: GIT_BRANCHES (rendered by runtime_complete)
+        // We use HOSTS and USERS as alternatives to avoid live git calls in test.
+        spec.positional.insert(1, trie::ARG_MODE_HOSTS);
+        spec.positional_alternatives.insert(1, vec![trie::ARG_MODE_USERS]);
+        trie.arg_specs.insert("mycmd".into(), spec);
+        let pins = crate::pins::Pins::default();
+
+        // complete("mycmd ") triggers show_type_completions with ArgMode::Normal
+        // after the trie lookup finds no children for the empty prefix.
+        let out = complete("mycmd ", &trie, &pins, ContextHint::Unknown);
+        assert!(
+            out.contains("also accepts:"),
+            "expected 'also accepts:' in output, got:\n{out}"
+        );
     }
 }

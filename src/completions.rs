@@ -65,21 +65,18 @@ fn load_descriptions(trie: &mut CommandTrie, fpath_dirs: &[String]) {
     let yaml_map: HashMap<String, HashMap<String, String>> =
         serde_yaml_ng::from_str(yaml_str).unwrap_or_default();
 
-    // Insert YAML descriptions as the base layer
+    // Insert YAML descriptions as the base layer (richest wins).
     for (parent, subs) in yaml_map {
-        let entry = trie.descriptions.entry(parent).or_default();
         for (sub, desc) in subs {
-            entry.entry(sub).or_insert(desc);
+            crate::trie::merge_description(&mut trie.descriptions, parent.clone(), sub, desc);
         }
     }
 
-    // Step 2: Parse descriptions from Zsh completion files (override YAML)
+    // Step 2: Parse descriptions from Zsh completion files (richest wins).
     let parsed = extract_descriptions_from_dirs(fpath_dirs);
     for (parent, subs) in parsed {
-        let entry = trie.descriptions.entry(parent).or_default();
         for (sub, desc) in subs {
-            // Parsed descriptions always win over YAML fallbacks
-            entry.insert(sub, desc);
+            crate::trie::merge_description(&mut trie.descriptions, parent.clone(), sub, desc);
         }
     }
 }
@@ -122,9 +119,8 @@ fn extract_descriptions_from_dirs(dirs: &[String]) -> HashMap<String, HashMap<St
 
             let descs = extract_descriptions_from_content(&content, cmd_name);
             for (parent, subs) in descs {
-                let entry = all_descs.entry(parent).or_default();
                 for (sub, desc) in subs {
-                    entry.insert(sub, desc);
+                    crate::trie::merge_description(&mut all_descs, parent.clone(), sub, desc);
                 }
             }
         }
@@ -5361,22 +5357,29 @@ _test-log () {
     // --- ArgSpec::merge ---
 
     #[test]
-    fn test_argspec_merge_gap_fill() {
+    fn test_argspec_merge_specificity_ranked() {
+        // GIT_BRANCHES (specificity 30) > PATHS (specificity 10):
+        // the more-specific type should win as primary; the less-specific becomes an alternative.
         let mut base = trie::ArgSpec::default();
         base.positional.insert(1, trie::ARG_MODE_PATHS);
         base.rest = Some(trie::ARG_MODE_PATHS);
 
         let mut other = trie::ArgSpec::default();
-        other.positional.insert(1, trie::ARG_MODE_GIT_BRANCHES); // should NOT overwrite PATHS
-        other.positional.insert(2, trie::ARG_MODE_GIT_REMOTES);  // should fill in
-        other.rest = Some(trie::ARG_MODE_GIT_BRANCHES);           // should NOT overwrite PATHS
+        other.positional.insert(1, trie::ARG_MODE_GIT_BRANCHES); // more specific → wins
+        other.positional.insert(2, trie::ARG_MODE_GIT_REMOTES);  // new slot → filled in
+        other.rest = Some(trie::ARG_MODE_GIT_BRANCHES);           // more specific → wins
         other.flag_args.insert("-u".into(), trie::ARG_MODE_GIT_REMOTES);
 
         base.merge(&other);
 
-        assert_eq!(base.positional.get(&1), Some(&trie::ARG_MODE_PATHS), "pos 1 not overwritten");
+        // GIT_BRANCHES wins pos 1; PATHS goes to alternatives.
+        assert_eq!(base.positional.get(&1), Some(&trie::ARG_MODE_GIT_BRANCHES), "more-specific wins pos 1");
+        assert!(base.positional_alternatives.get(&1).map(|v| v.contains(&trie::ARG_MODE_PATHS)).unwrap_or(false),
+            "PATHS in pos 1 alternatives");
         assert_eq!(base.positional.get(&2), Some(&trie::ARG_MODE_GIT_REMOTES), "pos 2 filled in");
-        assert_eq!(base.rest, Some(trie::ARG_MODE_PATHS), "rest not overwritten");
+        // GIT_BRANCHES wins rest; PATHS goes to rest_alternatives.
+        assert_eq!(base.rest, Some(trie::ARG_MODE_GIT_BRANCHES), "more-specific wins rest");
+        assert!(base.rest_alternatives.contains(&trie::ARG_MODE_PATHS), "PATHS in rest_alternatives");
         assert_eq!(base.flag_args.get("-u"), Some(&trie::ARG_MODE_GIT_REMOTES), "-u filled in");
     }
 

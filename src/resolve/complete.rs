@@ -944,7 +944,24 @@ pub(super) fn show_type_completions(
                 return;
             }
             let hint = runtime_complete::type_hint(type_id);
-            output.push_str(&format!("% Expects: {}\n", hint));
+            // Show alternatives from the spec if present.
+            let alt_suffix = if let Some(spec) = spec {
+                let types = spec.types_at(arg_position);
+                let alts: Vec<&str> = types
+                    .iter()
+                    .skip(1) // skip primary; we already show it
+                    .filter(|&&t| t != type_id)
+                    .map(|&t| runtime_complete::type_hint(t))
+                    .collect();
+                if alts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (also accepts: {})", alts.join(", "))
+                }
+            } else {
+                String::new()
+            };
+            output.push_str(&format!("% Expects: {}{}\n", hint, alt_suffix));
             let rt = runtime_complete::list_matches(type_id, prefix);
             let names: Vec<&str> = rt.iter().map(String::as_str).collect();
             if names.is_empty() {
@@ -957,17 +974,29 @@ pub(super) fn show_type_completions(
         }
         _ => {
             // Check spec for type hint even in Normal/ExecsOnly mode
-            if let Some(spec) = spec
-                && let Some(pos_type) = spec.type_at(arg_position)
-                && pos_type != 0
-            {
-                let hint = runtime_complete::type_hint(pos_type);
-                output.push_str(&format!("% Expects: {}\n", hint));
-                let rt = runtime_complete::list_matches(pos_type, prefix);
-                let names: Vec<&str> = rt.iter().map(String::as_str).collect();
-                if !names.is_empty() {
-                    output.push_str(&format_columns(&names, 80));
-                    return;
+            if let Some(spec) = spec {
+                let types = spec.types_at(arg_position);
+                if let Some(&pos_type) = types.first()
+                    && pos_type != 0
+                {
+                    let hint = runtime_complete::type_hint(pos_type);
+                    let alts: Vec<&str> = types
+                        .iter()
+                        .skip(1)
+                        .map(|&t| runtime_complete::type_hint(t))
+                        .collect();
+                    let alt_suffix = if alts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (also accepts: {})", alts.join(", "))
+                    };
+                    output.push_str(&format!("% Expects: {}{}\n", hint, alt_suffix));
+                    let rt = runtime_complete::list_matches(pos_type, prefix);
+                    let names: Vec<&str> = rt.iter().map(String::as_str).collect();
+                    if !names.is_empty() {
+                        output.push_str(&format_columns(&names, 80));
+                        return;
+                    }
                 }
             }
             if prefix.is_empty() {

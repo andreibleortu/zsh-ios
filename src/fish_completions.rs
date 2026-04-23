@@ -193,12 +193,14 @@ fn merge_into_trie(
             did_something = true;
         }
 
-        // Descriptions for top-level subcommands.
-        if !parsed.top_descriptions.is_empty() {
-            let desc_map = trie.descriptions.entry(cmd.clone()).or_default();
-            for (sub, desc) in &parsed.top_descriptions {
-                desc_map.entry(sub.clone()).or_insert_with(|| desc.clone());
-            }
+        // Descriptions for top-level subcommands (richest wins).
+        for (sub, desc) in &parsed.top_descriptions {
+            crate::trie::merge_description(
+                &mut trie.descriptions,
+                cmd.clone(),
+                sub.clone(),
+                desc.clone(),
+            );
         }
 
         // Top-level value-taking flags.
@@ -227,12 +229,16 @@ fn merge_into_trie(
             }
         }
 
-        // Descriptions for sub-scoped completions.
+        // Descriptions for sub-scoped completions (richest wins).
         for (parent_sub, descs) in &parsed.sub_descriptions {
             let key = format!("{} {}", cmd, parent_sub);
-            let desc_map = trie.descriptions.entry(key).or_default();
             for (sub, desc) in descs {
-                desc_map.entry(sub.clone()).or_insert_with(|| desc.clone());
+                crate::trie::merge_description(
+                    &mut trie.descriptions,
+                    key.clone(),
+                    sub.clone(),
+                    desc.clone(),
+                );
             }
         }
 
@@ -506,29 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn scan_fish_does_not_overwrite_zsh_descriptions() {
+    fn scan_fish_description_longest_wins() {
         let dir = tempfile::tempdir().unwrap();
         let fish_file = dir.path().join("foo.fish");
         std::fs::write(
             &fish_file,
-            "complete -c foo -a bar -d 'from fish'\n",
+            "complete -c foo -a bar -d 'from fish longer description'\ncomplete -c foo -a baz -d 'short'\n",
         )
         .unwrap();
 
         let mut trie = CommandTrie::new();
-        // Pre-populate with a Zsh-sourced description.
+        // "bar": zsh has short desc, fish has longer → fish wins.
         trie.descriptions
             .entry("foo".into())
             .or_default()
-            .insert("bar".into(), "from zsh".into());
+            .insert("bar".into(), "short".into());
+        // "baz": zsh has longer desc, fish has shorter → zsh wins.
+        trie.descriptions
+            .entry("foo".into())
+            .or_default()
+            .insert("baz".into(), "a longer description from zsh".into());
 
         scan_fish_dirs(&mut trie, &[dir.path().to_str().unwrap()]);
 
-        let desc = trie
-            .descriptions
-            .get("foo")
-            .and_then(|m| m.get("bar"))
-            .map(String::as_str);
-        assert_eq!(desc, Some("from zsh"), "Zsh description should not be overwritten");
+        let desc_bar = trie.descriptions.get("foo").and_then(|m| m.get("bar")).map(String::as_str);
+        assert_eq!(desc_bar, Some("from fish longer description"), "fish longer desc should win for bar");
+
+        let desc_baz = trie.descriptions.get("foo").and_then(|m| m.get("baz")).map(String::as_str);
+        assert_eq!(desc_baz, Some("a longer description from zsh"), "zsh longer desc should be kept for baz");
     }
 }

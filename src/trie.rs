@@ -498,7 +498,7 @@ pub fn arg_mode_name(mode: u8) -> &'static str {
 ///
 /// Parsed from Zsh `if [[ -n ${opt_args[(I)-b|-B|...]} ]]; then ACTION`
 /// patterns inside `case $state in` arm bodies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextRule {
     /// Any of these flags being present in the current words triggers the rule.
     pub trigger_flags: Vec<String>,
@@ -551,6 +551,101 @@ pub struct ArgSpec {
     /// `_arguments` spec strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_exclusions: Vec<Vec<String>>,
+    /// When merge detects a same-slot type conflict for a positional arg, the
+    /// more-specific type wins as the primary in `positional`, and the losing
+    /// type lands here. `types_at` returns primary + alternatives together.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub positional_alternatives: HashMap<u32, Vec<u8>>,
+    /// Same as `positional_alternatives` but keyed by flag name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flag_alternatives: HashMap<String, Vec<u8>>,
+    /// Same as `positional_alternatives` but for the rest/positional fallback type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rest_alternatives: Vec<u8>,
+}
+
+/// Returns a specificity score for an `ARG_MODE_*` constant.
+/// Higher = more specific. Used by `ArgSpec::merge` to decide which type wins
+/// when two sources populate the same slot with different values.
+pub fn arg_mode_specificity(mode: u8) -> u8 {
+    match mode {
+        // Filesystem generics
+        ARG_MODE_PATHS | ARG_MODE_DIRS_ONLY | ARG_MODE_EXECS_ONLY => 10,
+
+        // Format validators
+        ARG_MODE_URLS | ARG_MODE_URL_SCHEME | ARG_MODE_EMAIL
+        | ARG_MODE_IPV4 | ARG_MODE_IPV6 | ARG_MODE_MAC_ADDR => 15,
+
+        // System runtime
+        ARG_MODE_HOSTS | ARG_MODE_USERS | ARG_MODE_GROUPS | ARG_MODE_USERS_GROUPS
+        | ARG_MODE_PORTS | ARG_MODE_SIGNALS | ARG_MODE_NET_IFACES
+        | ARG_MODE_LOCALES | ARG_MODE_PIDS => 20,
+
+        // Timezone (static list, roughly equivalent to system runtime)
+        ARG_MODE_TIMEZONE => 25,
+
+        // Live shell state
+        ARG_MODE_HISTORY_ENTRY | ARG_MODE_SHELL_VAR | ARG_MODE_SHELL_FUNCTION
+        | ARG_MODE_SHELL_ALIAS | ARG_MODE_NAMED_DIR | ARG_MODE_JOB_SPEC
+        | ARG_MODE_DIRSTACK_ENTRY | ARG_MODE_ZSH_WIDGET | ARG_MODE_ZSH_KEYMAP
+        | ARG_MODE_ZSH_MODULE | ARG_MODE_HASHED_COMMAND => 25,
+
+        // Git — specific to one tool
+        ARG_MODE_GIT_BRANCHES | ARG_MODE_GIT_TAGS | ARG_MODE_GIT_REMOTES
+        | ARG_MODE_GIT_FILES | ARG_MODE_GIT_STASH | ARG_MODE_GIT_WORKTREE
+        | ARG_MODE_GIT_SUBMODULE | ARG_MODE_GIT_CONFIG_KEY | ARG_MODE_GIT_ALIAS
+        | ARG_MODE_GIT_COMMIT | ARG_MODE_GIT_REFLOG | ARG_MODE_GIT_HEAD
+        | ARG_MODE_GIT_BISECT | ARG_MODE_GIT_REMOTE_REF => 30,
+
+        // Docker
+        ARG_MODE_DOCKER_CONTAINER | ARG_MODE_DOCKER_IMAGE | ARG_MODE_DOCKER_NETWORK
+        | ARG_MODE_DOCKER_VOLUME | ARG_MODE_DOCKER_COMPOSE_SERVICE => 30,
+
+        // Kubernetes
+        ARG_MODE_K8S_CONTEXT | ARG_MODE_K8S_NAMESPACE | ARG_MODE_K8S_POD
+        | ARG_MODE_K8S_DEPLOYMENT | ARG_MODE_K8S_SERVICE | ARG_MODE_K8S_RESOURCE_KIND => 30,
+
+        // systemd
+        ARG_MODE_SYSTEMD_UNIT | ARG_MODE_SYSTEMD_SERVICE | ARG_MODE_SYSTEMD_TIMER
+        | ARG_MODE_SYSTEMD_SOCKET => 30,
+
+        // Package managers
+        ARG_MODE_BREW_FORMULA | ARG_MODE_BREW_CASK | ARG_MODE_APT_PACKAGE
+        | ARG_MODE_DNF_PACKAGE | ARG_MODE_PACMAN_PACKAGE | ARG_MODE_NPM_PACKAGE
+        | ARG_MODE_PIP_PACKAGE | ARG_MODE_CARGO_CRATE => 30,
+
+        // Project-local scripts / targets
+        ARG_MODE_NPM_SCRIPT | ARG_MODE_MAKE_TARGET | ARG_MODE_JUST_RECIPE
+        | ARG_MODE_CARGO_TASK | ARG_MODE_POETRY_SCRIPT | ARG_MODE_COMPOSER_SCRIPT
+        | ARG_MODE_GRADLE_TASK | ARG_MODE_RAKE_TASK | ARG_MODE_PIPENV_SCRIPT
+        | ARG_MODE_PNPM_WORKSPACE | ARG_MODE_LERNA_PACKAGE | ARG_MODE_YARN_WORKSPACE => 30,
+
+        // Session managers
+        ARG_MODE_TMUX_SESSION | ARG_MODE_TMUX_WINDOW | ARG_MODE_TMUX_PANE
+        | ARG_MODE_SCREEN_SESSION => 30,
+
+        // NORMAL (0) and anything unknown
+        _ => 0,
+    }
+}
+
+/// Insert or replace a description in `map[key][sub_key]`.
+/// Replaces the existing value only when `new_desc` is longer and non-empty,
+/// so the richest description across all sources is preserved.
+pub fn merge_description(
+    map: &mut DescriptionMap,
+    key: String,
+    sub_key: String,
+    new_desc: String,
+) {
+    if new_desc.is_empty() {
+        return;
+    }
+    let sub = map.entry(key).or_default();
+    let existing = sub.entry(sub_key).or_default();
+    if new_desc.len() > existing.len() {
+        *existing = new_desc;
+    }
 }
 
 impl ArgSpec {
@@ -605,6 +700,77 @@ impl ArgSpec {
         flag
     }
 
+    /// Primary type + all alternative types for a positional slot.
+    /// Primary is first; alternatives follow without duplicates.
+    /// Falls back to `rest` / `rest_alternatives` if no explicit positional.
+    pub fn types_at(&self, pos: u32) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        if let Some(&t) = self.positional.get(&pos) {
+            out.push(t);
+        }
+        if let Some(alts) = self.positional_alternatives.get(&pos) {
+            for &t in alts {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(t) = self.rest {
+                out.push(t);
+            }
+            for &t in &self.rest_alternatives {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Primary type + all alternative types for a flag argument.
+    /// Uses the same alias-resolution logic as `type_after_flag`.
+    pub fn types_after_flag(&self, flag: &str) -> Vec<u8> {
+        // Resolve to canonical flag name(s) to look up alternatives.
+        let stripped = flag.trim_end_matches('=');
+        let canonical = self.canonical_flag(flag);
+        let can_stripped = canonical.trim_end_matches('=');
+
+        // Collect primary via existing method.
+        let primary = self.type_after_flag(flag);
+        let mut out: Vec<u8> = Vec::new();
+        if let Some(t) = primary {
+            out.push(t);
+        }
+
+        // Look up alternatives using every alias form.
+        let lookup_keys = [flag, stripped, canonical, can_stripped];
+        for &key in &lookup_keys {
+            if let Some(alts) = self.flag_alternatives.get(key) {
+                for &t in alts {
+                    if !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        // Also walk alias groups.
+        for group in &self.flag_aliases {
+            if group.iter().any(|g| g == flag || g == stripped) {
+                for sibling in group {
+                    if let Some(alts) = self.flag_alternatives.get(sibling) {
+                        for &t in alts {
+                            if !out.contains(&t) {
+                                out.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Convenience: is this spec non-empty?
     pub fn is_empty(&self) -> bool {
         self.positional.is_empty()
@@ -617,6 +783,9 @@ impl ArgSpec {
             && self.context_rules.is_empty()
             && self.flag_aliases.is_empty()
             && self.flag_exclusions.is_empty()
+            && self.positional_alternatives.is_empty()
+            && self.flag_alternatives.is_empty()
+            && self.rest_alternatives.is_empty()
     }
 
     /// Whether a flag consumes the next word (either via typed arg, call_program, or static list).
@@ -643,50 +812,147 @@ impl ArgSpec {
         false
     }
 
-    /// Merge another `ArgSpec` into this one (pure gap-fill).
-    /// Only slots that are completely absent in `self` are filled from `other`;
-    /// any existing value — even a generic one — is preserved.  This ensures
-    /// that the primary function's explicit specs always take precedence over
-    /// what a helper function infers.
+    /// Merge another `ArgSpec` into `self` with specificity-ranked conflict resolution.
+    ///
+    /// - Scalar type fields (`positional`, `rest`, `flag_args`): the more-specific
+    ///   type wins as the primary; the losing type is stashed in the corresponding
+    ///   `_alternatives` field.  Ties keep the existing value.
+    /// - Static list fields (`flag_static_lists`, `rest_static_list`): union (dedup,
+    ///   preserve first-seen order).
+    /// - Scalar non-conflicting fields (`flag_call_programs`, `rest_call_program`):
+    ///   gap-fill only — these are command+argv pairs that aren't comparable by
+    ///   specificity.
+    /// - Vec fields (`flag_aliases`, `flag_exclusions`, `context_rules`): union
+    ///   unique elements.
     pub fn merge(&mut self, other: &ArgSpec) {
-        for (&pos, &arg_type) in &other.positional {
-            self.positional.entry(pos).or_insert(arg_type);
+        // --- positional: specificity-ranked ---
+        for (&pos, &ot) in &other.positional {
+            match self.positional.get(&pos).copied() {
+                None => {
+                    self.positional.insert(pos, ot);
+                }
+                Some(st) if st == ot => {}
+                Some(st) => {
+                    if arg_mode_specificity(ot) > arg_mode_specificity(st) {
+                        self.positional.insert(pos, ot);
+                        let bucket = self.positional_alternatives.entry(pos).or_default();
+                        if !bucket.contains(&st) {
+                            bucket.push(st);
+                        }
+                    } else {
+                        let bucket = self.positional_alternatives.entry(pos).or_default();
+                        if !bucket.contains(&ot) {
+                            bucket.push(ot);
+                        }
+                    }
+                }
+            }
         }
-        if self.rest.is_none() {
-            self.rest = other.rest;
+        // Merge other's own positional_alternatives without losing anything.
+        for (&pos, alts) in &other.positional_alternatives {
+            for &t in alts {
+                let primary = self.positional.get(&pos).copied();
+                let bucket = self.positional_alternatives.entry(pos).or_default();
+                if primary != Some(t) && !bucket.contains(&t) {
+                    bucket.push(t);
+                }
+            }
         }
-        for (flag, arg_type) in &other.flag_args {
-            self.flag_args.entry(flag.clone()).or_insert(*arg_type);
+
+        // --- rest: specificity-ranked ---
+        match (self.rest, other.rest) {
+            (None, Some(ot)) => {
+                self.rest = Some(ot);
+            }
+            (Some(_), None) | (None, None) => {}
+            (Some(st), Some(ot)) if st == ot => {}
+            (Some(st), Some(ot)) => {
+                if arg_mode_specificity(ot) > arg_mode_specificity(st) {
+                    self.rest = Some(ot);
+                    if !self.rest_alternatives.contains(&st) {
+                        self.rest_alternatives.push(st);
+                    }
+                } else if !self.rest_alternatives.contains(&ot) {
+                    self.rest_alternatives.push(ot);
+                }
+            }
         }
-        for (flag, entry) in &other.flag_call_programs {
-            self.flag_call_programs
-                .entry(flag.clone())
-                .or_insert_with(|| entry.clone());
+        for &t in &other.rest_alternatives {
+            if self.rest != Some(t) && !self.rest_alternatives.contains(&t) {
+                self.rest_alternatives.push(t);
+            }
+        }
+
+        // --- flag_args: specificity-ranked ---
+        for (flag, &ot) in &other.flag_args {
+            match self.flag_args.get(flag).copied() {
+                None => {
+                    self.flag_args.insert(flag.clone(), ot);
+                }
+                Some(st) if st == ot => {}
+                Some(st) => {
+                    if arg_mode_specificity(ot) > arg_mode_specificity(st) {
+                        self.flag_args.insert(flag.clone(), ot);
+                        let bucket = self.flag_alternatives.entry(flag.clone()).or_default();
+                        if !bucket.contains(&st) {
+                            bucket.push(st);
+                        }
+                    } else {
+                        let bucket = self.flag_alternatives.entry(flag.clone()).or_default();
+                        if !bucket.contains(&ot) {
+                            bucket.push(ot);
+                        }
+                    }
+                }
+            }
+        }
+        // Merge other's own flag_alternatives.
+        for (flag, alts) in &other.flag_alternatives {
+            for &t in alts {
+                let primary = self.flag_args.get(flag).copied();
+                let bucket = self.flag_alternatives.entry(flag.clone()).or_default();
+                if primary != Some(t) && !bucket.contains(&t) {
+                    bucket.push(t);
+                }
+            }
+        }
+
+        // --- flag_call_programs / rest_call_program: gap-fill only ---
+        for (k, v) in &other.flag_call_programs {
+            self.flag_call_programs.entry(k.clone()).or_insert_with(|| v.clone());
         }
         if self.rest_call_program.is_none() {
             self.rest_call_program = other.rest_call_program.clone();
         }
-        for (flag, list) in &other.flag_static_lists {
-            self.flag_static_lists
-                .entry(flag.clone())
-                .or_insert_with(|| list.clone());
-        }
-        if self.rest_static_list.is_none() {
-            self.rest_static_list = other.rest_static_list.clone();
-        }
-        // Gap-fill context rules: add any rules from other whose trigger_flags
-        // are not already covered by an existing rule in self.
-        for other_rule in &other.context_rules {
-            let already_covered = self.context_rules.iter().any(|r| {
-                r.trigger_flags
-                    .iter()
-                    .any(|f| other_rule.trigger_flags.contains(f))
-            });
-            if !already_covered {
-                self.context_rules.push(other_rule.clone());
+
+        // --- flag_static_lists: union per flag ---
+        for (k, new_items) in &other.flag_static_lists {
+            let bucket = self.flag_static_lists.entry(k.clone()).or_default();
+            for item in new_items {
+                if !bucket.contains(item) {
+                    bucket.push(item.clone());
+                }
             }
         }
-        // Gap-fill alias groups: only add groups whose flags are not yet represented.
+
+        // --- rest_static_list: union ---
+        if let Some(new_items) = &other.rest_static_list {
+            let bucket = self.rest_static_list.get_or_insert_with(Vec::new);
+            for item in new_items {
+                if !bucket.contains(item) {
+                    bucket.push(item.clone());
+                }
+            }
+        }
+
+        // --- context_rules: union unique ---
+        for rule in &other.context_rules {
+            if !self.context_rules.contains(rule) {
+                self.context_rules.push(rule.clone());
+            }
+        }
+
+        // --- flag_aliases: union unique groups ---
         'outer_alias: for other_group in &other.flag_aliases {
             for self_group in &self.flag_aliases {
                 if other_group.iter().any(|f| self_group.contains(f)) {
@@ -695,7 +961,8 @@ impl ArgSpec {
             }
             self.flag_aliases.push(other_group.clone());
         }
-        // Gap-fill exclusion groups.
+
+        // --- flag_exclusions: union unique groups ---
         'outer_excl: for other_excl in &other.flag_exclusions {
             for self_excl in &self.flag_exclusions {
                 if other_excl.iter().any(|f| self_excl.contains(f)) {
@@ -1071,18 +1338,23 @@ mod tests {
                 ContextRule {
                     trigger_flags: vec!["-b".into()],
                     override_type: ARG_MODE_HOSTS,
-                }, // duplicate trigger → dropped
+                }, // same trigger but different type → kept (union-unique on full equality)
                 ContextRule {
                     trigger_flags: vec!["-u".into()],
                     override_type: ARG_MODE_USERS,
-                }, // unique trigger → kept
+                }, // unique → kept
+                ContextRule {
+                    trigger_flags: vec!["-b".into()],
+                    override_type: ARG_MODE_GIT_BRANCHES,
+                }, // exact duplicate of a's existing rule → deduplicated
             ],
             ..Default::default()
         };
         a.merge(&b);
-        assert_eq!(a.context_rules.len(), 2);
+        assert_eq!(a.context_rules.len(), 3);
         assert_eq!(a.context_rules[0].override_type, ARG_MODE_GIT_BRANCHES);
-        assert_eq!(a.context_rules[1].override_type, ARG_MODE_USERS);
+        assert_eq!(a.context_rules[1].override_type, ARG_MODE_HOSTS);
+        assert_eq!(a.context_rules[2].override_type, ARG_MODE_USERS);
     }
 
     #[test]
@@ -1562,5 +1834,213 @@ mod tests {
         assert!(names.contains(&"git"), "expected 'git' in {:?}", names);
         assert!(names.contains(&"gitlab"), "expected 'gitlab' in {:?}", names);
         assert_eq!(res.len(), 2);
+    }
+
+    // ── arg_mode_specificity ──────────────────────────────────────────────────
+
+    #[test]
+    fn arg_mode_specificity_ranking() {
+        assert!(arg_mode_specificity(ARG_MODE_GIT_BRANCHES) > arg_mode_specificity(ARG_MODE_PATHS));
+        assert!(arg_mode_specificity(ARG_MODE_PATHS) > arg_mode_specificity(0));
+        assert!(arg_mode_specificity(ARG_MODE_DOCKER_CONTAINER) > arg_mode_specificity(ARG_MODE_PATHS));
+        assert!(arg_mode_specificity(ARG_MODE_K8S_POD) > arg_mode_specificity(ARG_MODE_HOSTS));
+        assert!(arg_mode_specificity(ARG_MODE_HOSTS) > arg_mode_specificity(ARG_MODE_PATHS));
+        assert!(arg_mode_specificity(ARG_MODE_EMAIL) > arg_mode_specificity(ARG_MODE_PATHS));
+        assert!(arg_mode_specificity(ARG_MODE_SHELL_FUNCTION) > arg_mode_specificity(ARG_MODE_HOSTS));
+        assert!(arg_mode_specificity(ARG_MODE_GIT_COMMIT) > arg_mode_specificity(ARG_MODE_SHELL_VAR));
+        assert_eq!(arg_mode_specificity(ARG_MODE_GIT_BRANCHES), arg_mode_specificity(ARG_MODE_GIT_TAGS));
+        assert_eq!(arg_mode_specificity(ARG_MODE_DOCKER_CONTAINER), arg_mode_specificity(ARG_MODE_K8S_POD));
+        assert_eq!(arg_mode_specificity(0), 0);
+        assert_eq!(arg_mode_specificity(200), 0);
+    }
+
+    // ── ArgSpec::merge (specificity-ranked) ───────────────────────────────────
+
+    #[test]
+    fn merge_positional_same_slot_keeps_more_specific() {
+        let mut a = ArgSpec::default();
+        a.positional.insert(1, ARG_MODE_PATHS);
+
+        let mut b = ArgSpec::default();
+        b.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+
+        a.merge(&b);
+        assert_eq!(a.positional.get(&1), Some(&ARG_MODE_GIT_BRANCHES), "more-specific wins");
+        let alts = a.positional_alternatives.get(&1).expect("loser in alternatives");
+        assert!(alts.contains(&ARG_MODE_PATHS), "PATHS should be in alternatives");
+    }
+
+    #[test]
+    fn merge_positional_same_slot_existing_wins_when_more_specific() {
+        let mut a = ArgSpec::default();
+        a.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+
+        let mut b = ArgSpec::default();
+        b.positional.insert(1, ARG_MODE_PATHS);
+
+        a.merge(&b);
+        assert_eq!(a.positional.get(&1), Some(&ARG_MODE_GIT_BRANCHES), "existing higher-spec stays");
+        let alts = a.positional_alternatives.get(&1).expect("loser in alternatives");
+        assert!(alts.contains(&ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn merge_positional_same_slot_same_type_no_alt() {
+        let mut a = ArgSpec::default();
+        a.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+
+        let mut b = ArgSpec::default();
+        b.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+
+        a.merge(&b);
+        assert_eq!(a.positional.get(&1), Some(&ARG_MODE_GIT_BRANCHES));
+        assert!(a.positional_alternatives.is_empty(), "no alternatives when types identical");
+    }
+
+    #[test]
+    fn merge_positional_different_slots_both_kept() {
+        let mut a = ArgSpec::default();
+        a.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+
+        let mut b = ArgSpec::default();
+        b.positional.insert(2, ARG_MODE_PATHS);
+
+        a.merge(&b);
+        assert_eq!(a.positional.get(&1), Some(&ARG_MODE_GIT_BRANCHES));
+        assert_eq!(a.positional.get(&2), Some(&ARG_MODE_PATHS));
+        assert!(a.positional_alternatives.is_empty());
+    }
+
+    #[test]
+    fn merge_rest_conflict_specificity() {
+        let mut a = ArgSpec { rest: Some(ARG_MODE_PATHS), ..Default::default() };
+        let b = ArgSpec { rest: Some(ARG_MODE_GIT_FILES), ..Default::default() };
+
+        a.merge(&b);
+        assert_eq!(a.rest, Some(ARG_MODE_GIT_FILES), "GIT_FILES more specific");
+        assert!(a.rest_alternatives.contains(&ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn merge_rest_conflict_existing_wins() {
+        let mut a = ArgSpec { rest: Some(ARG_MODE_GIT_FILES), ..Default::default() };
+        let b = ArgSpec { rest: Some(ARG_MODE_PATHS), ..Default::default() };
+
+        a.merge(&b);
+        assert_eq!(a.rest, Some(ARG_MODE_GIT_FILES));
+        assert!(a.rest_alternatives.contains(&ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn merge_flag_args_conflict_specificity() {
+        let mut a = ArgSpec::default();
+        a.flag_args.insert("-b".into(), ARG_MODE_PATHS);
+
+        let mut b = ArgSpec::default();
+        b.flag_args.insert("-b".into(), ARG_MODE_GIT_BRANCHES);
+
+        a.merge(&b);
+        assert_eq!(a.flag_args.get("-b"), Some(&ARG_MODE_GIT_BRANCHES));
+        let alts = a.flag_alternatives.get("-b").expect("flag alternatives");
+        assert!(alts.contains(&ARG_MODE_PATHS));
+    }
+
+    #[test]
+    fn merge_rest_static_list_unions_values() {
+        let mut a = ArgSpec {
+            rest_static_list: Some(vec!["alpha".into(), "beta".into()]),
+            ..Default::default()
+        };
+        let b = ArgSpec {
+            rest_static_list: Some(vec!["beta".into(), "gamma".into()]),
+            ..Default::default()
+        };
+
+        a.merge(&b);
+        let list = a.rest_static_list.as_ref().expect("rest_static_list");
+        assert!(list.contains(&"alpha".to_string()));
+        assert!(list.contains(&"beta".to_string()));
+        assert!(list.contains(&"gamma".to_string()));
+        // beta must appear exactly once (dedup).
+        assert_eq!(list.iter().filter(|s| s.as_str() == "beta").count(), 1);
+    }
+
+    #[test]
+    fn merge_flag_static_lists_unions_values() {
+        let mut a = ArgSpec::default();
+        a.flag_static_lists.insert("-m".into(), vec!["fast".into(), "slow".into()]);
+
+        let mut b = ArgSpec::default();
+        b.flag_static_lists.insert("-m".into(), vec!["slow".into(), "medium".into()]);
+
+        a.merge(&b);
+        let list = a.flag_static_lists.get("-m").expect("flag_static_lists");
+        assert!(list.contains(&"fast".to_string()));
+        assert!(list.contains(&"slow".to_string()));
+        assert!(list.contains(&"medium".to_string()));
+        assert_eq!(list.iter().filter(|s| s.as_str() == "slow").count(), 1);
+    }
+
+    #[test]
+    fn merge_description_keeps_longer() {
+        let mut map: DescriptionMap = HashMap::new();
+        merge_description(&mut map, "git".into(), "commit".into(), "short".into());
+        assert_eq!(map["git"]["commit"], "short");
+
+        merge_description(&mut map, "git".into(), "commit".into(), "much longer description".into());
+        assert_eq!(map["git"]["commit"], "much longer description");
+
+        // Shorter should not replace longer.
+        merge_description(&mut map, "git".into(), "commit".into(), "tiny".into());
+        assert_eq!(map["git"]["commit"], "much longer description");
+
+        // Empty should not replace anything.
+        merge_description(&mut map, "git".into(), "commit".into(), "".into());
+        assert_eq!(map["git"]["commit"], "much longer description");
+    }
+
+    // ── types_at / types_after_flag ───────────────────────────────────────────
+
+    #[test]
+    fn types_at_returns_primary_then_alternatives() {
+        let mut spec = ArgSpec::default();
+        spec.positional.insert(1, ARG_MODE_GIT_BRANCHES);
+        spec.positional_alternatives.insert(1, vec![ARG_MODE_PATHS, ARG_MODE_GIT_COMMIT]);
+
+        let types = spec.types_at(1);
+        assert_eq!(types[0], ARG_MODE_GIT_BRANCHES, "primary first");
+        assert!(types.contains(&ARG_MODE_PATHS));
+        assert!(types.contains(&ARG_MODE_GIT_COMMIT));
+        assert_eq!(types.len(), 3);
+    }
+
+    #[test]
+    fn types_at_falls_back_to_rest_when_no_positional() {
+        let spec = ArgSpec {
+            rest: Some(ARG_MODE_PATHS),
+            rest_alternatives: vec![ARG_MODE_DIRS_ONLY],
+            ..Default::default()
+        };
+
+        let types = spec.types_at(5);
+        assert_eq!(types[0], ARG_MODE_PATHS);
+        assert!(types.contains(&ARG_MODE_DIRS_ONLY));
+    }
+
+    #[test]
+    fn types_at_empty_when_nothing_set() {
+        let spec = ArgSpec::default();
+        assert!(spec.types_at(1).is_empty());
+    }
+
+    #[test]
+    fn types_after_flag_includes_alternatives() {
+        let mut spec = ArgSpec::default();
+        spec.flag_args.insert("-b".into(), ARG_MODE_GIT_BRANCHES);
+        spec.flag_alternatives.insert("-b".into(), vec![ARG_MODE_GIT_COMMIT]);
+
+        let types = spec.types_after_flag("-b");
+        assert_eq!(types[0], ARG_MODE_GIT_BRANCHES);
+        assert!(types.contains(&ARG_MODE_GIT_COMMIT));
     }
 }
