@@ -43,6 +43,12 @@ pub fn set_statistics_disabled(b: bool) {
 /// `Unknown` and `Argument` are the default / do-nothing cases.
 /// `Redirection` short-circuits arg resolution to path mode.
 /// `Math` and `Condition` suppress resolution entirely.
+/// `SingleQuoted`, `DoubleQuoted`, `Backticked`, and `ParameterName` are
+/// synthesised from `--quote` / `--param-context` flags; they take precedence
+/// over the positional `--context` value (most-specific wins).
+///
+/// Precedence when combining `--context`, `--quote`, and `--param-context`:
+///   ParameterName > SingleQuoted > DoubleQuoted > Backticked > <--context>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextHint {
     Unknown,
@@ -52,6 +58,14 @@ pub enum ContextHint {
     Math,
     Condition,
     Array,
+    /// Cursor is inside a single-quoted string — no expansion possible.
+    SingleQuoted,
+    /// Cursor is inside a double-quoted string — limited expansion.
+    DoubleQuoted,
+    /// Cursor is inside a backtick command substitution.
+    Backticked,
+    /// Cursor is inside `${PARAM…}` — completing a parameter name.
+    ParameterName,
 }
 
 impl ContextHint {
@@ -65,8 +79,33 @@ impl ContextHint {
             "math" => Self::Math,
             "condition" => Self::Condition,
             "array" => Self::Array,
+            "single" | "single-quoted" => Self::SingleQuoted,
+            "double" | "double-quoted" => Self::DoubleQuoted,
+            "backtick" | "backticked" => Self::Backticked,
+            "parameter" | "param-context" => Self::ParameterName,
             _ => Self::Unknown,
         }
+    }
+
+    /// Combine the positional `--context` hint with quote-state flags.
+    ///
+    /// Precedence (most-specific wins):
+    ///   param_context → ParameterName
+    ///   quote "single" → SingleQuoted
+    ///   quote "double" → DoubleQuoted
+    ///   quote "backtick" / "dollar" → Backticked
+    ///   fallback to the positional context hint
+    pub fn from_parts(context: Option<&str>, quote: Option<&str>, param_context: bool) -> Self {
+        if param_context {
+            return Self::ParameterName;
+        }
+        match quote {
+            Some("single") => return Self::SingleQuoted,
+            Some("double") => return Self::DoubleQuoted,
+            Some("backtick") | Some("dollar") => return Self::Backticked,
+            _ => {}
+        }
+        Self::parse_hint(context.unwrap_or(""))
     }
 }
 
@@ -136,6 +175,22 @@ pub fn resolve_line(
     // math / condition: the user is inside arithmetic or test expression;
     // never mangle the buffer.
     if matches!(context_hint, ContextHint::Math | ContextHint::Condition) {
+        return ResolveResult::Passthrough(input.to_string());
+    }
+
+    // Quote / parameter contexts: the cursor is inside a quoted region or a
+    // `${PARAM}` expansion — no command resolution should happen.
+    //   SingleQuoted  → no expansion at all (shell treats everything literally)
+    //   DoubleQuoted  → conservatively passthrough (data, not code)
+    //   Backticked    → inner shell; its own resolve pass will handle it
+    //   ParameterName → we're naming a parameter, not a command
+    if matches!(
+        context_hint,
+        ContextHint::SingleQuoted
+            | ContextHint::DoubleQuoted
+            | ContextHint::Backticked
+            | ContextHint::ParameterName
+    ) {
         return ResolveResult::Passthrough(input.to_string());
     }
 
@@ -4829,5 +4884,67 @@ mod tests {
             ResolveResult::Resolved(s) => assert_eq!(s, "Git"),
             other => panic!("expected Resolved(\"Git\"), got {:?}", other),
         }
+    }
+
+    // ── quote / param-context passthrough ────────────────────────────────────
+
+    #[test]
+    fn resolve_line_single_quoted_passthrough() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        let pins = Pins::default();
+        // Inside single quotes, even an abbreviation that would normally
+        // resolve must come back unchanged.
+        let result = resolve_line("git ch", &trie, &pins, None, ContextHint::SingleQuoted);
+        match result {
+            ResolveResult::Passthrough(s) => assert_eq!(s, "git ch"),
+            other => panic!("expected Passthrough, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_line_param_context_passthrough() {
+        let mut trie = CommandTrie::new();
+        trie.insert(&["git", "checkout"]);
+        let pins = Pins::default();
+        // Inside ${PARAM…}, the engine must not touch the buffer.
+        let result = resolve_line("echo ${HO", &trie, &pins, None, ContextHint::ParameterName);
+        match result {
+            ResolveResult::Passthrough(s) => assert_eq!(s, "echo ${HO"),
+            other => panic!("expected Passthrough, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_hint_from_parts_precedence() {
+        // param_context beats everything
+        assert_eq!(
+            ContextHint::from_parts(Some("redirection"), Some("single"), true),
+            ContextHint::ParameterName
+        );
+        // single quote beats double and context
+        assert_eq!(
+            ContextHint::from_parts(Some("math"), Some("single"), false),
+            ContextHint::SingleQuoted
+        );
+        // double quote beats positional context
+        assert_eq!(
+            ContextHint::from_parts(Some("redirection"), Some("double"), false),
+            ContextHint::DoubleQuoted
+        );
+        // backtick / dollar both map to Backticked
+        assert_eq!(
+            ContextHint::from_parts(None, Some("backtick"), false),
+            ContextHint::Backticked
+        );
+        assert_eq!(
+            ContextHint::from_parts(None, Some("dollar"), false),
+            ContextHint::Backticked
+        );
+        // falls back to positional context when no quote flag
+        assert_eq!(
+            ContextHint::from_parts(Some("redirection"), None, false),
+            ContextHint::Redirection
+        );
     }
 }

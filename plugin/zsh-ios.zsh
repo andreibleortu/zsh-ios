@@ -167,6 +167,88 @@ _zsh_ios_infer_context() {
     fi
 }
 
+# --- Infer quote state from the buffer ---
+# Walks forward tracking unclosed quotes; emits the deepest unclosed quote
+# type at end of buffer, or "none" when all quotes are balanced.
+# Outputs one of: none, single, double, backtick
+_zsh_ios_infer_quote() {
+    local buf="$1"
+    local single=0 double=0 backtick=0 escaped=0
+    local i=0 c
+    while (( i < ${#buf} )); do
+        c="${buf:$i:1}"
+        if (( escaped )); then
+            escaped=0
+            (( i++ ))
+            continue
+        fi
+        case "$c" in
+            '\\') escaped=1 ;;
+            "'")
+                if (( single == 0 && double == 0 && backtick == 0 )); then
+                    single=1
+                elif (( single == 1 )); then
+                    single=0
+                fi
+                ;;
+            '"')
+                if (( single == 0 )); then
+                    (( double ^= 1 ))
+                fi
+                ;;
+            '`')
+                if (( single == 0 && double == 0 )); then
+                    (( backtick ^= 1 ))
+                fi
+                ;;
+        esac
+        (( i++ ))
+    done
+    if (( single )); then
+        echo single
+    elif (( double )); then
+        echo double
+    elif (( backtick )); then
+        echo backtick
+    else
+        echo none
+    fi
+}
+
+# --- Infer whether the cursor is inside an unclosed ${ expansion ---
+# Returns 1 (true) when the buffer ends inside `${…` without a closing `}`.
+# Returns 0 otherwise.
+_zsh_ios_infer_param_context() {
+    local buf="$1"
+    local i=0 depth=0
+    while (( i < ${#buf} - 1 )); do
+        if [[ "${buf:$i:2}" == '${' ]]; then
+            (( depth++ ))
+            (( i += 2 ))
+            continue
+        fi
+        if [[ "${buf:$i:1}" == '}' ]] && (( depth > 0 )); then
+            (( depth-- ))
+        fi
+        (( i++ ))
+    done
+    (( depth > 0 )) && echo 1 || echo 0
+}
+
+# --- Build the extra quote/param-context args for the binary ---
+# Sets _zsh_ios_extra_args (array) based on the buffer prefix.
+# Usage: _zsh_ios_quote_args "$prefix"; then use "${_zsh_ios_extra_args[@]}"
+_zsh_ios_quote_args() {
+    local _prefix="$1"
+    _zsh_ios_extra_args=()
+    local _quote
+    _quote=$(_zsh_ios_infer_quote "$_prefix")
+    [[ "$_quote" != "none" ]] && _zsh_ios_extra_args+=(--quote "$_quote")
+    local _param_ctx
+    _param_ctx=$(_zsh_ios_infer_param_context "$_prefix")
+    [[ "$_param_ctx" == "1" ]] && _zsh_ios_extra_args+=(--param-context)
+}
+
 # --- ZLE Widget: Enter key (resolve + execute) ---
 _zsh_ios_accept_line() {
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
@@ -221,7 +303,9 @@ _zsh_ios_accept_line() {
 
     local output exit_code context
     context=$(_zsh_ios_infer_context "$BUFFER")
-    output=$("$ZSH_IOS_BIN" resolve --context "$context" -- "$BUFFER" 2>/dev/null)
+    local -a _zsh_ios_extra_args
+    _zsh_ios_quote_args "$BUFFER"
+    output=$("$ZSH_IOS_BIN" resolve --context "$context" "${_zsh_ios_extra_args[@]}" -- "$BUFFER" 2>/dev/null)
     exit_code=$?
 
     case $exit_code in
@@ -256,7 +340,9 @@ _zsh_ios_expand_or_complete() {
 
     local output exit_code context
     context=$(_zsh_ios_infer_context "$BUFFER")
-    output=$("$ZSH_IOS_BIN" resolve --context "$context" -- "$BUFFER" 2>/dev/null)
+    local -a _zsh_ios_extra_args
+    _zsh_ios_quote_args "$BUFFER"
+    output=$("$ZSH_IOS_BIN" resolve --context "$context" "${_zsh_ios_extra_args[@]}" -- "$BUFFER" 2>/dev/null)
     exit_code=$?
 
     case $exit_code in
@@ -447,7 +533,9 @@ _zsh_ios_help() {
     # Fast path: Rust binary handles typed completions (branches, hosts, etc.)
     local output context
     context=$(_zsh_ios_infer_context "$prefix")
-    output=$("$ZSH_IOS_BIN" complete --context "$context" -- "$prefix" 2>/dev/null)
+    local -a _zsh_ios_extra_args
+    _zsh_ios_quote_args "$prefix"
+    output=$("$ZSH_IOS_BIN" complete --context "$context" "${_zsh_ios_extra_args[@]}" -- "$prefix" 2>/dev/null)
 
     # Detect "generic" output — the Rust binary signaling it has nothing useful.
     # In these cases the ZLE worker may have better results.

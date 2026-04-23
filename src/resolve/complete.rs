@@ -22,6 +22,8 @@ fn titlecase(s: &str) -> String {
 }
 
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
+    use super::engine::ContextHint;
+
     // Leading `!` is a hands-off marker (see `starts_with_bang`). Produce no
     // completions so the shell's native completion (or history expansion)
     // gets a clean look.
@@ -29,8 +31,24 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: supe
         return String::new();
     }
 
+    // Single-quoted: no completions are possible inside single quotes.
+    if context_hint == ContextHint::SingleQuoted {
+        return String::new();
+    }
+
+    // Backticked: treat conservatively — no completions (inner shell context).
+    if context_hint == ContextHint::Backticked {
+        return String::new();
+    }
+
+    // ParameterName: the cursor is inside `${PARAM…}`. Find the partial
+    // parameter name after the last `${` and offer matching parameter names.
+    if context_hint == ContextHint::ParameterName {
+        return complete_parameter_name(input, trie);
+    }
+
     // Redirection context: complete the last word as a filesystem path.
-    if context_hint == super::engine::ContextHint::Redirection {
+    if context_hint == ContextHint::Redirection {
         let words: Vec<&str> = input.split_whitespace().collect();
         let prefix = if input.ends_with(' ') || input.ends_with('\t') {
             ""
@@ -41,8 +59,27 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: supe
     }
 
     // math / condition: no completions.
-    if matches!(context_hint, super::engine::ContextHint::Math | super::engine::ContextHint::Condition) {
+    if matches!(context_hint, ContextHint::Math | ContextHint::Condition) {
         return String::new();
+    }
+
+    // DoubleQuoted: only allow parameter ($VAR) completion; suppress
+    // command/subcommand/flag output. We run the normal path below but it
+    // will naturally offer parameter completion when the prefix starts with
+    // `$`. For any other prefix we return empty — the quoted string is data.
+    let double_quoted = context_hint == ContextHint::DoubleQuoted;
+    if double_quoted {
+        // Only offer completions if the cursor is on a `$`-prefixed word.
+        let words: Vec<&str> = input.split_whitespace().collect();
+        let prefix = if input.ends_with(' ') || input.ends_with('\t') {
+            ""
+        } else {
+            words.last().copied().unwrap_or("")
+        };
+        if !prefix.starts_with('$') {
+            return String::new();
+        }
+        // Fall through: the $VAR branch in complete_segment handles this.
     }
 
     // Expand global aliases so the `?` key sees the same expanded buffer
@@ -69,6 +106,75 @@ pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: supe
         .unwrap_or(input.trim_start());
 
     complete_segment(last_cmd, trie, pins)
+}
+
+/// Complete a parameter name when the cursor is inside `${PARAM…}`.
+///
+/// Scans `input` backwards from the end to find the last `${` that has no
+/// matching `}`, extracts the partial name between `${` and end-of-input,
+/// and returns matching parameter names from the live-state cache.
+fn complete_parameter_name(input: &str, trie: &CommandTrie) -> String {
+    // Find the last `${` not closed by a `}` before end of input.
+    let partial = {
+        let bytes = input.as_bytes();
+        let mut depth: i32 = 0;
+        let mut dollar_brace_pos: Option<usize> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
+                depth += 1;
+                dollar_brace_pos = Some(i + 2); // position after `${`
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'}' && depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    dollar_brace_pos = None;
+                }
+            }
+            i += 1;
+        }
+        // If there is an unclosed `${`, the partial name starts at dollar_brace_pos.
+        if depth > 0 {
+            dollar_brace_pos.map(|pos| &input[pos..])
+        } else {
+            None
+        }
+    };
+
+    let param_prefix = partial.unwrap_or("").trim_start();
+    let params = runtime_complete::live_state_for("parameters");
+
+    // Also include parameters from the trie's live_state snapshot (populated
+    // at build time from the ingest worker).
+    let trie_params: Vec<String> = trie
+        .live_state
+        .get("parameters")
+        .map(|s| runtime_complete::parse_parameters_output(s))
+        .unwrap_or_default();
+
+    let mut all_params: Vec<String> = params.clone();
+    for p in trie_params {
+        if !all_params.contains(&p) {
+            all_params.push(p);
+        }
+    }
+
+    let hits: Vec<String> = all_params
+        .iter()
+        .filter(|p| p.starts_with(param_prefix))
+        .cloned()
+        .collect();
+
+    if hits.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("% Expects: <$parameter>\n");
+    let refs: Vec<&str> = hits.iter().map(String::as_str).collect();
+    output.push_str(&format_columns(&refs, 80));
+    output
 }
 
 pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
@@ -1160,6 +1266,45 @@ mod tests {
         // Must NOT have per-tag headers.
         assert!(!out.contains("% Process:"), "should not have separate Process header");
         assert!(!out.contains("% Job:"), "should not have separate Job header");
+    }
+
+    // ── quote / param-context completion behaviour ───────────────────────────
+
+    #[test]
+    fn complete_single_quoted_returns_empty() {
+        let trie = build_test_trie();
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        // Inside a single-quoted string, no completions should be offered.
+        let out = super::complete("echo 'git ", &trie, &pins, ContextHint::SingleQuoted);
+        assert!(out.is_empty(), "expected empty output for SingleQuoted, got: {:?}", out);
+    }
+
+    #[test]
+    fn complete_param_context_offers_parameters() {
+        use super::super::engine::ContextHint;
+        use crate::runtime_complete;
+        // Seed the live state with some parameter names.
+        let mut state = std::collections::HashMap::new();
+        state.insert("parameters".to_string(), vec!["HOME".to_string(), "PATH".to_string(), "HISTFILE".to_string()]);
+        runtime_complete::set_live_state(state);
+
+        let trie = build_test_trie();
+        let pins = crate::pins::Pins::default();
+        let out = super::complete("echo ${HO", &trie, &pins, ContextHint::ParameterName);
+        assert!(out.contains("HOME"), "expected HOME in parameter completions, got: {:?}", out);
+        assert!(!out.contains("PATH"), "PATH should not match prefix HO, got: {:?}", out);
+    }
+
+    #[test]
+    fn complete_double_quoted_suppresses_subcommands() {
+        let trie = build_test_trie();
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        // Inside a double-quoted string with no `$`-prefix, no completions.
+        let out = super::complete("echo \"git ch", &trie, &pins, ContextHint::DoubleQuoted);
+        assert!(!out.contains("checkout"), "subcommand should be suppressed in DoubleQuoted, got: {:?}", out);
+        assert!(!out.contains("% Possible"), "no completion headers expected, got: {:?}", out);
     }
 
     #[test]

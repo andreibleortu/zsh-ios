@@ -27,6 +27,14 @@ enum Commands {
         /// Shell context hint inferred from the buffer (redirection, math, condition, …)
         #[arg(long = "context")]
         context: Option<String>,
+        /// Quote state: none / single / double / backtick / dollar
+        /// (inferred from the buffer by the plugin).
+        #[arg(long = "quote")]
+        quote: Option<String>,
+        /// When present, the cursor is inside a ${PARAM} expansion and
+        /// completion should suggest parameter names.
+        #[arg(long = "param-context")]
+        param_context: bool,
         /// The abbreviated command line to resolve
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         line: Vec<String>,
@@ -36,6 +44,14 @@ enum Commands {
         /// Shell context hint inferred from the buffer (redirection, math, condition, …)
         #[arg(long = "context")]
         context: Option<String>,
+        /// Quote state: none / single / double / backtick / dollar
+        /// (inferred from the buffer by the plugin).
+        #[arg(long = "quote")]
+        quote: Option<String>,
+        /// When present, the cursor is inside a ${PARAM} expansion and
+        /// completion should suggest parameter names.
+        #[arg(long = "param-context")]
+        param_context: bool,
         /// The prefix to complete
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         line: Vec<String>,
@@ -88,8 +104,12 @@ fn main() {
 
     match cli.command {
         Commands::Build { aliases_stdin } => cmd_build(aliases_stdin),
-        Commands::Resolve { context, line } => cmd_resolve(&line.join(" "), context.as_deref()),
-        Commands::Complete { context, line } => cmd_complete(&line.join(" "), context.as_deref()),
+        Commands::Resolve { context, quote, param_context, line } => {
+            cmd_resolve(&line.join(" "), context.as_deref(), quote.as_deref(), param_context)
+        }
+        Commands::Complete { context, quote, param_context, line } => {
+            cmd_complete(&line.join(" "), context.as_deref(), quote.as_deref(), param_context)
+        }
         Commands::Learn { exit_code, cwd, command } => cmd_learn(&command.join(" "), exit_code, cwd.as_deref()),
         Commands::Pin { abbrev, expanded } => cmd_pin(&abbrev, &expanded),
         Commands::Unpin { abbrev } => cmd_unpin(&abbrev),
@@ -241,7 +261,7 @@ fn import_shell_functions(trie: &mut trie::CommandTrie) -> u32 {
     n
 }
 
-fn cmd_resolve(line: &str, context: Option<&str>) {
+fn cmd_resolve(line: &str, context: Option<&str>, quote: Option<&str>, param_context: bool) {
     let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
@@ -262,7 +282,7 @@ fn cmd_resolve(line: &str, context: Option<&str>) {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok());
-    let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
+    let context_hint = resolve::ContextHint::from_parts(context, quote, param_context);
     match resolve::resolve_line(line, &trie, &pin_store, cwd.as_deref(), context_hint) {
         resolve::ResolveResult::Resolved(expanded) => {
             // Blocklist post-check: if the resolved command is blocklisted,
@@ -342,7 +362,7 @@ fn print_path_ambiguity_shell(candidates: &[String]) {
     println!("_zio_path_candidates=({})", items.join(" "));
 }
 
-fn cmd_complete(line: &str, context: Option<&str>) {
+fn cmd_complete(line: &str, context: Option<&str>, quote: Option<&str>, param_context: bool) {
     let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
@@ -351,7 +371,7 @@ fn cmd_complete(line: &str, context: Option<&str>) {
         trie.galiases.clear();
     }
     hydrate_live_state(&trie);
-    let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
+    let context_hint = resolve::ContextHint::from_parts(context, quote, param_context);
     let output = resolve::complete(line, &trie, &pin_store, context_hint);
     print!("{}", output);
 }

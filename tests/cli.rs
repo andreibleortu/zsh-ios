@@ -787,3 +787,35 @@ fn ingest_dirstack_populates_trie_field() {
         trie.dir_stack
     );
 }
+
+// ── quote / param-context CLI flags ─────────────────────────────────────────
+
+#[test]
+fn resolve_with_quote_single_passes_through() {
+    // `--quote single` signals the cursor is inside a single-quoted string;
+    // even an abbreviation that would normally expand must come back unchanged.
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+    // Use an input that would resolve ("ech hi" -> "echo hi") to verify
+    // the quote flag truly suppresses expansion.  The binary must either
+    // return exit 2 (Passthrough) with the original text on stdout.
+    let (code, stdout, _) = run(
+        cmd_in(td.path())
+            .args(["resolve", "--quote", "single", "--", "git ch"]),
+    );
+    // Passthrough: exit 2, original text echoed
+    assert_eq!(code, 2, "expected Passthrough (exit 2) with --quote single, got exit {}", code);
+    assert_eq!(stdout.trim(), "git ch", "stdout: {:?}", stdout);
+}
+
+#[test]
+fn resolve_with_param_context_passes_through() {
+    let td = tempfile::tempdir().unwrap();
+    seed_build(td.path());
+    let (code, stdout, _) = run(
+        cmd_in(td.path())
+            .args(["resolve", "--param-context", "--", "echo ${HOM"]),
+    );
+    assert_eq!(code, 2, "expected Passthrough (exit 2) with --param-context, got exit {}", code);
+    assert_eq!(stdout.trim(), "echo ${HOM", "stdout: {:?}", stdout);
+}
