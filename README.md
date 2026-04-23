@@ -70,8 +70,19 @@ The command trie is built from:
 7. **Zsh completion files** -- subcommand patterns and per-position argument specs from `$fpath` directories, including system paths and plugin-framework trees (Oh-My-Zsh, Prezto, zinit, antidote, antibody, znap, zplug, `~/.config/zsh`)
 8. **Fish completion files** -- `.fish` completion files from standard Fish completion directories (`/usr/share/fish/completions`, `~/.config/fish/completions`, etc.)
 9. **Bash completion files** -- `complete -F` / `complete -W` stanzas from `/etc/bash_completion.d`, `/usr/share/bash-completion/completions`, and equivalents
-10. **carapace-spec YAML** -- user, distro, and Homebrew carapace specs under `~/.config/carapace/specs/` and `/usr/{share,local/share}/carapace/specs/`; when the `carapace` binary is on PATH and `disable_build_time_shell_exec` is off, also shells to `carapace _list` + `carapace <cmd> _spec` to dump every builtin completer (cached under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/` keyed by `carapace --version`)
-11. **Fig / withfig/autocomplete** -- 500+ TypeScript specs from [withfig/autocomplete](https://github.com/withfig/autocomplete), compiled to JSON via `zsh-ios fig-fetch` (one-time; requires Node + pnpm/npm on PATH). Subsequent `zsh-ios rebuild` reads the cached JSON and folds templates / suggestions / generator scripts into the trie
+10. **carapace-spec YAML** -- three disk locations are scanned on every `build`:
+    - `~/.config/carapace/specs/*.yaml` (user-authored)
+    - `/usr/share/carapace/specs/*.yaml` (distro packages)
+    - `/usr/local/share/carapace/specs/*.yaml` (Homebrew and local installs)
+
+    When the `carapace` binary is also on PATH and `disable_build_time_shell_exec` is off, zsh-ios additionally shells to `carapace _list` to enumerate every builtin completer, then `carapace <cmd> _spec` to dump each as YAML. The dumps cache under `$XDG_CACHE_HOME/zsh-ios/carapace-specs/<cmd>.yaml` keyed by `carapace --version`, so subsequent builds read the cache until `carapace` itself upgrades.
+
+11. **Fig / withfig/autocomplete** -- 500+ TypeScript specs fetched from [`github.com/withfig/autocomplete`](https://github.com/withfig/autocomplete). The pipeline is a one-time `zsh-ios fig-fetch`:
+    - `git clone` (or `git pull`) into `$XDG_CACHE_HOME/zsh-ios/fig-autocomplete/`
+    - `pnpm install` + `pnpm build` (falls back to `npm` if `pnpm` isn't installed; both require Node on PATH)
+    - a bundled Node scriptlet (`data/fig_dump.js`, embedded via `include_str!`) walks the compiled `build/*.js` specs, replaces JS functions with a `"__FN__"` sentinel so `JSON.stringify` survives, and writes one JSON per spec to `$XDG_CACHE_HOME/zsh-ios/fig-json/<name>.json`
+
+    Every subsequent `zsh-ios rebuild` reads those JSON files via Rust's `serde_json` and folds templates / suggestions / generator scripts into the trie. If `fig-json/` is absent the scan silently returns zero — users who never run `fig-fetch` stay completely dep-free. Rerun `zsh-ios fig-fetch` whenever you want the latest upstream updates.
 12. **Project-local manifests** -- `package.json`, `Makefile`, `justfile`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `build.gradle`, `Rakefile`, `Pipfile`, `pnpm-workspace.yaml`, `lerna.json` (scripts and targets resolved by walking up from cwd)
 13. **Live worker state** -- on first shell startup the background zpty worker dumps: aliases, galiases, saliases, functions, named dirs, history, dirstack, jobs, commands, parameters, options, widgets, modules, and zstyle settings; all folded into the trie via `zsh-ios ingest`
 14. **Runtime resolvers** -- live data queried when `?` / Tab fires: git (`git for-each-ref`, `git log`, `git remote`, `git ls-files`, …), docker (`docker ps`, `docker images`, …), k8s (`kubectl get`), systemd (`systemctl list-units`), tmux (`tmux list-sessions`), package managers (brew, apt, dnf, pacman, npm, pip, cargo), and project scripts from manifests found by walking up from cwd
