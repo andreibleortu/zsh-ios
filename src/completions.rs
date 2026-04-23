@@ -18,7 +18,7 @@ pub fn scan_completions(trie: &mut CommandTrie) -> u32 {
     let fpath_dirs = completion_dirs();
     let mut total = 0u32;
 
-    let (subcmds, arg_specs, cmds_with_completions) = extract_from_dirs(&fpath_dirs);
+    let (subcmds, arg_specs, cmds_with_completions, tag_groups) = extract_from_dirs(&fpath_dirs);
     for (cmd, subs) in &subcmds {
         for sub in subs {
             trie.insert(&[cmd.as_str(), sub.as_str()]);
@@ -33,6 +33,13 @@ pub fn scan_completions(trie: &mut CommandTrie) -> u32 {
         }
     }
     trie.arg_specs.extend(arg_specs);
+
+    // Fold tag groups into the trie
+    for (cmd, groups) in tag_groups {
+        if !groups.is_empty() {
+            trie.tag_groups.entry(cmd).or_default().extend(groups);
+        }
+    }
 
     // Apply well-known hardcoded specs ONLY for commands without a Zsh completion file.
     // Commands with completion files are fully handled by the parser — no hardcoding.
@@ -1030,11 +1037,13 @@ fn completion_dirs() -> Vec<String> {
 }
 
 /// Result of scanning completion directories: (subcommands-per-command,
-/// arg-spec-per-command, commands-that-had-a-completion-file).
+/// arg-spec-per-command, commands-that-had-a-completion-file,
+/// tag-groups-per-command).
 type ExtractedCompletions = (
     HashMap<String, Vec<String>>,
     HashMap<String, ArgSpec>,
     HashSet<String>,
+    HashMap<String, Vec<trie::TagGroup>>,
 );
 
 /// Convert a [`regex_args::ParsedRegexArgs`] into an [`ArgSpec`].
@@ -1066,6 +1075,7 @@ fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
     let mut subcmds: HashMap<String, Vec<String>> = HashMap::new();
     let mut arg_specs: HashMap<String, ArgSpec> = HashMap::new();
     let mut cmds_with_completions: HashSet<String> = HashSet::new();
+    let mut all_tag_groups: HashMap<String, Vec<trie::TagGroup>> = HashMap::new();
 
     for dir in dirs {
         let dir_path = Path::new(dir);
@@ -1145,6 +1155,18 @@ fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
                 // e.g., _git-add () { _arguments ... '*:file:_files' } → "git add" → Paths
                 let sub_specs = extract_subcommand_arg_specs(cmd, &content);
                 arg_specs.extend(sub_specs);
+
+                // Extract tag groups from _wanted / _description patterns.
+                let arrays = collect_local_arrays(&content);
+                let groups = extract_tag_groups(&content, &arrays);
+                if !groups.is_empty() {
+                    let cmd_key = if commands.is_empty() {
+                        cmd.to_string()
+                    } else {
+                        commands[0].clone()
+                    };
+                    all_tag_groups.entry(cmd_key).or_default().extend(groups);
+                }
             }
         }
     }
@@ -1154,7 +1176,7 @@ fn extract_from_dirs(dirs: &[String]) -> ExtractedCompletions {
         subs.dedup();
     }
 
-    (subcmds, arg_specs, cmds_with_completions)
+    (subcmds, arg_specs, cmds_with_completions, all_tag_groups)
 }
 
 /// Parse the `#compdef` header to get the list of commands this file covers.
@@ -1647,6 +1669,162 @@ pub(super) fn collect_local_arrays(body: &str) -> ArrayData {
     }
 
     data
+}
+
+/// Extract (tag, label, items) triples from `_wanted` / `_description` /
+/// `_tags` invocations in a completion function body.
+///
+/// `_tags` and `_sort_tags` are orchestration — they do not produce data and
+/// are skipped.  `_requested` is also skipped (orchestration, not data).
+pub(super) fn extract_tag_groups(body: &str, arrays: &ArrayData) -> Vec<trie::TagGroup> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("_wanted ") {
+            if let Some(tg) = parse_wanted_line(rest, arrays) {
+                out.push(tg);
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("_description ") {
+            if let Some(tg) = parse_description_line(rest) {
+                out.push(tg);
+            }
+            continue;
+        }
+        // _tags, _sort_tags, _requested: skip — orchestration only, no data.
+    }
+    out
+}
+
+/// Parse a `_wanted` line (everything after the `_wanted ` prefix).
+///
+/// Syntax: `_wanted [-V|-J] [-x] [-1] [-2] [-o nosort] <tag> <expl_var> '<label>' <action>`
+fn parse_wanted_line(rest: &str, arrays: &ArrayData) -> Option<trie::TagGroup> {
+    let tokens = shell_tokenize(rest);
+    let mut i = 0;
+
+    // Skip leading option flags: -V, -J, -x, -1, -2, -o (with arg nosort)
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        match t {
+            "-V" | "-J" | "-x" | "-1" | "-2" => {
+                i += 1;
+            }
+            "-o" => {
+                i += 2; // skip -o and its argument (e.g. nosort)
+            }
+            _ => break,
+        }
+    }
+
+    // First non-flag token = tag
+    let tag = tokens.get(i)?.clone();
+    i += 1;
+    if tag.is_empty() {
+        return None;
+    }
+
+    // Next token = expl variable name — skip it
+    i += 1;
+
+    // Next quoted token = label
+    let label = tokens.get(i)?.trim_matches('\'').trim_matches('"').to_string();
+    i += 1;
+    if label.is_empty() {
+        return None;
+    }
+
+    // Remaining tokens are the action; collect literal items from compadd
+    let action_tokens = &tokens[i..];
+    let items = collect_compadd_items(action_tokens, arrays);
+
+    Some(trie::TagGroup { tag, label, items })
+}
+
+/// Parse a `_description` line (everything after the `_description ` prefix).
+///
+/// Syntax: `_description <tag> <expl_var> '<label>'`
+fn parse_description_line(rest: &str) -> Option<trie::TagGroup> {
+    let tokens = shell_tokenize(rest);
+    let mut i = 0;
+
+    let tag = tokens.get(i)?.clone();
+    i += 1;
+    if tag.is_empty() {
+        return None;
+    }
+
+    // expl variable name — skip
+    i += 1;
+
+    let label = tokens.get(i)?.trim_matches('\'').trim_matches('"').to_string();
+    if label.is_empty() {
+        return None;
+    }
+
+    Some(trie::TagGroup { tag, label, items: Vec::new() })
+}
+
+/// Collect literal items from a `compadd ...` action token slice.
+///
+/// Finds `compadd` in the tokens, skips known option flags (and their
+/// arguments), expands `-a ARRAYNAME` via `arrays.items`, and returns
+/// remaining bare-word tokens as items.  Shell expansions (`$(...)`,
+/// `` `...` ``, `${...}`) are treated as dynamic and yield empty items.
+fn collect_compadd_items(tokens: &[String], arrays: &ArrayData) -> Vec<String> {
+    // Find compadd position
+    let compadd_pos = tokens.iter().position(|t| t == "compadd");
+    let Some(start) = compadd_pos else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    let mut i = start + 1;
+    // Flags that consume the next token as an argument
+    let consuming_flags = ["-W", "-F", "-P", "-S", "-q", "-Q", "-r", "-R", "-d", "-D",
+                            "-X", "-x", "-n", "-p", "-J", "-V", "-1", "-2"];
+
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        // Shell operators end the item list
+        if matches!(t, "&&" | "||" | ";" | "&" | "|") {
+            break;
+        }
+        // End-of-options marker
+        if t == "--" {
+            break;
+        }
+        if t == "-a" {
+            // Expand array reference
+            i += 1;
+            if let Some(array_name) = tokens.get(i)
+                && let Some(arr_items) = arrays.items.get(array_name.as_str())
+            {
+                items.extend(arr_items.iter().cloned());
+            }
+            i += 1;
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            if consuming_flags.contains(&t) {
+                i += 1; // skip the flag's argument
+            }
+            continue;
+        }
+        // Shell expansion — dynamic, can't enumerate
+        if t.starts_with('$') || t.starts_with('(') || t.starts_with('`') {
+            // Items are dynamic — return empty to signal that
+            return Vec::new();
+        }
+        let clean = t.trim_matches('\'').trim_matches('"');
+        if !clean.is_empty() {
+            items.push(clean.to_string());
+        }
+        i += 1;
+    }
+    items
 }
 
 /// Tokenize the content inside `( ... )` of a Zsh array assignment.
@@ -6088,5 +6266,81 @@ _mytool "$@"
         let ra = ra.unwrap();
         assert_eq!(ra.positional.get(&1), Some(&trie::ARG_MODE_HOSTS));
         assert_eq!(ra.positional.get(&2), Some(&trie::ARG_MODE_PATHS));
+    }
+
+    // --- extract_tag_groups tests ---
+
+    #[test]
+    fn parse_wanted_simple() {
+        // Dynamic items (shell expansion) → items empty
+        let arrays = ArrayData::new();
+        let body = "_wanted processes expl 'process' compadd $(ps -e -o pid=)";
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "processes");
+        assert_eq!(groups[0].label, "process");
+        assert!(groups[0].items.is_empty(), "dynamic expansion yields no items");
+    }
+
+    #[test]
+    fn parse_wanted_with_literal_items() {
+        let arrays = ArrayData::new();
+        let body = "_wanted commands expl 'command' compadd start stop restart";
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "commands");
+        assert_eq!(groups[0].label, "command");
+        assert_eq!(groups[0].items, vec!["start", "stop", "restart"]);
+    }
+
+    #[test]
+    fn parse_wanted_with_array_ref() {
+        let mut arrays = ArrayData::new();
+        arrays.items.insert("mycmds".to_string(), vec!["foo".to_string(), "bar".to_string()]);
+        let body = "_wanted cmds expl 'cmd' compadd -a mycmds";
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "cmds");
+        assert_eq!(groups[0].label, "cmd");
+        assert_eq!(groups[0].items, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn parse_wanted_skips_flags() {
+        let arrays = ArrayData::new();
+        // -V, -J, -1 are leading option flags; tag follows
+        let body = "_wanted -V -J -1 processes expl 'process' compadd a b c";
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "processes");
+        assert_eq!(groups[0].label, "process");
+        assert_eq!(groups[0].items, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_description_simple() {
+        let arrays = ArrayData::new();
+        let body = "_description files expl 'file'";
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "files");
+        assert_eq!(groups[0].label, "file");
+        assert!(groups[0].items.is_empty());
+    }
+
+    #[test]
+    fn extract_tag_groups_from_mixed_body() {
+        let arrays = ArrayData::new();
+        let body = r#"
+_wanted commands expl 'command' compadd start stop
+_description files expl 'file'
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 2);
+        // Source order preserved
+        assert_eq!(groups[0].tag, "commands");
+        assert_eq!(groups[0].items, vec!["start", "stop"]);
+        assert_eq!(groups[1].tag, "files");
+        assert!(groups[1].items.is_empty());
     }
 }

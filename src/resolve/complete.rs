@@ -12,6 +12,15 @@ use crate::trie::{self, CommandTrie, TrieNode};
 
 use super::engine::*;
 
+/// Uppercase the first character of a string, leave the rest unchanged.
+fn titlecase(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
     // Leading `!` is a hands-off marker (see `starts_with_bang`). Produce no
     // completions so the shell's native completion (or history expansion)
@@ -289,6 +298,37 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         node.matcher_aware_search(prefix, &trie.matcher_rules)
     };
 
+    // --- Tag-group display ---
+    // When the trie has tag_groups for the resolved command path, prefer
+    // a grouped display over the flat subcommand list.  Fall through to the
+    // flat path if every group filtered to zero items.
+    let cmd_key = resolved_words.join(" ");
+    if let Some(groups) = trie.tag_groups.get(&cmd_key)
+        && !groups.is_empty()
+        && !prefix.starts_with('-')
+    {
+        let mut group_output = String::new();
+        for group in groups {
+            let filtered: Vec<&str> = group
+                .items
+                .iter()
+                .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+                .map(String::as_str)
+                .collect();
+            if filtered.is_empty() && prefix.is_empty() && !group.label.is_empty() {
+                // Show an empty-group stub: label only, no items
+                group_output.push_str(&format!("% {}:\n", titlecase(&group.label)));
+            } else if !filtered.is_empty() {
+                group_output.push_str(&format!("% {}:\n", titlecase(&group.label)));
+                group_output.push_str(&format_columns(&filtered, 80));
+            }
+        }
+        if !group_output.is_empty() {
+            output.push_str(&group_output);
+            return output;
+        }
+    }
+
     if trie_matches.is_empty() {
         // No trie matches — show type-aware completions based on arg spec
         show_type_completions(&mut output, current_mode, prefix, spec, arg_position);
@@ -310,7 +350,6 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
 
             // Try to show descriptions for subcommands (Cisco IOS style)
-            let cmd_key = resolved_words.join(" ");
             let descs = trie.descriptions.get(&cmd_key);
 
             output.push_str("% Possible subcommands:\n");
@@ -911,6 +950,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn complete_displays_tag_groups() {
+        use crate::trie::TagGroup;
+        let mut trie = CommandTrie::new();
+        trie.insert_command("kill");
+        trie.tag_groups.insert(
+            "kill".to_string(),
+            vec![
+                TagGroup {
+                    tag: "processes".to_string(),
+                    label: "process".to_string(),
+                    items: vec!["123".to_string(), "456".to_string()],
+                },
+                TagGroup {
+                    tag: "jobs".to_string(),
+                    label: "job".to_string(),
+                    items: vec!["%1".to_string()],
+                },
+            ],
+        );
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        let out = super::complete("kill ", &trie, &pins, ContextHint::Argument);
+        assert!(out.contains("% Process:"), "expected '% Process:' header, got: {:?}", out);
+        assert!(out.contains("% Job:"), "expected '% Job:' header, got: {:?}", out);
+        assert!(out.contains("123"), "expected item '123'");
+        assert!(out.contains("%1"), "expected item '%1'");
+    }
+
+    #[test]
+    fn complete_without_tag_groups_keeps_flat_output() {
+        let trie = build_test_trie();
+        let pins = crate::pins::Pins::default();
+        use super::super::engine::ContextHint;
+        // git has no tag_groups → should use the flat subcommand path
+        let out = super::complete("git ", &trie, &pins, ContextHint::Argument);
+        assert!(out.contains("% Possible subcommands:"), "expected flat subcommand header, got: {:?}", out);
+        // Must not have tag-style headers
+        assert!(!out.contains("% Process:"), "should not have tag-group header");
     }
 
     #[test]

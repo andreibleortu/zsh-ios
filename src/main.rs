@@ -659,6 +659,14 @@ fn cmd_status() {
                 trie.galiases.len(),
                 if user_cfg.disable_galiases { "disabled (config)" } else { "expanded" }
             );
+            if !trie.tag_groups.is_empty() {
+                let total_groups: usize = trie.tag_groups.values().map(Vec::len).sum();
+                println!(
+                    "  Tag groups:  {} commands, {} total groups",
+                    trie.tag_groups.len(),
+                    total_groups
+                );
+            }
         }
     } else {
         println!("  Tree:        not built yet (run `zsh-ios rebuild`)");

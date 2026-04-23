@@ -707,6 +707,17 @@ impl ArgSpec {
     }
 }
 
+/// A tag-organized group of completion entries derived from `_wanted TAG expl
+/// 'label' compadd ...` or `_description TAG expl 'label'` patterns in Zsh
+/// completion files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagGroup {
+    pub tag: String,
+    pub label: String,
+    /// Literal items if statically known; empty if dynamic.
+    pub items: Vec<String>,
+}
+
 /// Maps command path (e.g., "git add", "cp") to its argument spec.
 pub type ArgSpecMap = HashMap<String, ArgSpec>;
 
@@ -762,6 +773,12 @@ pub struct CommandTrie {
     /// Empty = use the default strict prefix matcher.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matcher_rules: Vec<MatcherRule>,
+    /// Per-command tag-organized completion entries derived from
+    /// `_wanted TAG expl 'label' compadd ...` / `_description TAG ...` patterns
+    /// in Zsh completion files. Key = fully-qualified command path
+    /// (e.g. "kill" or "git checkout"). Value = list of TagGroup.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tag_groups: HashMap<String, Vec<TagGroup>>,
 }
 
 impl CommandTrie {
