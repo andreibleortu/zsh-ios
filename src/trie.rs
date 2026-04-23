@@ -15,6 +15,11 @@ pub struct TrieNode {
     pub last_used: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_leaf: bool,
+    /// Frequency of use per-cwd. Limited to the top 8 cwds to keep the trie
+    /// compact; once full, the least-used is evicted on the next distinct cwd.
+    /// Populated by `cmd_learn --cwd PATH`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cwd_hits: Vec<(String, u32)>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -128,6 +133,43 @@ impl TrieNode {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
+    }
+
+    /// Record usage in the given cwd. Keeps at most 8 entries; evicts the
+    /// least-used when full.
+    pub fn record_cwd(&mut self, cwd: &str) {
+        const MAX_CWDS: usize = 8;
+        if let Some(entry) = self.cwd_hits.iter_mut().find(|(k, _)| k == cwd) {
+            entry.1 += 1;
+            return;
+        }
+        if self.cwd_hits.len() >= MAX_CWDS {
+            // Evict the entry with the smallest count.
+            if let Some(idx) = self
+                .cwd_hits
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, c))| *c)
+                .map(|(i, _)| i)
+            {
+                self.cwd_hits.remove(idx);
+            }
+        }
+        self.cwd_hits.push((cwd.to_string(), 1));
+    }
+
+    /// Fraction of uses that occurred in `cwd`, 0.0 if never seen there.
+    pub fn cwd_score(&self, cwd: &str) -> f32 {
+        let hits = self.cwd_hits.iter().find(|(k, _)| k == cwd).map(|(_, c)| *c).unwrap_or(0);
+        if hits == 0 {
+            return 0.0;
+        }
+        let total: u32 = self.cwd_hits.iter().map(|(_, c)| c).sum();
+        if total == 0 {
+            0.0
+        } else {
+            hits as f32 / total as f32
+        }
     }
 
     /// Check whether `name` is a strict prefix of any existing child.
@@ -1185,5 +1227,62 @@ mod tests {
         // The overlapping exclusion group from b (containing -a) should be dropped
         assert_eq!(a.flag_exclusions.len(), 2);
         assert!(a.flag_exclusions.iter().any(|g| g.contains(&"-x".to_string())));
+    }
+
+    #[test]
+    fn record_cwd_inserts_and_bumps() {
+        let mut node = TrieNode::default();
+        node.record_cwd("/home/user/proj");
+        assert_eq!(node.cwd_hits.len(), 1);
+        assert_eq!(node.cwd_hits[0], ("/home/user/proj".to_string(), 1));
+
+        node.record_cwd("/home/user/proj");
+        assert_eq!(node.cwd_hits.len(), 1);
+        assert_eq!(node.cwd_hits[0].1, 2);
+
+        node.record_cwd("/tmp");
+        assert_eq!(node.cwd_hits.len(), 2);
+    }
+
+    #[test]
+    fn record_cwd_evicts_when_full() {
+        let mut node = TrieNode::default();
+        // Fill to 8 entries with counts 1..=8 in distinct cwds
+        for i in 1u32..=8 {
+            let path = format!("/dir/{}", i);
+            for _ in 0..i {
+                node.record_cwd(&path);
+            }
+        }
+        assert_eq!(node.cwd_hits.len(), 8);
+
+        // Insert a 9th — the entry with count 1 (/dir/1) must be evicted.
+        node.record_cwd("/dir/new");
+        assert_eq!(node.cwd_hits.len(), 8);
+        // /dir/1 had the smallest count and should be gone.
+        assert!(!node.cwd_hits.iter().any(|(k, _)| k == "/dir/1"));
+        // The new entry should be present.
+        assert!(node.cwd_hits.iter().any(|(k, c)| k == "/dir/new" && *c == 1));
+    }
+
+    #[test]
+    fn cwd_score_zero_when_unseen() {
+        let node = TrieNode::default();
+        assert_eq!(node.cwd_score("/anywhere"), 0.0);
+    }
+
+    #[test]
+    fn cwd_score_fraction_of_total() {
+        let mut node = TrieNode::default();
+        // 3 uses in /a, 1 use in /b → /a should score 0.75
+        node.record_cwd("/a");
+        node.record_cwd("/a");
+        node.record_cwd("/a");
+        node.record_cwd("/b");
+        let score_a = node.cwd_score("/a");
+        assert!((score_a - 0.75).abs() < 1e-6, "expected 0.75 got {}", score_a);
+        let score_b = node.cwd_score("/b");
+        assert!((score_b - 0.25).abs() < 1e-6, "expected 0.25 got {}", score_b);
+        assert_eq!(node.cwd_score("/unseen"), 0.0);
     }
 }

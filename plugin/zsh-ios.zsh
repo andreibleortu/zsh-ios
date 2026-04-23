@@ -80,6 +80,7 @@ _zsh_ios_build_if_stale
 # --- Learn commands only after successful execution ---
 _zsh_ios_preexec() {
     _zsh_ios_pending_cmd="$1"
+    _zsh_ios_pending_cwd="$PWD"
 }
 
 # Capture exit code before any other precmd hook can modify it.
@@ -104,9 +105,15 @@ precmd() {
 _zsh_ios_precmd() {
     local ec=${_zsh_ios_retval:-0}
     if [[ -n "$_zsh_ios_pending_cmd" ]]; then
-        ("$ZSH_IOS_BIN" learn --exit-code "$ec" -- "$_zsh_ios_pending_cmd" &>/dev/null &)
+        ("$ZSH_IOS_BIN" learn --exit-code "$ec" --cwd "$_zsh_ios_pending_cwd" -- "$_zsh_ios_pending_cmd" &>/dev/null &)
+        if [[ $ec -eq 0 ]]; then
+            # Stash the first word of the command as the sibling-context hint
+            # for the next resolution. The engine reads ZSH_IOS_LAST_CMD.
+            export _ZSH_IOS_LAST_CMD="${_zsh_ios_pending_cmd%% *}"
+        fi
     fi
     unset _zsh_ios_pending_cmd
+    unset _zsh_ios_pending_cwd
     unset _zsh_ios_last_pin
     if (( ! _zsh_ios_ingested )) && _zsh_ios_worker_is_ready; then
         _zsh_ios_ingested=1
@@ -131,6 +138,21 @@ _zsh_ios_safe_eval() {
 # --- Check if disabled (file-based toggle via `zsh-ios toggle`) ---
 _zsh_ios_is_disabled() {
     [[ -f "$ZSH_IOS_CONFIG_DIR/disabled" ]]
+}
+
+# --- Infer shell context from the buffer ---
+# Outputs one of: math, condition, redirection, argument
+_zsh_ios_infer_context() {
+    local buf="$1"
+    if [[ "$buf" == *'(('* && "$buf" != *'))'* ]]; then
+        echo math
+    elif [[ "$buf" == *'[['* && "$buf" != *']]'* ]]; then
+        echo condition
+    elif [[ "${buf##*[[:space:]]}" =~ '^[12&]?[>]{1,2}' ]]; then
+        echo redirection
+    else
+        echo argument
+    fi
 }
 
 # --- ZLE Widget: Enter key (resolve + execute) ---
@@ -185,8 +207,9 @@ _zsh_ios_accept_line() {
         return
     fi
 
-    local output exit_code
-    output=$("$ZSH_IOS_BIN" resolve -- "$BUFFER" 2>/dev/null)
+    local output exit_code context
+    context=$(_zsh_ios_infer_context "$BUFFER")
+    output=$("$ZSH_IOS_BIN" resolve --context "$context" -- "$BUFFER" 2>/dev/null)
     exit_code=$?
 
     case $exit_code in
@@ -219,8 +242,9 @@ _zsh_ios_expand_or_complete() {
         return
     fi
 
-    local output exit_code
-    output=$("$ZSH_IOS_BIN" resolve -- "$BUFFER" 2>/dev/null)
+    local output exit_code context
+    context=$(_zsh_ios_infer_context "$BUFFER")
+    output=$("$ZSH_IOS_BIN" resolve --context "$context" -- "$BUFFER" 2>/dev/null)
     exit_code=$?
 
     case $exit_code in
@@ -381,8 +405,9 @@ _zsh_ios_help() {
     fi
 
     # Fast path: Rust binary handles typed completions (branches, hosts, etc.)
-    local output
-    output=$("$ZSH_IOS_BIN" complete -- "$prefix" 2>/dev/null)
+    local output context
+    context=$(_zsh_ios_infer_context "$prefix")
+    output=$("$ZSH_IOS_BIN" complete --context "$context" -- "$prefix" 2>/dev/null)
 
     # Detect "generic" output — the Rust binary signaling it has nothing useful.
     # In these cases the ZLE worker may have better results.

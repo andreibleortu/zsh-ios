@@ -12,11 +12,27 @@ use crate::trie::{self, CommandTrie, TrieNode};
 
 use super::engine::*;
 
-pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
+pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
     // Leading `!` is a hands-off marker (see `starts_with_bang`). Produce no
     // completions so the shell's native completion (or history expansion)
     // gets a clean look.
     if starts_with_bang(input) {
+        return String::new();
+    }
+
+    // Redirection context: complete the last word as a filesystem path.
+    if context_hint == super::engine::ContextHint::Redirection {
+        let words: Vec<&str> = input.split_whitespace().collect();
+        let prefix = if input.ends_with(' ') || input.ends_with('\t') {
+            ""
+        } else {
+            words.last().copied().unwrap_or("")
+        };
+        return complete_filesystem(prefix, false);
+    }
+
+    // math / condition: no completions.
+    if matches!(context_hint, super::engine::ContextHint::Math | super::engine::ContextHint::Condition) {
         return String::new();
     }
 

@@ -15,16 +15,58 @@ use super::escape::{escape_resolved_path, shell_escape_path};
 
 use std::sync::atomic::AtomicBool;
 
+use std::cell::RefCell;
+
 /// Global toggle for the statistical tiebreaker. Set once at CLI startup
 /// from `user_config.disable_statistics`.  When true, `score_candidates_stats`
 /// short-circuits to `None` so the engine never picks between tied
 /// candidates based on local history.
 pub(super) static STATS_DISABLED: AtomicBool = AtomicBool::new(false);
 
+// Thread-local storage for context signals that flow into score_node
+// without requiring a signature change on every internal helper.
+// CWD_CONTEXT: current working directory for the resolve call, used by
+// score_node as a cwd-locality multiplier.
+thread_local! {
+    static CWD_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// Enable or disable the statistical tiebreaker at runtime. Called from
 /// `main.rs` after reading `UserConfig`.
 pub fn set_statistics_disabled(b: bool) {
     STATS_DISABLED.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shell context hint inferred from the buffer by the plugin.
+///
+/// `Unknown` and `Argument` are the default / do-nothing cases.
+/// `Redirection` short-circuits arg resolution to path mode.
+/// `Math` and `Condition` suppress resolution entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextHint {
+    Unknown,
+    Command,
+    Argument,
+    Redirection,
+    Math,
+    Condition,
+    Array,
+}
+
+impl ContextHint {
+    /// Parse a string value (from `--context` CLI flag). Unrecognised
+    /// values map to `Unknown` so forward-compatibility is preserved.
+    pub fn parse_hint(s: &str) -> Self {
+        match s {
+            "command" => Self::Command,
+            "argument" => Self::Argument,
+            "redirection" => Self::Redirection,
+            "math" => Self::Math,
+            "condition" => Self::Condition,
+            "array" => Self::Array,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -76,11 +118,23 @@ pub(super) fn starts_with_bang(input: &str) -> bool {
     input.trim_start().starts_with('!')
 }
 
-pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
+pub fn resolve_line(
+    input: &str,
+    trie: &CommandTrie,
+    pins: &Pins,
+    cwd: Option<&str>,
+    context_hint: ContextHint,
+) -> ResolveResult {
     // Leading `!`: the user wants zsh's history-expansion / literal-run
     // semantics. Never touch the buffer — return it verbatim so the shell
     // runs exactly what was typed.
     if starts_with_bang(input) {
+        return ResolveResult::Passthrough(input.to_string());
+    }
+
+    // math / condition: the user is inside arithmetic or test expression;
+    // never mangle the buffer.
+    if matches!(context_hint, ContextHint::Math | ContextHint::Condition) {
         return ResolveResult::Passthrough(input.to_string());
     }
 
@@ -89,7 +143,7 @@ pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResu
     // Fast path: no operators → resolve as a single command.
     let has_op = parts.iter().any(|p| matches!(p, LinePart::Operator(_)));
     if !has_op {
-        return resolve(input, trie, pins);
+        return resolve_with_ctx(input, trie, pins, cwd, context_hint);
     }
 
     let mut resolved: Vec<String> = Vec::new();
@@ -109,7 +163,7 @@ pub fn resolve_line(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResu
                     continue;
                 }
 
-                match resolve(trimmed, trie, pins) {
+                match resolve_with_ctx(trimmed, trie, pins, cwd, context_hint) {
                     ResolveResult::Resolved(r) => {
                         word_offset += r.split_whitespace().count();
                         resolved.push(r);
@@ -340,6 +394,70 @@ pub(super) fn split_words_quoted(input: &str) -> (Vec<&str>, Vec<bool>) {
     }
 
     (words, quoted)
+}
+
+/// Resolve a single segment with optional cwd and context hint applied.
+fn resolve_with_ctx(
+    input: &str,
+    trie: &CommandTrie,
+    pins: &Pins,
+    cwd: Option<&str>,
+    context_hint: ContextHint,
+) -> ResolveResult {
+    // Redirection context: treat the last word as a file path and skip
+    // command-semantics resolution entirely.
+    if context_hint == ContextHint::Redirection {
+        let words: Vec<&str> = input.split_whitespace().collect();
+        if let Some(last) = words.last() {
+            // If it looks like a path abbreviation try to resolve it; otherwise
+            // pass through verbatim so the shell handles it.
+            match path_resolve::resolve_path(last, &trie.named_dirs) {
+                path_resolve::PathResult::Resolved(resolved) => {
+                    let mut parts: Vec<String> =
+                        words[..words.len() - 1].iter().map(|s| s.to_string()).collect();
+                    parts.push(shell_escape_path(&resolved));
+                    let result = parts.join(" ");
+                    return if result == input {
+                        ResolveResult::Passthrough(input.to_string())
+                    } else {
+                        ResolveResult::Resolved(result)
+                    };
+                }
+                path_resolve::PathResult::Ambiguous(candidates) => {
+                    let prefix: Vec<String> =
+                        words[..words.len() - 1].iter().map(|s| s.to_string()).collect();
+                    let full_cmds: Vec<String> = candidates
+                        .into_iter()
+                        .map(|c| {
+                            let mut parts = prefix.clone();
+                            parts.push(shell_escape_path(&c));
+                            parts.join(" ")
+                        })
+                        .collect();
+                    return ResolveResult::PathAmbiguous(full_cmds);
+                }
+                path_resolve::PathResult::Unchanged => {}
+            }
+        }
+        return ResolveResult::Passthrough(input.to_string());
+    }
+
+    resolve_with_cwd(input, trie, pins, cwd)
+}
+
+/// Resolve a single command segment, threading `cwd` into the scorer.
+fn resolve_with_cwd(input: &str, trie: &CommandTrie, pins: &Pins, cwd: Option<&str>) -> ResolveResult {
+    // We cannot pass cwd directly into resolve_from_node without a large
+    // refactor; instead we store it in a thread-local so score_node can
+    // read it during the tiebreak.
+    CWD_CONTEXT.with(|c| {
+        *c.borrow_mut() = cwd.map(|s| s.to_string());
+    });
+    let result = resolve(input, trie, pins);
+    CWD_CONTEXT.with(|c| {
+        *c.borrow_mut() = None;
+    });
+    result
 }
 
 /// Resolve a single command segment (no pipes/chains) against the trie and pins.
@@ -1026,9 +1144,17 @@ pub(super) fn score_candidates_stats<'a>(
         return candidates.first().copied();
     }
 
+    // last-cmd sibling boost: if the env var names the same command as one of
+    // the candidates, that candidate gets a 1.3× tiebreaker nudge.
+    let last_cmd = last_cmd_env();
+
     let mut scored: Vec<(f32, (&'a str, &'a TrieNode))> = candidates
         .iter()
-        .map(|&(name, node)| (score_node(node, now), (name, node)))
+        .map(|&(name, node)| {
+            let base = score_node(node, now);
+            let last_boost = if last_cmd.as_deref() == Some(name) { 1.3 } else { 1.0 };
+            (base * last_boost, (name, node))
+        })
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1065,7 +1191,22 @@ fn score_node(node: &TrieNode, now: u64) -> f32 {
     // Success rate: default to 1.0 when we have no failure signal yet.
     let success = node.success_rate().unwrap_or(1.0);
 
-    freq * recency * success
+    // cwd multiplier: up to 1.5× boost for commands used in this directory.
+    let cwd_mul = CWD_CONTEXT.with(|c| {
+        if let Some(cwd) = c.borrow().as_deref() {
+            1.0 + 0.5 * node.cwd_score(cwd)
+        } else {
+            1.0
+        }
+    });
+
+    freq * recency * success * cwd_mul
+}
+
+/// Read `ZSH_IOS_LAST_CMD` env var. Returns `None` if the var is unset or empty.
+fn last_cmd_env() -> Option<String> {
+    let val = std::env::var("ZSH_IOS_LAST_CMD").ok()?;
+    if val.is_empty() { None } else { Some(val) }
 }
 
 /// Helper: current unix timestamp.  Called from resolve sites.
@@ -1687,7 +1828,7 @@ fn narrate_inner_ambiguity(
 /// wrapper detection, trie prefix search, deep disambiguation, arg-spec
 /// lookup) and then reports the actual `resolve_line` result so any
 /// discrepancy between the walk and the real engine is visible.
-pub fn explain(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
+pub fn explain(input: &str, trie: &CommandTrie, pins: &Pins, cwd: Option<&str>) -> String {
     let mut out = Vec::<String>::new();
     let push = |out: &mut Vec<String>, depth: usize, s: String| {
         out.push(format!("{}{}", "  ".repeat(depth), s));
@@ -1747,7 +1888,7 @@ pub fn explain(input: &str, trie: &CommandTrie, pins: &Pins) -> String {
 
     // 4. Real result
     push(&mut out, 0, String::new());
-    match resolve_line(input, trie, pins) {
+    match resolve_line(input, trie, pins, cwd, ContextHint::Unknown) {
         ResolveResult::Resolved(s) => {
             push(&mut out, 0, format!("Final: Resolved → {}", s));
         }
@@ -2422,7 +2563,7 @@ mod tests {
         let pins = Pins::default();
 
         // Both sides of a pipe should resolve
-        match resolve_line("gi push | gr -r pattern", &trie, &pins) {
+        match resolve_line("gi push | gr -r pattern", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "git push | grep -r pattern"),
             other => panic!("Expected Resolved, got {:?}", other),
         }
@@ -2433,7 +2574,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
 
-        match resolve_line("ter init && ter ap", &trie, &pins) {
+        match resolve_line("ter init && ter ap", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform init && terraform apply"),
             other => panic!("Expected Resolved, got {:?}", other),
         }
@@ -2449,7 +2590,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
 
-        match resolve_line("ter init; ter pl", &trie, &pins) {
+        match resolve_line("ter init; ter pl", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform init ; terraform plan"),
             other => panic!("Expected Resolved, got {:?}", other),
         }
@@ -2465,7 +2606,7 @@ mod tests {
         let pins = Pins::default();
 
         // First segment resolves; second is ambiguous (bare "g")
-        match resolve_line("ter ap | g", &trie, &pins) {
+        match resolve_line("ter ap | g", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Ambiguous(info) => {
                 assert_eq!(info.word, "g");
                 // Position should be offset by first segment (2 words) + operator (1)
@@ -2816,7 +2957,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
 
-        match resolve_line("sudo ter in && sudo ter ap", &trie, &pins) {
+        match resolve_line("sudo ter in && sudo ter ap", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => {
                 assert_eq!(s, "sudo terraform init && sudo terraform apply");
             }
@@ -3213,7 +3354,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
         // "ter ap &&" has an empty segment after &&
-        match resolve_line("ter ap && ", &trie, &pins) {
+        match resolve_line("ter ap && ", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "terraform apply && "),
             other => panic!("Expected Resolved, got {:?}", other),
         }
@@ -3228,7 +3369,7 @@ mod tests {
 
         let trie = build_test_trie();
         let pins = Pins::default();
-        match resolve_line("ter in || ter ap", &trie, &pins) {
+        match resolve_line("ter in || ter ap", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => {
                 assert_eq!(s, "terraform init || terraform apply");
             }
@@ -3343,7 +3484,7 @@ mod tests {
             trie.insert(&["common"]);
         }
         let pins = Pins::default();
-        let out = complete("", &trie, &pins);
+        let out = complete("", &trie, &pins, ContextHint::Unknown);
         // common should appear before rare because its count is higher.
         let c = out.find("common").expect("common in output");
         let r = out.find("rare").expect("rare in output");
@@ -3354,7 +3495,7 @@ mod tests {
     fn complete_no_matches_message() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        let out = complete("xq", &trie, &pins);
+        let out = complete("xq", &trie, &pins, ContextHint::Unknown);
         assert!(out.contains("No commands matching"), "got: {}", out);
     }
 
@@ -3362,7 +3503,7 @@ mod tests {
     fn complete_prefix_lists_candidates() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        let out = complete("g", &trie, &pins);
+        let out = complete("g", &trie, &pins, ContextHint::Unknown);
         // All g-prefixed commands appear.
         assert!(out.contains("git"));
         assert!(out.contains("grep"));
@@ -3377,7 +3518,7 @@ mod tests {
         // "g c " with trailing space means: "completed: g c; completing: <empty>".
         // But mid-walk "c" under git is ambiguous between checkout/commit, so
         // the code emits those matches directly.
-        let out = complete("git c", &trie, &pins);
+        let out = complete("git c", &trie, &pins, ContextHint::Unknown);
         assert!(out.contains("checkout"), "got: {}", out);
         assert!(out.contains("commit"), "got: {}", out);
     }
@@ -3387,7 +3528,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
         // "git " with trailing space → list all git subcommands.
-        let out = complete("git ", &trie, &pins);
+        let out = complete("git ", &trie, &pins, ContextHint::Unknown);
         assert!(out.contains("checkout"));
         assert!(out.contains("commit"));
         assert!(out.contains("push"));
@@ -3398,7 +3539,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
         // Before the pipe is "ls"-like junk, after the pipe is what gets completed.
-        let out = complete("xx | g", &trie, &pins);
+        let out = complete("xx | g", &trie, &pins, ContextHint::Unknown);
         assert!(out.contains("git") || out.contains("grep"), "got: {}", out);
     }
 
@@ -3408,7 +3549,7 @@ mod tests {
         let pins = Pins::default();
         // "git -" triggers the complete_flags branch. Our test trie has
         // -m under git commit, so we expect some flag output.
-        let out = complete("git commit -", &trie, &pins);
+        let out = complete("git commit -", &trie, &pins, ContextHint::Unknown);
         assert!(out.contains("-m"), "flag output missing: {}", out);
     }
 
@@ -3538,12 +3679,12 @@ mod tests {
     fn resolve_line_empty_and_operator_only() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        match resolve_line("", &trie, &pins) {
+        match resolve_line("", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Passthrough(s) => assert_eq!(s, ""),
             other => panic!("empty → Passthrough, got {:?}", other),
         }
         // Operator at the start: shouldn't panic.
-        let _ = resolve_line("| git st", &trie, &pins);
+        let _ = resolve_line("| git st", &trie, &pins, None, ContextHint::Unknown);
     }
 
     // --- Ambiguity info shape ---
@@ -3618,7 +3759,7 @@ mod tests {
         // Even though "gi" alone is ambiguous/resolvable, `!gi st` must be
         // returned untouched.
         for input in ["!!", "!git", "!gi st", "!$", "!echo hi", "!?foo"] {
-            match resolve_line(input, &trie, &pins) {
+            match resolve_line(input, &trie, &pins, None, ContextHint::Unknown) {
                 ResolveResult::Passthrough(s) => assert_eq!(s, input, "bang bypass failed"),
                 other => panic!("expected Passthrough for {:?}, got {:?}", input, other),
             }
@@ -3630,7 +3771,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
         let input = "   !git status";
-        match resolve_line(input, &trie, &pins) {
+        match resolve_line(input, &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Passthrough(s) => assert_eq!(s, input),
             other => panic!("expected Passthrough, got {:?}", other),
         }
@@ -3646,7 +3787,7 @@ mod tests {
         // `echo !foo` starts with `echo`, not `!` — normal path.
         // We just verify it's not a no-op Passthrough-of-unchanged-input
         // caused by the bang guard firing on a non-leading `!`.
-        match resolve_line("echo !foo", &trie, &pins) {
+        match resolve_line("echo !foo", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Passthrough(_) | ResolveResult::Resolved(_) => {}
             other => panic!("unexpected {:?}", other),
         }
@@ -3656,9 +3797,9 @@ mod tests {
     fn complete_bang_returns_empty() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        assert!(complete("!g", &trie, &pins).is_empty());
-        assert!(complete("!!", &trie, &pins).is_empty());
-        assert!(complete("  !git ", &trie, &pins).is_empty());
+        assert!(complete("!g", &trie, &pins, ContextHint::Unknown).is_empty());
+        assert!(complete("!!", &trie, &pins, ContextHint::Unknown).is_empty());
+        assert!(complete("  !git ", &trie, &pins, ContextHint::Unknown).is_empty());
     }
 
     #[test]
@@ -3666,7 +3807,7 @@ mod tests {
         let trie = build_test_trie();
         let pins = Pins::default();
         // `echo !foo` doesn't start with `!` → normal completion runs.
-        let out = complete("ech", &trie, &pins);
+        let out = complete("ech", &trie, &pins, ContextHint::Unknown);
         assert!(!out.is_empty());
     }
 
@@ -3688,7 +3829,7 @@ mod tests {
     fn explain_bang_reports_bypass() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        let out = explain("!!", &trie, &pins);
+        let out = explain("!!", &trie, &pins, None);
         assert!(out.contains("Leading-! bypass"), "got: {}", out);
         assert!(out.contains("Passthrough"));
     }
@@ -3699,7 +3840,7 @@ mod tests {
         let pins = Pins::default();
         // "ter ap" resolves uniquely via terraform apply. Narrative should
         // include the unique-match line and the final Resolved.
-        let out = explain("ter ap", &trie, &pins);
+        let out = explain("ter ap", &trie, &pins, None);
         assert!(out.contains("\"ter\""), "got: {}", out);
         assert!(out.contains("Trie:"), "got: {}", out);
         assert!(out.contains("Final: Resolved → terraform apply"), "got: {}", out);
@@ -3709,7 +3850,7 @@ mod tests {
     fn explain_ambiguous_shows_candidates_and_lcp() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        let out = explain("g", &trie, &pins);
+        let out = explain("g", &trie, &pins, None);
         assert!(out.contains("Final: Ambiguous"), "got: {}", out);
         assert!(out.contains("candidates"));
         // Test trie has git/grep/go/gzip under "g" prefix
@@ -3722,7 +3863,7 @@ mod tests {
         let pins = Pins::default();
         // "g push" — only git has a `push` subcommand; the explain trace
         // must call out the survivor explicitly.
-        let out = explain("g push", &trie, &pins);
+        let out = explain("g push", &trie, &pins, None);
         assert!(out.contains("Deep-disambiguate"), "got: {}", out);
         assert!(out.contains("winner: git"), "got: {}", out);
         assert!(out.contains("Final: Resolved → git push"));
@@ -3738,7 +3879,7 @@ mod tests {
                 expanded: vec!["kubectl".into()],
             }],
         };
-        let out = explain("k ap", &trie, &pins);
+        let out = explain("k ap", &trie, &pins, None);
         assert!(out.contains("Pin match"), "got: {}", out);
         assert!(out.contains("k") && out.contains("kubectl"));
         assert!(out.contains("Final: Resolved → kubectl apply"));
@@ -3749,7 +3890,7 @@ mod tests {
         let mut trie = build_test_trie();
         trie.insert_command("sudo");
         let pins = Pins::default();
-        let out = explain("sudo ter ap", &trie, &pins);
+        let out = explain("sudo ter ap", &trie, &pins, None);
         assert!(out.contains("Wrapper: sudo"), "got: {}", out);
         assert!(out.contains("Inner: \"ter ap\""));
         // The inner command is still resolved, so the final line reports
@@ -3761,7 +3902,7 @@ mod tests {
     fn explain_pipe_chain_splits_and_narrates_each_segment() {
         let trie = build_test_trie();
         let pins = Pins::default();
-        let out = explain("gi st | gr foo", &trie, &pins);
+        let out = explain("gi st | gr foo", &trie, &pins, None);
         assert!(out.contains("Pipe/chain split"), "got: {}", out);
         assert!(out.contains("Segment 1"));
         assert!(out.contains("Segment 2"));
@@ -3906,7 +4047,7 @@ mod tests {
         // "che" matches checkout, check-ignore — but only check-ignore expects PATHS.
         // "target_file" exists on disk → PATHS evidence → narrows to check-ignore.
         let pins = Pins::default();
-        match resolve_line("gi che target_file", &trie, &pins) {
+        match resolve_line("gi che target_file", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "git check-ignore target_file"),
             ResolveResult::Ambiguous(info) => panic!("still ambiguous: {:?}", info.candidates),
             other => panic!("unexpected: {:?}", other),
@@ -3922,7 +4063,7 @@ mod tests {
         let pins = Pins::default();
         // "totally_not_anything" is not a file, not a branch, not a commit →
         // no arg-type evidence on either side → narrow_by_arg_type returns unchanged.
-        match resolve_line("gi che totally_not_anything", &trie, &pins) {
+        match resolve_line("gi che totally_not_anything", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Ambiguous(info) => {
                 // checkout, check-ignore, cherry, cherry-pick all match "che"
                 assert!(info.candidates.len() >= 2, "expected ≥2 candidates, got {:?}", info.candidates);
@@ -4090,7 +4231,7 @@ mod tests {
         // Use "totally_unknown_arg" so no runtime type resolver can match it,
         // ensuring arg-type narrowing is a no-op and stats decides.
         let pins = Pins::default();
-        match resolve_line("gi che totally_unknown_arg", &trie, &pins) {
+        match resolve_line("gi che totally_unknown_arg", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => {
                 assert!(s.starts_with("git checkout"), "expected checkout, got: {}", s);
             }
@@ -4119,7 +4260,7 @@ mod tests {
         let pins = Pins::default();
         // Both "checkout_tool" and "cherry_app" start with "che". With no
         // subcommand lookahead, stats decides at the first-word level.
-        let out = explain("che totally_unknown_arg", &trie, &pins);
+        let out = explain("che totally_unknown_arg", &trie, &pins, None);
         // The stats narration section must be present.
         assert!(out.contains("stats tiebreak"), "stats tiebreak section missing:\n{}", out);
         // The chosen winner should be checkout_tool.
@@ -4389,7 +4530,7 @@ mod tests {
         );
         // cherry has no flag_args — no positional that matches "-p" either
         let pins = Pins::default();
-        match resolve_line("git ch -p main", &trie, &pins) {
+        match resolve_line("git ch -p main", &trie, &pins, None, ContextHint::Unknown) {
             ResolveResult::Resolved(s) => assert_eq!(s, "git checkout -p main"),
             ResolveResult::Ambiguous(info) => {
                 panic!("still ambiguous: {:?}", info.candidates)
@@ -4409,7 +4550,7 @@ mod tests {
         let mut trie = trie_with_git_subcommands_and_argspecs();
         trie.insert_command("git");
         let pins = Pins::default();
-        let output = explain("gi che totally_not_anything", &trie, &pins);
+        let output = explain("gi che totally_not_anything", &trie, &pins, None);
         assert!(
             output.contains("Inner ambiguity within"),
             "expected 'Inner ambiguity within' in explain output;\ngot:\n{}",
@@ -4452,7 +4593,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let output = explain("gi che -p", &trie, &pins);
+        let output = explain("gi che -p", &trie, &pins, None);
         // Both candidates now have -p, so flag-match reports unanimous / no split.
         assert!(
             output.contains("Inner ambiguity within"),
@@ -4532,5 +4673,100 @@ mod tests {
         let narrowed = narrow_by_flag_match(&candidates, &prefix, &["-f"], &t.arg_specs);
         assert_eq!(narrowed.len(), 1, "should narrow to commit via alias");
         assert_eq!(narrowed[0].0, "commit");
+    }
+
+    // --- Task 1: cwd scoring in stats tiebreaker ---
+
+    #[test]
+    fn score_stats_boosts_same_cwd_sibling() {
+        use crate::test_util::CWD_LOCK;
+        let _lock = CWD_LOCK.lock().unwrap();
+
+        let mut t = CommandTrie::new();
+        t.root.insert_with_time(&["git"], 1000);
+        t.root.insert_with_time(&["gitlab"], 1000);
+
+        if let Some(n) = t.root.children.get_mut("git") {
+            for _ in 0..5 {
+                n.record_cwd("/home/user/proj");
+            }
+        }
+        if let Some(n) = t.root.children.get_mut("gitlab") {
+            for _ in 0..5 {
+                n.record_cwd("/tmp");
+            }
+        }
+
+        CWD_CONTEXT.with(|c| *c.borrow_mut() = Some("/home/user/proj".to_string()));
+        let git_n = t.root.get_child("git").unwrap();
+        let gitlab_n = t.root.get_child("gitlab").unwrap();
+        let git_score = score_node(git_n, 1001);
+        let gitlab_score = score_node(gitlab_n, 1001);
+        CWD_CONTEXT.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            git_score > gitlab_score,
+            "git ({}) should outscore gitlab ({}) in cwd=/home/user/proj",
+            git_score,
+            gitlab_score
+        );
+    }
+
+    // --- Task 2: ZSH_IOS_LAST_CMD env boost ---
+
+    #[test]
+    fn score_stats_last_cmd_env_boost() {
+        use crate::test_util::CWD_LOCK;
+        let _lock = CWD_LOCK.lock().unwrap();
+
+        let mut t = CommandTrie::new();
+        t.root.insert_with_time(&["git"], 1000);
+        t.root.insert_with_time(&["gitlab"], 1000);
+        // Also give them subcommand "push" so "g push" can deep-disambiguate
+        t.root.insert_with_time(&["git", "push"], 1000);
+        t.root.insert_with_time(&["gitlab", "push"], 1000);
+
+        // SAFETY: test holds CWD_LOCK so no other test mutates env concurrently.
+        unsafe { std::env::set_var("ZSH_IOS_LAST_CMD", "git") };
+        let pins = Pins::default();
+        let result = resolve_line("g push", &t, &pins, None, ContextHint::Unknown);
+        unsafe { std::env::remove_var("ZSH_IOS_LAST_CMD") };
+
+        match result {
+            ResolveResult::Resolved(s) => {
+                assert!(
+                    s.starts_with("git"),
+                    "expected git to win with LAST_CMD=git, got: {}",
+                    s
+                );
+            }
+            ResolveResult::Ambiguous(_) => {}
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    // --- Task 3: context hint redirection ---
+
+    #[test]
+    fn resolve_line_redirection_context_treats_last_word_as_path() {
+        use crate::test_util::CWD_LOCK;
+        use std::fs;
+        let _lock = CWD_LOCK.lock().unwrap();
+
+        let td = tempfile::tempdir().unwrap();
+        let _f = fs::write(td.path().join("output.log"), b"");
+
+        let t = CommandTrie::new();
+        let pins = Pins::default();
+        let input = format!("echo hello > {}", td.path().join("out").display());
+        let result = resolve_line(&input, &t, &pins, None, ContextHint::Redirection);
+        match result {
+            ResolveResult::Resolved(_)
+            | ResolveResult::Passthrough(_)
+            | ResolveResult::PathAmbiguous(_) => {}
+            ResolveResult::Ambiguous(info) => {
+                panic!("unexpected Ambiguous in redirection context: {:?}", info.word);
+            }
+        }
     }
 }

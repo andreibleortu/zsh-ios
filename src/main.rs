@@ -24,12 +24,18 @@ enum Commands {
     },
     /// Resolve an abbreviated command line
     Resolve {
+        /// Shell context hint inferred from the buffer (redirection, math, condition, …)
+        #[arg(long = "context")]
+        context: Option<String>,
         /// The abbreviated command line to resolve
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         line: Vec<String>,
     },
     /// Show completions for a prefix (used by ? key)
     Complete {
+        /// Shell context hint inferred from the buffer (redirection, math, condition, …)
+        #[arg(long = "context")]
+        context: Option<String>,
         /// The prefix to complete
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         line: Vec<String>,
@@ -39,6 +45,9 @@ enum Commands {
         /// Exit code of the command (0 = success, non-zero = failure)
         #[arg(long = "exit-code", default_value_t = 0)]
         exit_code: i32,
+        /// Working directory where the command ran
+        #[arg(long = "cwd")]
+        cwd: Option<String>,
         /// The full command that was executed
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -79,9 +88,9 @@ fn main() {
 
     match cli.command {
         Commands::Build { aliases_stdin } => cmd_build(aliases_stdin),
-        Commands::Resolve { line } => cmd_resolve(&line.join(" ")),
-        Commands::Complete { line } => cmd_complete(&line.join(" ")),
-        Commands::Learn { exit_code, command } => cmd_learn(&command.join(" "), exit_code),
+        Commands::Resolve { context, line } => cmd_resolve(&line.join(" "), context.as_deref()),
+        Commands::Complete { context, line } => cmd_complete(&line.join(" "), context.as_deref()),
+        Commands::Learn { exit_code, cwd, command } => cmd_learn(&command.join(" "), exit_code, cwd.as_deref()),
         Commands::Pin { abbrev, expanded } => cmd_pin(&abbrev, &expanded),
         Commands::Unpin { abbrev } => cmd_unpin(&abbrev),
         Commands::Pins => cmd_list_pins(),
@@ -232,7 +241,7 @@ fn import_shell_functions(trie: &mut trie::CommandTrie) -> u32 {
     n
 }
 
-fn cmd_resolve(line: &str) {
+fn cmd_resolve(line: &str, context: Option<&str>) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
@@ -246,7 +255,11 @@ fn cmd_resolve(line: &str) {
         process::exit(2);
     }
 
-    match resolve::resolve_line(line, &trie, &pin_store) {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok());
+    let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
+    match resolve::resolve_line(line, &trie, &pin_store, cwd.as_deref(), context_hint) {
         resolve::ResolveResult::Resolved(expanded) => {
             // Blocklist post-check: if the resolved command is blocklisted,
             // print the ORIGINAL input (not the expansion) and passthrough.
@@ -325,16 +338,17 @@ fn print_path_ambiguity_shell(candidates: &[String]) {
     println!("_zio_path_candidates=({})", items.join(" "));
 }
 
-fn cmd_complete(line: &str) {
+fn cmd_complete(line: &str, context: Option<&str>) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
-    let output = resolve::complete(line, &trie, &pin_store);
+    let context_hint = resolve::ContextHint::parse_hint(context.unwrap_or(""));
+    let output = resolve::complete(line, &trie, &pin_store, context_hint);
     print!("{}", output);
 }
 
-fn cmd_learn(command: &str, exit_code: i32) {
+fn cmd_learn(command: &str, exit_code: i32, cwd: Option<&str>) {
     if command.trim().is_empty() {
         return;
     }
@@ -363,7 +377,7 @@ fn cmd_learn(command: &str, exit_code: i32) {
     // Only learn when resolution fully succeeds -- ambiguous or passthrough
     // input has nothing valid to teach the trie.
     let pin_store = pins::Pins::load(&config::pins_path());
-    let to_learn = match resolve::resolve_line(command, &trie, &pin_store) {
+    let to_learn = match resolve::resolve_line(command, &trie, &pin_store, None, resolve::ContextHint::Unknown) {
         resolve::ResolveResult::Resolved(r) => r,
         _ => return,
     };
@@ -378,6 +392,18 @@ fn cmd_learn(command: &str, exit_code: i32) {
         if exit_code == 0 {
             if !trie.root.is_prefix_of_existing(words[0]) {
                 trie.root.insert_with_time(&words, now);
+                // Record cwd for each node along the inserted path when cwd is Some.
+                if let Some(cwd_str) = cwd {
+                    let mut node = &mut trie.root;
+                    for word in &words {
+                        if let Some(child) = node.children.get_mut(*word) {
+                            child.record_cwd(cwd_str);
+                            node = child;
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 dirty = true;
             }
         } else {
@@ -614,7 +640,10 @@ fn cmd_explain(line: &str) {
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
-    println!("{}", resolve::explain(line, &trie, &pin_store));
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok());
+    println!("{}", resolve::explain(line, &trie, &pin_store, cwd.as_deref()));
 }
 
 fn load_trie() -> trie::CommandTrie {
