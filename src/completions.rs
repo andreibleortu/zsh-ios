@@ -1033,6 +1033,30 @@ fn completion_dirs() -> Vec<String> {
         }
     }
 
+    // excluded_fpath_dirs: remove entries that match any configured prefix.
+    let excluded = crate::runtime_config::get().excluded_fpath_dirs;
+    if !excluded.is_empty() {
+        let home_str = dirs::home_dir()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Expand `~` to the home directory for each exclusion entry.
+        let expanded_excluded: Vec<String> = excluded
+            .iter()
+            .map(|e| {
+                if let Some(rest) = e.strip_prefix("~/") {
+                    format!("{}/{}", home_str, rest)
+                } else if e == "~" {
+                    home_str.clone()
+                } else {
+                    e.clone()
+                }
+            })
+            .collect();
+        dirs.retain(|d| {
+            !expanded_excluded.iter().any(|ex| d.starts_with(ex.as_str()))
+        });
+    }
+
     dirs
 }
 
@@ -6342,5 +6366,36 @@ _description files expl 'file'
         assert_eq!(groups[0].items, vec!["start", "stop"]);
         assert_eq!(groups[1].tag, "files");
         assert!(groups[1].items.is_empty());
+    }
+
+    #[test]
+    fn excluded_fpath_dirs_filters_completion_dirs() {
+        // Set up: first grab the full dir list.
+        let baseline = completion_dirs();
+
+        if baseline.is_empty() {
+            // No completion dirs on this system; nothing to filter.
+            return;
+        }
+
+        // Pick the first entry as the thing to exclude.
+        let to_exclude = baseline[0].clone();
+
+        crate::runtime_config::set(crate::runtime_config::RuntimeConfig {
+            excluded_fpath_dirs: vec![to_exclude.clone()],
+            ..crate::runtime_config::RuntimeConfig::default()
+        });
+
+        let filtered = completion_dirs();
+
+        // The excluded directory must not appear in the result.
+        assert!(
+            !filtered.contains(&to_exclude),
+            "excluded dir {:?} should not appear in completion_dirs output",
+            to_exclude
+        );
+
+        // Restore
+        crate::runtime_config::set(crate::runtime_config::RuntimeConfig::default());
     }
 }

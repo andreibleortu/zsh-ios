@@ -12,6 +12,12 @@ use crate::trie::{self, CommandTrie, TrieNode};
 
 use super::engine::*;
 
+/// Return the configured picker-header prefix (default `%`).
+#[inline]
+fn hdr() -> String {
+    crate::runtime_config::get().picker_header_prefix
+}
+
 /// Uppercase the first character of a string, leave the rest unchanged.
 fn titlecase(s: &str) -> String {
     let mut chars = s.chars();
@@ -171,7 +177,7 @@ fn complete_parameter_name(input: &str, trie: &CommandTrie) -> String {
         return String::new();
     }
 
-    let mut output = String::from("% Expects: <$parameter>\n");
+    let mut output = format!("{} Expects: <$parameter>\n", hdr());
     let refs: Vec<&str> = hits.iter().map(String::as_str).collect();
     output.push_str(&format_columns(&refs, 80));
     output
@@ -189,7 +195,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         let mut entries: Vec<(&str, &TrieNode)> = trie.root.prefix_search("");
         entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
         let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
-        output.push_str("% Possible commands:\n");
+        output.push_str(&format!("{} Possible commands:\n", hdr()));
         output.push_str(&format_columns(&names, 80));
         return output;
     }
@@ -210,11 +216,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     if completed_words.is_empty() {
         let mut matches = trie.root.matcher_aware_search(prefix, &trie.matcher_rules);
         if matches.is_empty() {
-            output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
+            output.push_str(&format!("{} No commands matching \"{}\"\n", hdr(), prefix));
         } else {
             matches.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
             let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
-            output.push_str("% Possible commands:\n");
+            output.push_str(&format!("{} Possible commands:\n", hdr()));
             output.push_str(&format_columns(&names, 80));
         }
         return output;
@@ -272,7 +278,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             _ => {
                 // Intermediate word is ambiguous — show its completions
                 let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
-                output.push_str("% Possible completions:\n");
+                output.push_str(&format!("{} Possible completions:\n", hdr()));
                 output.push_str(&format_columns(&names, 80));
                 return output;
             }
@@ -309,7 +315,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             .map(|p| format!("${p}"))
             .collect();
         if !hits.is_empty() {
-            output.push_str("% Expects: <$parameter>\n");
+            output.push_str(&format!("{} Expects: <$parameter>\n", hdr()));
             let refs: Vec<&str> = hits.iter().map(String::as_str).collect();
             output.push_str(&format_columns(&refs, 80));
             return output;
@@ -345,7 +351,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && prev.starts_with('-')
         && let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prev))
     {
-        output.push_str("% Expects: <value>\n");
+        output.push_str(&format!("{} Expects: <value>\n", hdr()));
         let filtered: Vec<&str> = items
             .iter()
             .filter(|i| prefix.is_empty() || i.starts_with(prefix))
@@ -386,7 +392,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             .map(String::as_str)
             .collect();
         if !filtered.is_empty() {
-            output.push_str("% Expects: <value>\n");
+            output.push_str(&format!("{} Expects: <value>\n", hdr()));
             output.push_str(&format_columns(&filtered, 80));
             return output;
         }
@@ -407,9 +413,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // --- Tag-group display ---
     // When the trie has tag_groups for the resolved command path, prefer
     // a grouped display over the flat subcommand list.  Fall through to the
-    // flat path if every group filtered to zero items.
+    // flat path if every group filtered to zero items, or when tag_grouping
+    // is disabled in the runtime config.
     let cmd_key = resolved_words.join(" ");
-    if let Some(groups) = trie.tag_groups.get(&cmd_key)
+    if crate::runtime_config::get().tag_grouping
+        && let Some(groups) = trie.tag_groups.get(&cmd_key)
         && !groups.is_empty()
         && !prefix.starts_with('-')
     {
@@ -523,7 +531,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             // Try to show descriptions for subcommands (Cisco IOS style)
             let descs = trie.descriptions.get(&cmd_key);
 
-            output.push_str("% Possible subcommands:\n");
+            output.push_str(&format!("{} Possible subcommands:\n", hdr()));
             if descs.is_some_and(|d| !d.is_empty()) && sorted.len() <= 40 {
                 let descs = descs.unwrap();
                 let col_width = sorted.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 2;
@@ -542,9 +550,9 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
 
         if !flag_matches.is_empty() {
             if subcmds.is_empty() {
-                output.push_str("% Possible flags:\n");
+                output.push_str(&format!("{} Possible flags:\n", hdr()));
             } else {
-                output.push_str("% Flags:\n");
+                output.push_str(&format!("{} Flags:\n", hdr()));
             }
             output.push_str(&format_flags_from_trie(&flag_matches, spec));
         }
@@ -572,8 +580,12 @@ fn apply_format(raw_format: &str, description: &str) -> String {
 }
 
 /// Apply ANSI cyan color to items that look like directories (end with `/`).
-/// Used when `list-colors` is set and stdout is a TTY.
+/// Used when `list-colors` is set and stdout is a TTY. Suppressed when
+/// `disable_list_colors` is true in the runtime config.
 fn colorize_item(item: &str) -> String {
+    if crate::runtime_config::get().disable_list_colors {
+        return item.to_string();
+    }
     if item.ends_with('/') {
         format!("\x1b[36m{item}\x1b[0m")
     } else {
@@ -702,7 +714,7 @@ pub(super) fn complete_flags(
     }
 
     // Multiple flag matches
-    output.push_str("% Possible flags:\n");
+    output.push_str(&format!("{} Possible flags:\n", hdr()));
 
     // Multiple matches or partial: show flag names with their expected arg type
     let col_width = known_flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0) + 2;
@@ -809,8 +821,10 @@ unsafe fn libc_ioctl(fd: i32, request: u64, arg: *mut u8) -> i32 {
     unsafe { ioctl(fd, request, arg) }
 }
 
-/// Format a list of names into columns, capped at `max_items`.
-/// Uses terminal width from COLUMNS env (default 80). Short lists use a single column.
+/// Format a list of names into columns, capped at `max_items` (or the
+/// configured `max_completions_shown` when `max_items` is 200 — the old
+/// hardcoded value — so call sites that pass 200 automatically pick up the
+/// config knob without a signature change).
 pub(super) fn format_columns(names: &[&str], max_items: usize) -> String {
     if names.is_empty() {
         return String::new();
@@ -818,8 +832,16 @@ pub(super) fn format_columns(names: &[&str], max_items: usize) -> String {
 
     let term_width = terminal_width();
 
+    // Use the runtime-configured cap when the caller passed the legacy
+    // sentinel value of 200.
+    let effective_max = if max_items == 200 {
+        crate::runtime_config::get().max_completions_shown as usize
+    } else {
+        max_items
+    };
+
     let total = names.len();
-    let visible_count = total.min(max_items);
+    let visible_count = total.min(effective_max);
     let shown = &names[..visible_count];
 
     // Single-column for small lists (≤ 12 items)
@@ -828,8 +850,8 @@ pub(super) fn format_columns(names: &[&str], max_items: usize) -> String {
         for name in shown {
             out.push_str(&format!("  {}\n", name));
         }
-        if total > max_items {
-            out.push_str(&format!("  ... and {} more\n", total - max_items));
+        if total > effective_max {
+            out.push_str(&format!("  ... and {} more\n", total - effective_max));
         }
         return out;
     }
@@ -861,8 +883,8 @@ pub(super) fn format_columns(names: &[&str], max_items: usize) -> String {
         out.push('\n');
     }
 
-    if total > max_items {
-        out.push_str(&format!("  ... and {} more\n", total - max_items));
+    if total > effective_max {
+        out.push_str(&format!("  ... and {} more\n", total - effective_max));
     }
 
     out
@@ -898,7 +920,7 @@ pub(super) fn show_type_completions(
                 let hosts = runtime_complete::list_matches(trie::ARG_MODE_HOSTS, host_prefix);
                 let with_user: Vec<String> =
                     hosts.iter().map(|h| format!("{user_prefix}{h}")).collect();
-                output.push_str("% Expects: <user@host>\n");
+                output.push_str(&format!("{} Expects: <user@host>\n", hdr()));
                 if with_user.is_empty() {
                     if !host_prefix.is_empty() {
                         output.push_str(&format!("% No matches for \"{host_prefix}\"\n"));
@@ -937,7 +959,7 @@ pub(super) fn show_type_completions(
                 }
             }
             if prefix.is_empty() {
-                output.push_str("% <enter argument>\n");
+                output.push_str(&format!("{} <enter argument>\n", hdr()));
             } else {
                 output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
             }
@@ -1024,7 +1046,7 @@ pub(super) fn complete_filesystem(word: &str, dirs_only: bool) -> String {
     if filtered.is_empty() {
         output.push_str(&format!("% No matches for \"{}\"\n", word));
     } else {
-        output.push_str("% Possible completions:\n");
+        output.push_str(&format!("{} Possible completions:\n", hdr()));
         // Append directory marker and use multi-column display
         let display_names: Vec<String> = filtered
             .iter()

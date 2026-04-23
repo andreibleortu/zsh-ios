@@ -23,6 +23,7 @@ pub mod regex_args;
 pub mod resolve;
 pub mod runtime_cache;
 pub mod runtime_complete;
+pub mod runtime_config;
 pub mod scanner;
 pub mod trie;
 pub mod type_resolver;

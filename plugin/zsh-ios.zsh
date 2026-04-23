@@ -65,6 +65,15 @@ _zsh_ios_build_if_stale() {
     [[ -z "$tree_file" ]] && return
     [[ "$threshold" =~ '^[0-9]+$' ]] || threshold=3600
 
+    # Parse new config-driven status lines.
+    local worker_disabled picker_prefix worker_timeout
+    worker_disabled=$(print -r -- "$status_out" | grep 'Worker:' | grep -q 'disabled' && echo 1 || echo 0)
+    picker_prefix=$(print -r -- "$status_out" | grep 'Picker prefix:' | sed -E 's/.*Picker prefix:[[:space:]]+(.*)/\1/')
+    worker_timeout=$(print -r -- "$status_out" | grep 'Worker timeout:' | sed -E 's/.*Worker timeout:[[:space:]]+([0-9]+)ms.*/\1/')
+    export _zsh_ios_worker_disabled="$worker_disabled"
+    [[ -n "$picker_prefix" ]] && typeset -g _zsh_ios_picker_prefix="$picker_prefix"
+    [[ "$worker_timeout" =~ '^[0-9]+$' ]] && ZSH_IOS_WORKER_TIMEOUT_MS="$worker_timeout"
+
     local rebuild=0
     if [[ ! -f "$tree_file" ]]; then
         rebuild=1
@@ -397,7 +406,7 @@ _zsh_ios_tab_preview() {
     fi
 
     if (( ${#_zio_candidates} > 0 )); then
-        local msg="% Ambiguous command: \"$_zio_word\""
+        local msg="${_zsh_ios_picker_prefix:-%} Ambiguous command: \"$_zio_word\""
         local c
         for c in "${_zio_candidates[@]}"; do
             msg+=$'\n'"  $c"
@@ -428,7 +437,7 @@ _zsh_ios_handle_path_ambiguity() {
     zle -I
 
     echo ""
-    echo "% Ambiguous path:"
+    echo "${_zsh_ios_picker_prefix:-%} Ambiguous path:"
     local i=1
     for item in "${_zio_path_candidates[@]}"; do
         echo "  $i) $item"
@@ -490,7 +499,7 @@ _zsh_ios_format_items() {
         (( _col_n++ ))
     done
     [[ -n "$_line" ]] && _col_output+="${_line}"$'\n'
-    _zio_format_result="% Expects: <argument> [${_label}]\n${_col_output}"
+    _zio_format_result="${_zsh_ios_picker_prefix:-%} Expects: <argument> [${_label}]\n${_col_output}"
 }
 
 # --- ZLE Widget: ? key (show completions) ---
@@ -633,7 +642,7 @@ _zsh_ios_help() {
     if [[ -n "$output" ]]; then
         zle -M "$output"
     else
-        zle -M "% No commands found"
+        zle -M "${_zsh_ios_picker_prefix:-%} No commands found"
     fi
 }
 
@@ -700,7 +709,7 @@ _zsh_ios_handle_ambiguity() {
     local abbrev_str="${(j: :)abbrev_words[1,$((_zio_position+1))]}"
 
     echo ""
-    echo "% Ambiguous command: \"$abbrev_str\""
+    echo "${_zsh_ios_picker_prefix:-%} Ambiguous command: \"$abbrev_str\""
     echo "  Pick a number to save as shorthand (Enter to cancel):"
     local i=1
     for item in "${menu_display[@]}"; do
@@ -966,6 +975,8 @@ _zsh_ios_worker_is_ready() {
 }
 
 _zsh_ios_worker_start() {
+    # Respect config-driven disable_worker knob (parsed from `zsh-ios status`).
+    [[ "${_zsh_ios_worker_disabled:-0}" == "1" ]] && return 0
     _zsh_ios_worker_is_ready && return 0
     (( _ZSH_IOS_WORKER_STARTING )) && return 0
     _ZSH_IOS_WORKER_STARTING=1

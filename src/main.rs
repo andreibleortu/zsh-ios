@@ -132,6 +132,9 @@ fn cmd_build(aliases_stdin: bool) {
         process::exit(1);
     });
 
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    runtime_config::set(user_cfg.to_runtime_config());
+
     // Serialize against concurrent `learn` writers.
     let _lock = locks::lock_for(&config::tree_path());
 
@@ -220,6 +223,27 @@ fn cmd_build(aliases_stdin: bool) {
         ct.insert(&["zsh-ios", sub]);
     }
 
+    // 7a. Retention: prune stale nodes (forget_unused_after_days).
+    let rcfg = runtime_config::get();
+    if rcfg.forget_unused_after_days > 0 {
+        let now = current_unix_ts();
+        let cutoff_secs = rcfg.forget_unused_after_days as u64 * 86400;
+        let pruned = prune_stale_nodes(&mut ct.root, now, cutoff_secs);
+        if pruned > 0 {
+            eprintln!("Pruned {} stale trie nodes (unused >{} days, count<3)", pruned, rcfg.forget_unused_after_days);
+        }
+    }
+
+    // 7b. Retention: cap trie size (max_trie_size).
+    if rcfg.max_trie_size > 0 {
+        let total = count_all_nodes(&ct.root);
+        if total > rcfg.max_trie_size as usize {
+            let drop_count = total - rcfg.max_trie_size as usize;
+            let dropped = drop_lowest_nodes(&mut ct.root, drop_count);
+            eprintln!("Capped trie: dropped {} nodes to stay within max_trie_size={}", dropped, rcfg.max_trie_size);
+        }
+    }
+
     // 7. Save trie
     let tree_path = config::tree_path();
     ct.save(&tree_path).unwrap_or_else(|e| {
@@ -234,12 +258,72 @@ fn cmd_build(aliases_stdin: bool) {
     );
 }
 
+/// Recursively prune nodes that haven't been used in `cutoff_secs` and have
+/// a use count < 3. Returns the number of nodes removed.
+fn prune_stale_nodes(node: &mut trie::TrieNode, now: u64, cutoff_secs: u64) -> usize {
+    let mut removed = 0usize;
+    node.children.retain(|_, child| {
+        let age = if child.last_used == 0 {
+            u64::MAX // never used → always old
+        } else {
+            now.saturating_sub(child.last_used)
+        };
+        let stale = age > cutoff_secs && child.count < 3;
+        if stale {
+            removed += 1 + count_all_nodes(child);
+            false
+        } else {
+            removed += prune_stale_nodes(child, now, cutoff_secs);
+            true
+        }
+    });
+    removed
+}
+
+/// Count total nodes (including `node` itself).
+fn count_all_nodes(node: &trie::TrieNode) -> usize {
+    1 + node.children.values().map(count_all_nodes).sum::<usize>()
+}
+
+/// Drop `target` nodes from the trie by removing the least-used / oldest
+/// leaf-level subtrees. Returns the actual number removed.
+fn drop_lowest_nodes(root: &mut trie::TrieNode, target: usize) -> usize {
+    // Collect all (count, last_used, path) for leaves and score them.
+    // We drop the subtree at the lowest-scoring top-level child first.
+    // Simple strategy: sort top-level children by (count asc, last_used asc)
+    // and drop them until we've freed enough nodes.
+    let mut dropped = 0usize;
+    loop {
+        if dropped >= target {
+            break;
+        }
+        // Find the child with the lowest (count, last_used).
+        let worst_key: Option<String> = root
+            .children
+            .iter()
+            .min_by_key(|(_, n)| (n.count, n.last_used))
+            .map(|(k, _)| k.clone());
+        match worst_key {
+            None => break,
+            Some(k) => {
+                let subtree_size = count_all_nodes(root.children.get(&k).unwrap());
+                root.children.remove(&k);
+                dropped += subtree_size;
+            }
+        }
+    }
+    dropped
+}
+
 /// Ask an interactive Zsh to print its function names, one per line, and
 /// insert non-underscore-prefixed ones into the trie as leaf commands.
 ///
 /// Returns the number of functions actually inserted.  Missing zsh,
 /// .zshrc errors, or an empty result all quietly yield 0.
 fn import_shell_functions(trie: &mut trie::CommandTrie) -> u32 {
+    if runtime_config::get().disable_build_time_shell_exec {
+        return 0;
+    }
     let mut cmd = std::process::Command::new("zsh");
     cmd.args(["-ic", "print -l ${(k)functions}"]);
     cmd.stderr(std::process::Stdio::null());
@@ -269,7 +353,9 @@ fn cmd_resolve(line: &str, context: Option<&str>, quote: Option<&str>, param_con
     let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    runtime_config::set(user_cfg.to_runtime_config());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
+    runtime_complete::reset_runtime_call_counter();
     if user_cfg.disable_galiases {
         trie.galiases.clear();
     }
@@ -370,7 +456,9 @@ fn cmd_complete(line: &str, context: Option<&str>, quote: Option<&str>, param_co
     let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    runtime_config::set(user_cfg.to_runtime_config());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
+    runtime_complete::reset_runtime_call_counter();
     if user_cfg.disable_galiases {
         trie.galiases.clear();
     }
@@ -413,6 +501,7 @@ fn cmd_learn(command: &str, exit_code: i32, cwd: Option<&str>) {
     if user_cfg.disable_learning {
         return;
     }
+    runtime_config::set(user_cfg.to_runtime_config());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
 
     if config::ensure_config_dir().is_err() {
@@ -647,6 +736,17 @@ fn cmd_status() {
             "enabled"
         }
     );
+    // Plugin-parseable lines: prefix must be stable so grep in the plugin works.
+    println!(
+        "  Worker:      {}",
+        if user_cfg.disable_worker {
+            "disabled (config)"
+        } else {
+            "enabled"
+        }
+    );
+    println!("  Worker timeout: {}ms", user_cfg.worker_timeout_ms);
+    println!("  Picker prefix: {}", user_cfg.picker_header_prefix);
 
     if tree_path.exists() {
         if let Ok(meta) = std::fs::metadata(&tree_path) {
@@ -747,6 +847,7 @@ fn cmd_explain(line: &str) {
     let mut trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    runtime_config::set(user_cfg.to_runtime_config());
     resolve::set_statistics_disabled(user_cfg.disable_statistics);
     if user_cfg.disable_galiases {
         trie.galiases.clear();

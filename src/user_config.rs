@@ -4,7 +4,9 @@
 //! back to the compiled-in default. Parse failures are surfaced on stderr but
 //! are *never* fatal — an invalid config must not wedge the shell.
 
+use crate::runtime_config::RuntimeConfig;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -12,9 +14,20 @@ use std::path::Path;
 /// this value out of `zsh-ios status` so both sides agree.
 pub const DEFAULT_STALE_THRESHOLD_SECS: u64 = 3600;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+// ── serde default helpers ──────────────────────────────────────────────────
+
+fn default_dominance_margin() -> f32 { 1.05 }
+fn default_min_resolve_prefix_length() -> u32 { 1 }
+fn default_worker_timeout_ms() -> u32 { 500 }
+fn default_max_completions_shown() -> u32 { 200 }
+fn default_tag_grouping() -> bool { true }
+fn default_picker_header_prefix() -> String { "%".into() }
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UserConfig {
+    // ── Existing fields ───────────────────────────────────────────────────────
+
     /// How old (in seconds) `tree.msgpack` must be before the plugin auto-
     /// rebuilds on shell startup. `None` = use the compiled-in default.
     pub stale_threshold_seconds: Option<u64>,
@@ -31,11 +44,8 @@ pub struct UserConfig {
     pub command_blocklist: Vec<String>,
 
     /// When true, the statistical tiebreaker (frequency × recency ×
-    /// success-rate) is skipped — if narrowing by subcommand prefix,
-    /// arg-type, and flag match still leaves >1 candidate, the user sees
-    /// the picker instead of the engine silently picking the historical
-    /// favorite. Users who want reproducible resolution across machines
-    /// and sessions turn this on.
+    /// success-rate) is skipped. Users who want reproducible resolution
+    /// across machines and sessions turn this on.
     pub disable_statistics: bool,
 
     /// When true, global aliases (alias -g) are NOT expanded before
@@ -43,10 +53,127 @@ pub struct UserConfig {
     pub disable_galiases: bool,
 
     /// When true, the build-time harvest of `_regex_arguments` specs via the
-    /// zpty worker is skipped.  Saves a second of shell startup time at the
-    /// cost of less complete arg-spec data for commands like `ip` and
-    /// `iptables` whose completion functions build their spec at runtime.
+    /// zpty worker is skipped.
     pub disable_dynamic_harvest: bool,
+
+    // ── Resolution determinism ────────────────────────────────────────────────
+
+    /// Minimum character length of the first word before resolution is
+    /// attempted. Words shorter than this are passed through unchanged.
+    /// Default: 2.
+    #[serde(default = "default_min_resolve_prefix_length")]
+    pub min_resolve_prefix_length: u32,
+
+    /// When the candidate pool reaches this count, skip the statistical
+    /// tiebreaker and show the picker directly. 0 = disabled (default).
+    pub force_picker_at_candidates: u32,
+
+    /// The winning stats candidate must score at least this multiple above the
+    /// runner-up. Default: 1.05.
+    #[serde(default = "default_dominance_margin")]
+    pub dominance_margin: f32,
+
+    /// When true, the per-directory usage-frequency multiplier is not applied
+    /// during scoring.
+    pub disable_cwd_scoring: bool,
+
+    /// When true, the `ZSH_IOS_LAST_CMD` sibling-context boost is not applied.
+    pub disable_sibling_context: bool,
+
+    /// When true, arg-type narrowing is skipped during disambiguation.
+    pub disable_arg_type_narrowing: bool,
+
+    /// When true, flag-match narrowing is skipped during disambiguation.
+    pub disable_flag_matching: bool,
+
+    // ── Privacy / attack surface ──────────────────────────────────────────────
+
+    /// When true, the ZLE background worker is not started.
+    pub disable_worker: bool,
+
+    /// Runtime resolver ids to disable. Example: `["git-branches", "hosts"]`.
+    pub disable_runtime_resolvers: Vec<String>,
+
+    /// Fpath directories to exclude from `build` scans. Matched as path
+    /// prefixes after `~` expansion.
+    pub excluded_fpath_dirs: Vec<String>,
+
+    /// When true, the `zsh -ic` shell function enumeration step in `build` is
+    /// skipped.
+    pub disable_build_time_shell_exec: bool,
+
+    // ── Performance ───────────────────────────────────────────────────────────
+
+    /// Per-resolver TTL overrides in seconds. Key is `resolver.id()`.
+    pub resolver_ttls: HashMap<String, u64>,
+
+    /// How long (ms) to wait for the ZLE worker. Parsed by plugin from
+    /// `zsh-ios status`. Default: 500.
+    #[serde(default = "default_worker_timeout_ms")]
+    pub worker_timeout_ms: u32,
+
+    /// Max live resolver calls per invocation. 0 = no cap.
+    pub resolve_max_runtime_calls: u32,
+
+    // ── Retention ─────────────────────────────────────────────────────────────
+
+    /// Prune nodes unused for this many days with count < 3 during `build`.
+    /// 0 = disabled.
+    pub forget_unused_after_days: u32,
+
+    /// Cap total trie node count during `build`. 0 = no cap.
+    pub max_trie_size: u32,
+
+    // ── Display ───────────────────────────────────────────────────────────────
+
+    /// Prefix printed before section headers in `?` output and the picker.
+    /// Parsed by plugin from `zsh-ios status`. Default: `%`.
+    #[serde(default = "default_picker_header_prefix")]
+    pub picker_header_prefix: String,
+
+    /// When true, ANSI colour codes are suppressed in `?` output.
+    pub disable_list_colors: bool,
+
+    /// Maximum items shown by `format_columns`. Default: 200.
+    #[serde(default = "default_max_completions_shown")]
+    pub max_completions_shown: u32,
+
+    /// When false, tag-grouped display is never used. Default: true.
+    #[serde(default = "default_tag_grouping")]
+    pub tag_grouping: bool,
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            stale_threshold_seconds: None,
+            disable_learning: false,
+            command_blocklist: Vec::new(),
+            disable_statistics: false,
+            disable_galiases: false,
+            disable_dynamic_harvest: false,
+            min_resolve_prefix_length: 1,
+            force_picker_at_candidates: 0,
+            dominance_margin: default_dominance_margin(),
+            disable_cwd_scoring: false,
+            disable_sibling_context: false,
+            disable_arg_type_narrowing: false,
+            disable_flag_matching: false,
+            disable_worker: false,
+            disable_runtime_resolvers: Vec::new(),
+            excluded_fpath_dirs: Vec::new(),
+            disable_build_time_shell_exec: false,
+            resolver_ttls: HashMap::new(),
+            worker_timeout_ms: default_worker_timeout_ms(),
+            resolve_max_runtime_calls: 0,
+            forget_unused_after_days: 0,
+            max_trie_size: 0,
+            picker_header_prefix: default_picker_header_prefix(),
+            disable_list_colors: false,
+            max_completions_shown: default_max_completions_shown(),
+            tag_grouping: default_tag_grouping(),
+        }
+    }
 }
 
 impl UserConfig {
@@ -84,6 +211,32 @@ impl UserConfig {
     /// True if `first_word` is literally on the blocklist.
     pub fn is_blocklisted(&self, first_word: &str) -> bool {
         !first_word.is_empty() && self.command_blocklist.iter().any(|b| b == first_word)
+    }
+
+    /// Convert to the runtime representation published via [`runtime_config::set`].
+    pub fn to_runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            min_resolve_prefix_length: self.min_resolve_prefix_length,
+            force_picker_at_candidates: self.force_picker_at_candidates,
+            dominance_margin: self.dominance_margin,
+            disable_cwd_scoring: self.disable_cwd_scoring,
+            disable_sibling_context: self.disable_sibling_context,
+            disable_arg_type_narrowing: self.disable_arg_type_narrowing,
+            disable_flag_matching: self.disable_flag_matching,
+            disable_worker: self.disable_worker,
+            disable_runtime_resolvers: self.disable_runtime_resolvers.clone(),
+            excluded_fpath_dirs: self.excluded_fpath_dirs.clone(),
+            disable_build_time_shell_exec: self.disable_build_time_shell_exec,
+            resolver_ttls: self.resolver_ttls.clone(),
+            worker_timeout_ms: self.worker_timeout_ms,
+            resolve_max_runtime_calls: self.resolve_max_runtime_calls,
+            forget_unused_after_days: self.forget_unused_after_days,
+            max_trie_size: self.max_trie_size,
+            picker_header_prefix: self.picker_header_prefix.clone(),
+            disable_list_colors: self.disable_list_colors,
+            max_completions_shown: self.max_completions_shown,
+            tag_grouping: self.tag_grouping,
+        }
     }
 }
 
@@ -194,5 +347,91 @@ command_blocklist:
         let c = UserConfig::load(&p);
         assert_eq!(c.stale_threshold(), 600);
         assert!(c.is_blocklisted("ansible"));
+    }
+
+    #[test]
+    fn parse_every_new_field() {
+        let yaml = r#"
+min_resolve_prefix_length: 3
+force_picker_at_candidates: 5
+dominance_margin: 1.2
+disable_cwd_scoring: true
+disable_sibling_context: true
+disable_arg_type_narrowing: true
+disable_flag_matching: true
+disable_worker: true
+disable_runtime_resolvers:
+  - git-branches
+  - hosts
+excluded_fpath_dirs:
+  - ~/.local/share/zinit
+disable_build_time_shell_exec: true
+resolver_ttls:
+  git-branches: 30
+  hosts: 3600
+worker_timeout_ms: 1000
+resolve_max_runtime_calls: 16
+forget_unused_after_days: 90
+max_trie_size: 5000
+picker_header_prefix: ">"
+disable_list_colors: true
+max_completions_shown: 100
+tag_grouping: false
+"#;
+        let c = UserConfig::parse(yaml).unwrap();
+        assert_eq!(c.min_resolve_prefix_length, 3);
+        assert_eq!(c.force_picker_at_candidates, 5);
+        assert!((c.dominance_margin - 1.2).abs() < 1e-4);
+        assert!(c.disable_cwd_scoring);
+        assert!(c.disable_sibling_context);
+        assert!(c.disable_arg_type_narrowing);
+        assert!(c.disable_flag_matching);
+        assert!(c.disable_worker);
+        assert_eq!(c.disable_runtime_resolvers, vec!["git-branches", "hosts"]);
+        assert_eq!(c.excluded_fpath_dirs, vec!["~/.local/share/zinit"]);
+        assert!(c.disable_build_time_shell_exec);
+        assert_eq!(c.resolver_ttls.get("git-branches"), Some(&30u64));
+        assert_eq!(c.resolver_ttls.get("hosts"), Some(&3600u64));
+        assert_eq!(c.worker_timeout_ms, 1000);
+        assert_eq!(c.resolve_max_runtime_calls, 16);
+        assert_eq!(c.forget_unused_after_days, 90);
+        assert_eq!(c.max_trie_size, 5000);
+        assert_eq!(c.picker_header_prefix, ">");
+        assert!(c.disable_list_colors);
+        assert_eq!(c.max_completions_shown, 100);
+        assert!(!c.tag_grouping);
+
+        // Verify to_runtime_config round-trip
+        let rc = c.to_runtime_config();
+        assert_eq!(rc.min_resolve_prefix_length, 3);
+        assert!(rc.disable_arg_type_narrowing);
+        assert_eq!(rc.picker_header_prefix, ">");
+        assert_eq!(rc.max_completions_shown, 100);
+        assert!(!rc.tag_grouping);
+    }
+
+    #[test]
+    fn new_fields_have_correct_defaults() {
+        let c = UserConfig::default();
+        assert_eq!(c.min_resolve_prefix_length, 1);
+        assert_eq!(c.force_picker_at_candidates, 0);
+        assert!((c.dominance_margin - 1.05).abs() < 1e-4);
+        assert!(!c.disable_cwd_scoring);
+        assert!(!c.disable_sibling_context);
+        assert!(!c.disable_arg_type_narrowing);
+        assert!(!c.disable_flag_matching);
+        assert!(!c.disable_worker);
+        assert!(c.disable_runtime_resolvers.is_empty());
+        assert!(c.excluded_fpath_dirs.is_empty());
+        assert!(!c.disable_build_time_shell_exec);
+        assert!(c.resolver_ttls.is_empty());
+        assert_eq!(c.worker_timeout_ms, 500);
+        assert_eq!(c.resolve_max_runtime_calls, 0);
+        assert_eq!(c.forget_unused_after_days, 0);
+        assert_eq!(c.max_trie_size, 0);
+        assert_eq!(c.picker_header_prefix, "%");
+        assert!(!c.disable_list_colors);
+        assert_eq!(c.max_completions_shown, 200);
+        assert!(c.tag_grouping);
     }
 }

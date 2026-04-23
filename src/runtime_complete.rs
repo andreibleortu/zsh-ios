@@ -1,8 +1,20 @@
 use crate::trie::*;
 use crate::type_resolver::{Ctx, Registry, TypeResolver};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+
+// Thread-local counter for live resolver calls within one CLI invocation.
+// Reset by `reset_runtime_call_counter` at the start of cmd_resolve / cmd_complete.
+thread_local! {
+    static RUNTIME_CALL_COUNT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Reset the per-invocation runtime-call counter. Call once at CLI entry.
+pub fn reset_runtime_call_counter() {
+    RUNTIME_CALL_COUNT.with(|c| c.set(0));
+}
 
 /// Each resource initializes independently on first access — no upfront cost,
 /// no mutex contention, and no risk of poisoned-mutex panics.
@@ -727,7 +739,32 @@ fn list_with_cache(
     mode: u8,
     ctx: &Ctx,
 ) -> Vec<String> {
-    let ttl = resolver.cache_ttl();
+    let rcfg = crate::runtime_config::get();
+
+    // Check runtime-call cap (0 = no cap).
+    if rcfg.resolve_max_runtime_calls > 0 {
+        let count = RUNTIME_CALL_COUNT.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        if count >= rcfg.resolve_max_runtime_calls {
+            return Vec::new();
+        }
+    }
+
+    // Determine effective TTL: config override wins over resolver default.
+    let base_ttl = resolver.cache_ttl();
+    let ttl = if !resolver.id().is_empty() {
+        if let Some(&secs) = rcfg.resolver_ttls.get(resolver.id()) {
+            Duration::from_secs(secs)
+        } else {
+            base_ttl
+        }
+    } else {
+        base_ttl
+    };
+
     if ttl.is_zero() {
         return resolver.list(ctx);
     }
@@ -819,6 +856,14 @@ pub fn list_matches(arg_type: u8, prefix: &str) -> Vec<String> {
 
     // Registry fast path for all registered types.
     if let Some(resolver) = crate::type_resolver::REGISTRY.get(arg_type) {
+        // disable_runtime_resolvers: skip if this resolver's id is listed.
+        let disabled = {
+            let id = resolver.id();
+            !id.is_empty() && crate::runtime_config::get().disable_runtime_resolvers.contains(&id.to_string())
+        };
+        if disabled {
+            return Vec::new();
+        }
         let ctx = Ctx::with_partial(prefix);
         let items = list_with_cache(resolver, arg_type, &ctx);
         return filter_prefix(&items, prefix);
@@ -5730,5 +5775,40 @@ lint = \"flake8 .\"
         assert!(items.iter().any(|s| s == "%sleep"));
         // Clean up so other tests in the same process aren't confused.
         set_live_state(std::collections::HashMap::new());
+    }
+
+    #[test]
+    fn disable_runtime_resolvers_returns_empty_for_listed_id() {
+        // Seed a resolver id into the disable list.
+        crate::runtime_config::set(crate::runtime_config::RuntimeConfig {
+            disable_runtime_resolvers: vec!["hosts".to_string()],
+            ..crate::runtime_config::RuntimeConfig::default()
+        });
+
+        // list_matches for ARG_MODE_HOSTS should return empty because "hosts" is disabled.
+        let result = list_matches(ARG_MODE_HOSTS, "");
+        assert!(
+            result.is_empty(),
+            "expected empty list when resolver id 'hosts' is disabled, got {} items",
+            result.len()
+        );
+
+        // Restore so other tests are not affected.
+        crate::runtime_config::set(crate::runtime_config::RuntimeConfig::default());
+    }
+
+    #[test]
+    fn resolver_ttls_override_is_stored_in_config() {
+        // Verify that resolver_ttls entries survive the config round-trip and
+        // are readable from get(). The actual cache-ttl override path is
+        // exercised in list_with_cache; here we just confirm the config plumbing.
+        let mut cfg = crate::runtime_config::RuntimeConfig::default();
+        cfg.resolver_ttls.insert("git-branches".to_string(), 30);
+        cfg.resolver_ttls.insert("hosts".to_string(), 7200);
+
+        assert_eq!(cfg.resolver_ttls.get("git-branches"), Some(&30u64));
+        assert_eq!(cfg.resolver_ttls.get("hosts"), Some(&7200u64));
+        // Non-listed key falls back to resolver default (not present in map).
+        assert!(!cfg.resolver_ttls.contains_key("signals"));
     }
 }
