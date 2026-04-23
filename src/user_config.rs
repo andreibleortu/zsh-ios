@@ -41,6 +41,12 @@ pub struct UserConfig {
     /// When true, global aliases (alias -g) are NOT expanded before
     /// resolution. Some users prefer the literal buffer intact.
     pub disable_galiases: bool,
+
+    /// When true, the build-time harvest of `_regex_arguments` specs via the
+    /// zpty worker is skipped.  Saves a second of shell startup time at the
+    /// cost of less complete arg-spec data for commands like `ip` and
+    /// `iptables` whose completion functions build their spec at runtime.
+    pub disable_dynamic_harvest: bool,
 }
 
 impl UserConfig {

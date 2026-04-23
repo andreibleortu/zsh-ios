@@ -129,7 +129,7 @@ _zsh_ios_precmd() {
     unset _zsh_ios_last_pin
     if (( ! _zsh_ios_ingested )) && _zsh_ios_worker_is_ready; then
         _zsh_ios_ingested=1
-        ( _zsh_ios_ingest_worker_state & ) &>/dev/null
+        ( _zsh_ios_ingest_worker_state; _zsh_ios_harvest_regex_args ) &>/dev/null &
     fi
 }
 
@@ -1150,6 +1150,28 @@ _zio_accept_line() {
             dump-modules)
                 zmodload >> "\$_ZIO_RF" 2>/dev/null
                 ;;
+            dump-regex-args)
+                # Override the two _regex_arguments sinks so the completion
+                # function captures its spec strings instead of dispatching.
+                # Restored via unfunction right after the call.
+                function _regex_words() {
+                    local _zrw_tag="\$1"
+                    local _zrw_desc="\$2"
+                    shift 2
+                    reply=("\$@")
+                    print -r -- "__ZIO_REGEX_WORDS__" "\$_zrw_tag" "\$_zrw_desc" "\$@" >> "\$_ZIO_RF" 2>/dev/null
+                    return 0
+                }
+                function _regex_arguments() {
+                    print -r -- "__ZIO_REGEX_ARGS__" "\$@" >> "\$_ZIO_RF" 2>/dev/null
+                    return 0
+                }
+                if [[ -n "\$_ZIO_REGEX_FUNC" ]]; then
+                    autoload -Uz "\$_ZIO_REGEX_FUNC" 2>/dev/null
+                    "\$_ZIO_REGEX_FUNC" 2>/dev/null || true
+                fi
+                unfunction _regex_words _regex_arguments 2>/dev/null
+                ;;
         esac
         [[ -n "\$_ZIO_DF" ]] && touch "\$_ZIO_DF"
         rm -f "\$_req"
@@ -1364,6 +1386,49 @@ EOF
     return $_rc
 }
 
+_zsh_ios_worker_dump_regex_args() {
+    _zsh_ios_worker_is_ready || return 1
+    local _func="$1"
+    [[ -n "$_func" ]] || return 1
+
+    # Drain accumulated pty output (same pattern as _zsh_ios_worker_dump).
+    local _zio_drain_buf _zio_drain_n=0
+    while zpty -t _zsh_ios_worker 2>/dev/null; do
+        zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        (( ++_zio_drain_n > 200 )) && break
+    done
+
+    local _rf; _rf=$(mktemp "${TMPDIR:-/tmp}/zio-rxa.XXXXXX") || return 1
+    local _df="${_rf}.done"
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+
+    # Write request file. _ZIO_REGEX_FUNC is a worker-side variable so we use
+    # a literal assignment — no parent-side expansion wanted.
+    cat > "$_req" <<EOF
+_ZIO_REQUEST='dump-regex-args'
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+_ZIO_REGEX_FUNC='$_func'
+EOF
+
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null || {
+        rm -f "$_rf" "$_df" "$_req"; return 1
+    }
+
+    local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
+    for _i in $(seq 1 $_slices); do
+        [[ -f "$_df" ]] && break
+        sleep 0.01
+        while zpty -t _zsh_ios_worker 2>/dev/null; do
+            zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        done
+    done
+    local _rc=1
+    if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
+    rm -f "$_rf" "$_df" "$_req"
+    return $_rc
+}
+
 _zsh_ios_ingest_worker_state() {
     # One-shot; runs in background.  Concatenates worker dumps with @<kind>
     # section markers and pipes into `zsh-ios ingest` for trie integration.
@@ -1395,6 +1460,78 @@ _zsh_ios_ingest_worker_state() {
         print "@modules"
         _zsh_ios_worker_dump modules
     } | "$ZSH_IOS_BIN" ingest 2>/dev/null
+}
+
+_zsh_ios_harvest_regex_args() {
+    _zsh_ios_worker_is_ready || return 1
+
+    # Cache file: one line per already-processed file: "<abs-path>|<mtime-epoch>".
+    local _cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/zsh-ios"
+    local _cache_file="$_cache_dir/regex-harvest.cache"
+    mkdir -p "$_cache_dir" 2>/dev/null
+
+    # Search fpath directories that may contain _regex_arguments completions.
+    local -a _search_paths
+    _search_paths=(
+        /usr/share/zsh/*/functions/_*
+        /usr/local/share/zsh/site-functions/_*
+        /opt/homebrew/share/zsh/site-functions/_*
+    )
+
+    local _tmp="${TMPDIR:-/tmp}/zio-regex-harvest.$$"
+    : > "$_tmp"
+
+    local _file _fn _mtime _cache_hit _new_cache
+    _new_cache=""
+
+    for _file in "${_search_paths[@]}"; do
+        [[ -f "$_file" ]] || continue
+        grep -q '_regex_arguments' "$_file" 2>/dev/null || continue
+
+        # Get mtime as epoch seconds (cross-platform).
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            _mtime=$(stat -f %m "$_file" 2>/dev/null || echo 0)
+        else
+            _mtime=$(stat -c %Y "$_file" 2>/dev/null || echo 0)
+        fi
+
+        # Cache check: skip if we've already processed this file at this mtime.
+        _cache_hit=0
+        if [[ -f "$_cache_file" ]]; then
+            if grep -qF "${_file}|${_mtime}" "$_cache_file" 2>/dev/null; then
+                _cache_hit=1
+            fi
+        fi
+
+        if (( _cache_hit )); then
+            # Preserve this entry in the new cache.
+            _new_cache+="${_file}|${_mtime}"$'\n'
+            continue
+        fi
+
+        # Function name matches the filename (basename).
+        _fn="${_file:t}"
+        local _rxa_out="${TMPDIR:-/tmp}/zio-rxa-out.$$"
+        _zsh_ios_worker_dump_regex_args "$_fn" > "$_rxa_out" 2>/dev/null
+        if [[ -s "$_rxa_out" ]]; then
+            cat "$_rxa_out" >> "$_tmp"
+        fi
+        rm -f "$_rxa_out"
+
+        # Record this file+mtime as processed.
+        _new_cache+="${_file}|${_mtime}"$'\n'
+    done
+
+    # Write updated cache (replaces old contents).
+    if [[ -n "$_new_cache" ]]; then
+        printf '%s' "$_new_cache" > "$_cache_file" 2>/dev/null
+    fi
+
+    # Feed combined capture to the binary for trie folding.
+    if [[ -s "$_tmp" ]]; then
+        "$ZSH_IOS_BIN" regex-args-ingest < "$_tmp" 2>/dev/null
+    fi
+    rm -f "$_tmp"
 }
 
 _zsh_ios_worker_cleanup() {

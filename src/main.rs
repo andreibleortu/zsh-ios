@@ -97,6 +97,9 @@ enum Commands {
     },
     /// Ingest structured shell state from stdin (aliases, functions, named dirs)
     Ingest,
+    /// Read a harvest capture from stdin and fold _regex_arguments specs into the trie
+    #[command(name = "regex-args-ingest")]
+    RegexArgsIngest,
 }
 
 fn main() {
@@ -119,6 +122,7 @@ fn main() {
         Commands::Status => cmd_status(),
         Commands::Explain { line } => cmd_explain(&line.join(" ")),
         Commands::Ingest => ingest::cmd_ingest(),
+        Commands::RegexArgsIngest => cmd_regex_args_ingest(),
     }
 }
 
@@ -211,7 +215,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
-        "status", "explain", "ingest",
+        "status", "explain", "ingest", "regex-args-ingest",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }
@@ -635,6 +639,14 @@ fn cmd_status() {
         }
     );
     println!("  Blocklist:   {}", user_cfg.command_blocklist.len());
+    println!(
+        "  Dyn harvest: {}",
+        if user_cfg.disable_dynamic_harvest {
+            "disabled (config)"
+        } else {
+            "enabled"
+        }
+    );
 
     if tree_path.exists() {
         if let Ok(meta) = std::fs::metadata(&tree_path) {
@@ -744,6 +756,91 @@ fn cmd_explain(line: &str) {
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok());
     println!("{}", resolve::explain(line, &trie, &pin_store, cwd.as_deref()));
+}
+
+fn cmd_regex_args_ingest() {
+    use std::io::Read;
+
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    if user_cfg.disable_dynamic_harvest {
+        return;
+    }
+
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    if input.trim().is_empty() {
+        return;
+    }
+    if config::ensure_config_dir().is_err() {
+        return;
+    }
+
+    let tree_path = config::tree_path();
+    let _lock = locks::lock_for(&tree_path);
+    let mut trie = match trie::CommandTrie::load(&tree_path) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    // The input may contain multiple back-to-back captures, one per function.
+    // Each capture starts with __ZIO_REGEX_WORDS__ / __ZIO_REGEX_ARGS__ lines.
+    // We split them by __ZIO_REGEX_ARGS__ boundaries so each function is parsed
+    // independently, then fold all results into the trie.
+    let mut ingested = 0usize;
+    for capture_block in split_harvest_blocks(&input) {
+        if let Some((cmd_name, parsed)) = regex_args::parse_harvest_capture(capture_block) {
+            if cmd_name.is_empty() {
+                continue;
+            }
+            let spec = trie.arg_specs.entry(cmd_name).or_default();
+            // Fold positionals (don't overwrite existing entries from the static parser).
+            for (pos, arg_type) in parsed.positional {
+                spec.positional.entry(pos).or_insert(arg_type);
+            }
+            if spec.rest.is_none() {
+                spec.rest = parsed.rest;
+            }
+            for (pos, list) in parsed.static_lists {
+                spec.flag_static_lists.entry(format!("__pos_{}", pos)).or_insert(list);
+            }
+            if spec.rest_static_list.is_none() {
+                spec.rest_static_list = parsed.rest_static;
+            }
+            ingested += 1;
+        }
+    }
+
+    if ingested > 0 {
+        let _ = trie.save(&tree_path);
+    }
+}
+
+/// Split a raw harvest stream into per-function blocks.
+///
+/// Each block starts with one or more `__ZIO_REGEX_WORDS__` lines followed by
+/// exactly one `__ZIO_REGEX_ARGS__` line.  We accumulate lines until we see a
+/// `__ZIO_REGEX_ARGS__` line, then yield the accumulated block (including that
+/// terminating line).  Leftover lines after the last `__ZIO_REGEX_ARGS__` are
+/// discarded (they're malformed input).
+fn split_harvest_blocks(input: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut block_start = 0usize;
+    let mut pos = 0usize;
+
+    for line in input.split_inclusive('\n') {
+        let line_start = pos;
+        pos += line.len();
+        if line.trim_start().starts_with("__ZIO_REGEX_ARGS__") {
+            // This line is the last line of the current block.
+            blocks.push(&input[block_start..pos]);
+            block_start = pos;
+        }
+        let _ = line_start;
+    }
+
+    blocks
 }
 
 fn load_trie() -> trie::CommandTrie {
