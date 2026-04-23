@@ -9,6 +9,7 @@
 //! to the binary" here. Anything that needs to stay hidden should use
 //! `pub(crate)` inside its own module.
 
+pub mod bash_completions;
 pub mod completions;
 pub mod config;
 pub mod fish_completions;

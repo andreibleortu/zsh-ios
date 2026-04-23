@@ -161,6 +161,16 @@ fn cmd_build(aliases_stdin: bool) {
         );
     }
 
+    // 5d. Supplement with Bash completion data (additive — Zsh and Fish win on conflicts)
+    let (bash_cmds, bash_subs, bash_flags) =
+        bash_completions::scan_bash_completions(&mut ct);
+    if bash_cmds > 0 {
+        eprintln!(
+            "Enriched {} commands with Bash completion data ({} subs, {} flags)",
+            bash_cmds, bash_subs, bash_flags,
+        );
+    }
+
     // 5c. Import user-defined shell functions so they're resolvable as commands.
     // We run `zsh -ic` (interactive) so .zshrc runs and user's functions are
     // visible. Cheap because the result only needs to be fetched at build time.
