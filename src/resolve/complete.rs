@@ -77,7 +77,39 @@ fn is_plausible_item(s: &str) -> bool {
         return false;
     }
 
+    // URL scheme fragments (`ftp://`, `http://`, `https://`, etc.) are never
+    // valid top-level completions — they only make sense after a specific flag
+    // like `--url=`.  Their `://` sigil distinguishes them unambiguously.
+    if t.contains("://") {
+        return false;
+    }
+
+    // Single uppercase letters like `I` and `M` (sed s-command modifiers)
+    // are not useful as top-level completions.  Single lowercase alphanumerics
+    // and single digits are already accepted — we only block lone uppercase.
+    if t.len() == 1 && t.chars().next().unwrap().is_ascii_uppercase() {
+        return false;
+    }
+
     true
+}
+
+/// Tags that carry context-specific completions only meaningful after a flag
+/// (e.g. HTTP headers after `--header=`, URL schemes after `--url=`, ssh
+/// subsystem names inside `sftp://` completion).  Displaying these groups at
+/// the command root produces noise and confuses users.
+fn is_noisy_tag(tag: &str) -> bool {
+    // Normalise to lowercase for comparison.
+    let t = tag.to_lowercase();
+    matches!(
+        t.as_str(),
+        "headers"     // HTTP / mail headers
+        | "urls"      // URL scheme prefixes (ftp://, http://)
+        | "subsystems"// ssh subsystem names (sftp)
+        | "mods"      // sed s-command modifiers (I, M)
+        | "address-forms" // sed address forms
+        | "steps"     // sed step values
+    )
 }
 
 /// When the parser grabbed a group's own tag or label as if it were an item,
@@ -327,12 +359,19 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // Walk the trie through completed words
     let mut node = &trie.root;
     let resolve_start;
+    // Track whether we actually walked INTO the trie for the parent command.
+    // If the first word isn't in the trie, `node` would remain at `trie.root` and
+    // we'd spuriously return every top-level command as a "subcommand of <unknown>".
+    let mut cmd_in_trie = false;
 
     if pin_consumed > 0 {
         resolved_words = expanded_prefix.clone();
         for w in &expanded_prefix {
             match node.get_child(w) {
-                Some(child) => node = child,
+                Some(child) => {
+                    node = child;
+                    cmd_in_trie = true;
+                }
                 None => break,
             }
         }
@@ -340,6 +379,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     } else {
         if let Some(child) = node.get_child(&resolved_cmd) {
             node = child;
+            cmd_in_trie = true;
         }
         resolve_start = 1;
     }
@@ -438,9 +478,12 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prev))
     {
         output.push_str(&format!("{} Expects: <value>\n", hdr()));
+        let mut seen = std::collections::HashSet::new();
         let filtered: Vec<&str> = items
             .iter()
             .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+            .filter(|i| is_plausible_item(i))
+            .filter(|i| seen.insert(i.as_str()))
             .map(String::as_str)
             .collect();
         if !filtered.is_empty() {
@@ -470,9 +513,15 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && let Some((tag, argv)) = spec.and_then(|s| s.rest_call_program.as_ref())
     {
         let results = runtime_complete::call_program_cached(argv, prefix);
-        if !results.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = results
+            .iter()
+            .filter(|i| is_plausible_item(i))
+            .filter(|i| seen.insert(i.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !names.is_empty() {
             output.push_str(&format!("% Expects: <{}>\n", tag));
-            let names: Vec<&str> = results.iter().map(String::as_str).collect();
             output.push_str(&format_columns(&names, 80));
             return output;
         }
@@ -484,9 +533,12 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && !node_has_subcommands
         && let Some(items) = spec.and_then(|s| s.rest_static_list.as_ref())
     {
+        let mut seen = std::collections::HashSet::new();
         let filtered: Vec<&str> = items
             .iter()
             .filter(|i| prefix.is_empty() || i.starts_with(prefix))
+            .filter(|i| is_plausible_item(i))
+            .filter(|i| seen.insert(i.as_str()))
             .map(String::as_str)
             .collect();
         if !filtered.is_empty() {
@@ -502,7 +554,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     let in_flag_value_context = prev_word
         .is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.flag_takes_value(p)));
 
-    let trie_matches = if in_flag_value_context {
+    let trie_matches = if in_flag_value_context || !cmd_in_trie {
         vec![]
     } else {
         node.matcher_aware_search(prefix, &trie.matcher_rules)
@@ -559,6 +611,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             };
             let mut all_items: Vec<String> = Vec::new();
             for group in groups {
+                // Skip entire tag groups known to carry context-specific items
+                // that are only meaningful after a specific flag, not at root.
+                if is_noisy_tag(&group.tag) {
+                    continue;
+                }
                 let filtered: Vec<String> = group
                     .items
                     .iter()
@@ -586,6 +643,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             // label but no list (happens a lot with `_description TAG expl`
             // calls whose compadd runs on a separate line we don't thread).
             for group in groups {
+                // Skip known noisy tags that are context-specific (e.g. HTTP
+                // headers, URL schemes, ssh subsystems, sed modifiers).
+                if is_noisy_tag(&group.tag) {
+                    continue;
+                }
                 let filtered: Vec<&str> = group
                     .items
                     .iter()
@@ -1500,5 +1562,74 @@ mod tests {
         let out2 = complete_flags("-", Some(&spec), node, &[], String::new());
         assert!(out2.contains("-a"), "should list -a when no prior");
         assert!(out2.contains("-v"), "should list -v when no prior");
+    }
+
+    // --- is_plausible_item display-time filter tests ---
+
+    #[test]
+    fn is_plausible_item_rejects_url_schemes() {
+        // URL scheme fragments like `ftp://` and `http://` must be filtered
+        // — they are only valid after a specific flag, not at the root.
+        assert!(!is_plausible_item("ftp://"), "ftp:// should be rejected");
+        assert!(!is_plausible_item("http://"), "http:// should be rejected");
+        assert!(!is_plausible_item("https://"), "https:// should be rejected");
+        assert!(!is_plausible_item("sftp://"), "sftp:// should be rejected");
+    }
+
+    #[test]
+    fn is_plausible_item_rejects_lone_uppercase() {
+        // Single uppercase letters (sed s-command modifiers I, M) must be filtered.
+        assert!(!is_plausible_item("I"), "lone uppercase I should be rejected");
+        assert!(!is_plausible_item("M"), "lone uppercase M should be rejected");
+        // Single lowercase and digits are fine (e.g. `v`, `1`).
+        assert!(is_plausible_item("v"), "single lowercase should be accepted");
+        assert!(is_plausible_item("1"), "single digit should be accepted");
+        // Multi-character uppercase tokens are fine (subcommands).
+        assert!(is_plausible_item("GET"), "multi-char uppercase should be accepted");
+    }
+
+    // --- is_noisy_tag filter tests ---
+
+    #[test]
+    fn is_noisy_tag_rejects_known_noisy_tags() {
+        assert!(is_noisy_tag("headers"),      "headers tag should be noisy");
+        assert!(is_noisy_tag("urls"),         "urls tag should be noisy");
+        assert!(is_noisy_tag("subsystems"),   "subsystems tag should be noisy");
+        assert!(is_noisy_tag("mods"),         "mods tag should be noisy");
+        assert!(is_noisy_tag("address-forms"),"address-forms tag should be noisy");
+        // Case-insensitive
+        assert!(is_noisy_tag("Headers"),      "Headers (mixed case) should be noisy");
+    }
+
+    #[test]
+    fn is_noisy_tag_accepts_useful_tags() {
+        assert!(!is_noisy_tag("commands"),  "commands tag should not be noisy");
+        assert!(!is_noisy_tag("files"),     "files tag should not be noisy");
+        assert!(!is_noisy_tag("branches"),  "branches tag should not be noisy");
+    }
+
+    // --- noisy tag group display suppression test ---
+
+    #[test]
+    fn complete_suppresses_noisy_tag_groups_at_root() {
+        use crate::trie::{CommandTrie, TagGroup};
+        let mut trie = CommandTrie::default();
+        trie.insert(&["wget"]);
+        // Inject noisy tag group (HTTP headers, like wget has in _wget)
+        trie.tag_groups.insert(
+            "wget".to_string(),
+            vec![
+                TagGroup {
+                    tag: "headers".to_string(),
+                    label: "HTTP header".to_string(),
+                    items: vec!["Accept".to_string(), "Content-Type".to_string()],
+                },
+            ],
+        );
+        let pins = crate::pins::Pins::default();
+        // Even though the tag group has items, they should be suppressed.
+        let out = super::complete("wget ", &trie, &pins, super::super::engine::ContextHint::Unknown);
+        assert!(!out.contains("Accept"), "HTTP headers should not appear in wget root completions");
+        assert!(!out.contains("Content-Type"), "HTTP headers should not appear in wget root completions");
     }
 }

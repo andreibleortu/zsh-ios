@@ -296,7 +296,7 @@ fn parse_complete_entry(line: &str) -> Option<FishEntry> {
                     // The value may be a space-separated list of completion words.
                     for word in tokens[i].split_whitespace() {
                         let w = word.trim();
-                        if !w.is_empty() {
+                        if is_plausible_fish_arg(w) {
                             args.push(w.to_string());
                         }
                     }
@@ -386,6 +386,28 @@ struct FishEntry {
     description: Option<String>,
     takes_value: bool,
     condition_subs: Vec<String>,
+}
+
+/// Reject tokens that aren't real subcommand names. Fish completion scripts
+/// frequently pass shell variable references (`$__podman_comp_results`),
+/// subshell invocations, or brace expansions to `complete -a`; those are
+/// resolved at runtime, and the literal token is useless as a static hint.
+fn is_plausible_fish_arg(s: &str) -> bool {
+    if s.is_empty() || s.len() >= 64 {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    if matches!(first, b'$' | b'(' | b'{' | b'"' | b'\'' | b'`' | b'*' | b'?') {
+        return false;
+    }
+    if s.contains('$') || s.contains('(') || s.contains('`') {
+        return false;
+    }
+    // Real subcommand/arg names are alphanumeric + a small set of punctuation.
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | '=' | ',')
+    })
 }
 
 /// Tokenize a Fish `complete` invocation line, respecting single- and
@@ -540,5 +562,29 @@ mod tests {
 
         let desc_baz = trie.descriptions.get("foo").and_then(|m| m.get("baz")).map(String::as_str);
         assert_eq!(desc_baz, Some("a longer description from zsh"), "zsh longer desc should be kept for baz");
+    }
+
+    #[test]
+    fn skip_shell_var_reference_arg() {
+        // podman.fish does: complete -c podman -a '$__podman_comp_results'
+        // The literal string isn't a real subcommand; filter it out.
+        let mut per = HashMap::new();
+        parse_fish_file(
+            "complete -c podman -a '$__podman_comp_results'\ncomplete -c podman -a build\n",
+            &mut per,
+        );
+        let rec = per.get("podman").expect("podman record");
+        assert_eq!(rec.top_args, vec!["build"]);
+    }
+
+    #[test]
+    fn skip_command_substitution_arg() {
+        let mut per = HashMap::new();
+        parse_fish_file(
+            "complete -c foo -a '(bar baz)'\ncomplete -c foo -a 'real'\n",
+            &mut per,
+        );
+        let rec = per.get("foo").expect("foo record");
+        assert_eq!(rec.top_args, vec!["real"]);
     }
 }

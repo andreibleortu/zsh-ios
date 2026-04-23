@@ -212,7 +212,7 @@ fn parse_complete_invocation(
                 if i < tokens.len() {
                     for w in tokens[i].split_whitespace() {
                         let w = w.trim();
-                        if !w.is_empty() {
+                        if !w.is_empty() && looks_like_completion_word(w) {
                             w_words.push(w.to_string());
                         }
                     }
@@ -498,11 +498,38 @@ fn collect_local_vars(body: &str) -> HashMap<String, String> {
 }
 
 /// Extract words from `compgen -W "..."` or `compgen -W "$VAR"` patterns.
+///
+/// Skips compgen invocations inside `case ... esac` blocks — those are
+/// flag-value enumerations (handled separately by extract_case_prev_subs),
+/// not top-level subcommands. Without this guard, `fdisk`'s
+/// `case $prev in '-b') compgen -W "512 1024 2048 4096" ;; esac`
+/// leaks "512" etc. as apparent top-level subcommands.
 fn extract_compgen_words(body: &str, var_map: &HashMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
+    let mut case_depth: u32 = 0;
     for line in body.lines() {
         let t = line.trim();
-        if !t.contains("compgen") {
+
+        // Track case..esac nesting so we don't capture per-flag enum values.
+        if t.starts_with("case ") && t.ends_with(" in") {
+            case_depth += 1;
+            continue;
+        }
+        if (t == "esac" || t.starts_with("esac ") || t.starts_with("esac;"))
+            && case_depth > 0
+        {
+            case_depth -= 1;
+            continue;
+        }
+        if case_depth > 0 {
+            continue;
+        }
+
+        // Require `compgen` as a standalone command (not `_comp_compgen` or
+        // other wrapper functions where the word list is contextual rather than
+        // global). `compgen` must be preceded by `$(`, `(`, or whitespace/line
+        // start, not by an underscore or alphanumeric character.
+        if !contains_standalone_compgen(t) {
             continue;
         }
         // Find `-W` in the line.
@@ -518,6 +545,12 @@ fn extract_compgen_words(body: &str, var_map: &HashMap<String, String>) -> Vec<S
             } else {
                 raw
             };
+            // If the resolved value is itself a subshell / shell expression
+            // (e.g. `comps=$( compgen -A file ... )`), don't split it — the
+            // tokens inside are shell syntax, not completion words.
+            if value.contains("$(") || value.contains('`') || value.trim_start().starts_with('$') {
+                continue;
+            }
             for word in value.split_whitespace() {
                 let word = word.trim();
                 if !word.is_empty() && looks_like_completion_word(word) {
@@ -527,6 +560,33 @@ fn extract_compgen_words(body: &str, var_map: &HashMap<String, String>) -> Vec<S
         }
     }
     out
+}
+
+/// Return true if `line` contains `compgen` as a standalone command token
+/// (not as part of `_comp_compgen` or other wrapper function names).
+///
+/// `compgen` must be immediately preceded by `$(`, `(`, whitespace, or the
+/// start of the string — not by an alphanumeric character or underscore.
+fn contains_standalone_compgen(line: &str) -> bool {
+    let needle = b"compgen";
+    let bytes = line.as_bytes();
+    let nlen = needle.len();
+    let mut i = 0;
+    while i + nlen <= bytes.len() {
+        if &bytes[i..i + nlen] == needle {
+            // Check character before `compgen` (if any).
+            let before_ok = i == 0
+                || matches!(bytes[i - 1], b' ' | b'\t' | b'(' | b'`');
+            // Check character after `compgen` (if any).
+            let after_ok = i + nlen >= bytes.len()
+                || !bytes[i + nlen].is_ascii_alphanumeric() && bytes[i + nlen] != b'_';
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Find the position of the word following `-W` in a compgen line.
@@ -576,9 +636,25 @@ fn extract_quoted_or_var<'a>(s: &'a str, var_map: &'a HashMap<String, String>) -
 /// that are later referenced via `compgen -W "$opts"`.
 fn extract_opts_vars(body: &str, var_map: &HashMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
+    let mut case_depth: u32 = 0;
     // Find all variable names referenced in compgen -W "$VAR" patterns.
     for line in body.lines() {
         let t = line.trim();
+
+        if t.starts_with("case ") && t.ends_with(" in") {
+            case_depth += 1;
+            continue;
+        }
+        if (t == "esac" || t.starts_with("esac ") || t.starts_with("esac;"))
+            && case_depth > 0
+        {
+            case_depth -= 1;
+            continue;
+        }
+        if case_depth > 0 {
+            continue;
+        }
+
         if !t.contains("compgen") {
             continue;
         }
@@ -591,6 +667,13 @@ fn extract_opts_vars(body: &str, var_map: &HashMap<String, String>) -> Vec<Strin
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
                 if let Some(val) = var_map.get(&var) {
+                    // Skip variable values that are themselves subshell
+                    // expressions — splitting them yields shell syntax, not
+                    // completion words.
+                    if val.contains("$(") || val.contains('`') || val.trim_start().starts_with('$')
+                    {
+                        continue;
+                    }
                     for word in val.split_whitespace() {
                         let word = word.trim();
                         if !word.is_empty() && looks_like_completion_word(word) {
@@ -605,12 +688,26 @@ fn extract_opts_vars(body: &str, var_map: &HashMap<String, String>) -> Vec<Strin
 }
 
 /// Returns true if a word looks like a valid completion word (subcommand or flag).
-/// Rejects shell variable expressions, subshell syntax, etc.
+/// Rejects shell variable expressions, subshell syntax, redirections, and
+/// other shell-operator tokens that leak in when a compgen -W value captured
+/// raw shell source.
 fn looks_like_completion_word(w: &str) -> bool {
     if w.contains('$') || w.contains('(') || w.contains(')') || w.contains('`') {
         return false;
     }
     if w.len() > 64 {
+        return false;
+    }
+    // Redirections: `2>&1`, `>file`, `<file`, `>>log`, `2>`, `&>`, etc.
+    if w.contains('>') || w.contains('<') {
+        return false;
+    }
+    // Pipes / control operators embedded in a word.
+    if w.contains('|') || w.contains(';') || w.contains('&') {
+        return false;
+    }
+    // Brace expansion / parameter syntax.
+    if w.contains('{') || w.contains('}') {
         return false;
     }
     // Must start with alphanumeric, `-`, or `_`.
@@ -624,6 +721,43 @@ fn extract_case_prev_subs(
     var_map: &HashMap<String, String>,
 ) -> HashMap<String, Vec<String>> {
     let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Guard: if the function ALSO dispatches on a subcommand word (e.g.
+    // `case $words[2]`, `case "$1"`, `case $object`, `case $command`) then the
+    // `case $prev in` block is almost certainly handling *flag-value*
+    // completions (e.g. `wep-key-type)` → `compgen -W "key phrase"`), not
+    // subcommand dispatch.  Treating flag-value arm labels as subcommands
+    // pollutes the trie with junk like `nmcli → wep-key-type`.
+    let has_other_case_dispatch = body.lines().any(|l| {
+        let t = l.trim();
+        if !t.starts_with("case ") || !t.ends_with(" in") {
+            return false;
+        }
+        // Words-based dispatch: `case $words[N]`, `case ${words[N]}`, `case $1`, `case "$1"`
+        let is_words = t.contains("$words") || t.contains("${words") || t.contains("\"$words");
+        let is_positional = t.contains("\"$1\"") || t.contains("$1 ") || t.ends_with("$1 in")
+            || t.contains("\"$2\"") || t.contains("$2 ") || t.ends_with("$2 in");
+        // Named variable dispatch that is NOT $prev/$cur/$COMP_WORDS:
+        // e.g. `case $object in`, `case $command in`, `case $subcommand in`
+        let is_named_var = (t.contains("$object") || t.contains("$command") || t.contains("$subcommand")
+            || t.contains("$cmd") || t.contains("$subcmd") || t.contains("$action"))
+            && !t.contains("$prev") && !t.contains("$cur");
+        is_words || is_positional || is_named_var
+    });
+    if has_other_case_dispatch {
+        return result;
+    }
+
+    // Two-pass approach:
+    // Pass 1: collect ALL arm label→word mappings, including flag arms (labels
+    //   starting with `-`).  Flag arms are needed to identify which non-flag
+    //   labels are actually flag VALUES rather than subcommands.
+    // Pass 2: drop non-flag arm labels that appear as completion words for any
+    //   flag arm (they are flag values, not subcommands).
+
+    // --- Pass 1 ---
+    // Full result including flag arms.
+    let mut full: HashMap<String, Vec<String>> = HashMap::new();
 
     // Find `case "$prev" in` or `case $prev in` (also `$1`, `$cur`, etc. — we skip those).
     let mut in_case = false;
@@ -670,6 +804,9 @@ fn extract_case_prev_subs(
                 found
             };
             if !has_unquoted_space {
+                // Collect all labels, including flags (starting with `-`).
+                // `*` and `$` are still excluded; `is_likely_cmd_name` is NOT applied here
+                // so that flag labels (like `--passthrough`) are also captured for pass 2.
                 let labels: Vec<String> = pattern
                     .split('|')
                     .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
@@ -678,7 +815,6 @@ fn extract_case_prev_subs(
                             && !p.contains('*')
                             && !p.contains('$')
                             && p != "--"
-                            && is_likely_cmd_name(p)
                     })
                     .collect();
                 current_labels = labels;
@@ -700,7 +836,7 @@ fn extract_case_prev_subs(
                 .collect();
             if !words.is_empty() {
                 for label in &current_labels {
-                    result.entry(label.clone()).or_default().extend(words.clone());
+                    full.entry(label.clone()).or_default().extend(words.clone());
                 }
             }
         }
@@ -708,6 +844,32 @@ fn extract_case_prev_subs(
         // `;;` ends the arm.
         if t == ";;" || t.ends_with(";;") {
             current_labels.clear();
+        }
+    }
+
+    // --- Pass 2 ---
+    // Build the set of words produced by any FLAG arm (label starts with `-`).
+    // These words are flag values, not subcommands — any non-flag arm label
+    // that also appears in this set is a flag value and must not become a
+    // trie child.
+    //
+    // Example (firewall-cmd):
+    //   --passthrough|--*-chain|...)   → ipv4 ipv6 eb   ← flag arm, words are flag values
+    //   ipv4|ipv6|eb)                  → nat filter mangle
+    // Without this filter, `ipv4`, `ipv6`, and `eb` would be inserted as
+    // `firewall-cmd → ipv4`, polluting the completion list.
+    let flag_words: std::collections::HashSet<String> = full
+        .iter()
+        .filter(|(label, _)| label.starts_with('-'))
+        .flat_map(|(_, words)| words.clone())
+        .collect();
+
+    for (label, words) in full {
+        // Keep only non-flag labels that:
+        // (a) look like plausible command/subcommand names, AND
+        // (b) do NOT appear as completion words for flag arms.
+        if !label.starts_with('-') && is_likely_cmd_name(&label) && !flag_words.contains(&label) {
+            result.entry(label).or_default().extend(words);
         }
     }
 
@@ -913,6 +1075,101 @@ complete -F _mycmd mycmd
     }
 
     #[test]
+    fn case_prev_with_word_dispatch_drops_flag_value_labels() {
+        // When a completion function ALSO has a `case $words[N]` (real subcommand
+        // dispatch), the `case $prev in` block handles flag-value completions.
+        // Its arm labels (like `wep-key-type`) must NOT be treated as subcommands.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("nmcli.bash");
+        fs::write(
+            &f,
+            r#"_nmcli() {
+    local cur prev words cword
+    _init_completion || return
+
+    case $prev in
+        wep-key-type)
+            COMPREPLY=( $(compgen -W "key phrase" -- "$cur") )
+            return
+            ;;
+        id)
+            return
+            ;;
+    esac
+
+    case ${words[2]} in
+        nm|con|dev)
+            COMPREPLY=( $(compgen -W "status" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _nmcli nmcli
+"#,
+        )
+        .unwrap();
+
+        let mut trie = CommandTrie::new();
+        scan_bash_dirs(&mut trie, &[dir.path().to_str().unwrap()]);
+
+        // When the `case $prev in` block is skipped (because there's a
+        // `case $words[N]` dispatch), nmcli may or may not be in the trie.
+        // What matters is that `wep-key-type` is NOT a child of nmcli.
+        if let Some(node) = trie.root.get_child("nmcli") {
+            assert!(
+                node.get_child("wep-key-type").is_none(),
+                "wep-key-type should not be a subcommand"
+            );
+            assert!(node.get_child("id").is_none(), "id should not be a subcommand");
+        }
+        // If nmcli is not in the trie at all, wep-key-type definitely isn't either.
+    }
+
+    #[test]
+    fn case_prev_flag_value_labels_filtered() {
+        // When a flag arm (e.g. `--passthrough`) produces words like `ipv4 ipv6 eb`,
+        // those words must NOT be treated as subcommands even if they also appear
+        // as arm labels in the same `case $prev in` block.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("firewall.bash");
+        fs::write(
+            &f,
+            r#"_firewall() {
+    local cur prev
+    _init_completion || return
+
+    case $prev in
+        --passthrough|--get-chains|--get-rules)
+            COMPREPLY=( $(compgen -W "ipv4 ipv6 eb" -- "$cur") )
+            ;;
+        ipv4|ipv6|eb)
+            COMPREPLY=( $(compgen -W "nat filter mangle" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _firewall firewall
+"#,
+        )
+        .unwrap();
+
+        let mut trie = CommandTrie::new();
+        scan_bash_dirs(&mut trie, &[dir.path().to_str().unwrap()]);
+
+        // ipv4, ipv6, eb are flag values → must NOT be subcommands.
+        // If firewall is not in the trie at all, none of them are either.
+        if let Some(node) = trie.root.get_child("firewall") {
+            assert!(
+                node.get_child("ipv4").is_none(),
+                "ipv4 should not be a subcommand"
+            );
+            assert!(
+                node.get_child("ipv6").is_none(),
+                "ipv6 should not be a subcommand"
+            );
+            assert!(node.get_child("eb").is_none(), "eb should not be a subcommand");
+        }
+    }
+
+    #[test]
     fn bash_scan_does_not_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("git.bash");
@@ -985,6 +1242,65 @@ complete -F _mycmd mycmd
         let words = extract_compgen_words(body, &var_map);
         assert!(words.contains(&"x".to_string()), "{:?}", words);
         assert!(words.contains(&"z".to_string()), "{:?}", words);
+    }
+
+    #[test]
+    fn looks_like_completion_word_rejects_shell_operators() {
+        assert!(!looks_like_completion_word("2>&1"));
+        assert!(!looks_like_completion_word(">file"));
+        assert!(!looks_like_completion_word("foo|bar"));
+        assert!(!looks_like_completion_word("foo;bar"));
+        assert!(!looks_like_completion_word("${parts"));
+        assert!(!looks_like_completion_word("parts}"));
+        assert!(looks_like_completion_word("install"));
+        assert!(looks_like_completion_word("--help"));
+        assert!(looks_like_completion_word("git-lfs"));
+    }
+
+    #[test]
+    fn extract_compgen_skips_subshell_value() {
+        // systemd-nspawn assigns `comps=$(compgen -A file ...)` then calls
+        // `compgen -W "$comps"`. The resolved value is shell source, not
+        // completion words; it must not be split as words.
+        let mut var_map = HashMap::new();
+        var_map.insert(
+            "comps".to_string(),
+            "$( compgen -A file -- \"$cur\" )".to_string(),
+        );
+        let body = r#"COMPREPLY=( $(compgen -W "$comps" -- "$cur") )"#;
+        let words = extract_compgen_words(body, &var_map);
+        assert!(words.is_empty(), "{:?}", words);
+    }
+
+    #[test]
+    fn extract_compgen_skips_inside_case() {
+        // The fdisk bug: `case $prev in '-b') COMPREPLY=( $(compgen -W "512 1024 ...") ) ;; esac`
+        // leaks "512" etc. as top-level subcommands. Those are per-flag values
+        // and must NOT appear in the top-level compgen harvest.
+        let var_map = HashMap::new();
+        let body = r#"
+_fdisk_module() {
+    case $prev in
+        '-b'|'--sector-size')
+            COMPREPLY=( $(compgen -W "512 1024 2048 4096" -- $cur) )
+            return 0
+            ;;
+        '-L'|'--color')
+            COMPREPLY=( $(compgen -W "auto never always" -- $cur) )
+            return 0
+            ;;
+    esac
+    COMPREPLY=( $(compgen -W "alpha beta" -- $cur) )
+}
+"#;
+        let words = extract_compgen_words(body, &var_map);
+        // Only the post-case compgen should contribute.
+        assert!(words.contains(&"alpha".to_string()), "{:?}", words);
+        assert!(words.contains(&"beta".to_string()), "{:?}", words);
+        // Per-flag enum values must not leak.
+        assert!(!words.contains(&"512".to_string()), "{:?}", words);
+        assert!(!words.contains(&"1024".to_string()), "{:?}", words);
+        assert!(!words.contains(&"always".to_string()), "{:?}", words);
     }
 
     #[test]

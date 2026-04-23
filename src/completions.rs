@@ -81,6 +81,56 @@ fn load_descriptions(trie: &mut CommandTrie, fpath_dirs: &[String]) {
     }
 }
 
+/// Sanitise a raw static-list before storing it in ArgSpec.
+///
+/// Two goals:
+///   1. **Dedup** — preserve first-seen order, drop later duplicates.
+///   2. **Filter** — reject items that are clearly Zsh source syntax rather
+///      than actual completion values.  The same allowlist logic lives in
+///      `resolve/complete.rs::is_plausible_item` for display-time filtering;
+///      this ingestion-time version is intentionally slightly more permissive
+///      (it also accepts single-char alphanumerics and items that start with
+///      `--`) so we don't accidentally drop legitimate short flags or long
+///      options from `_values`/`compadd -a` lists.
+///
+/// Items rejected here will never appear at display time even if the
+/// display-layer filter misses them; items that pass here but are syntactically
+/// suspicious are caught by the display-layer filter as belt-and-suspenders.
+fn sanitize_static_list(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let t = item.trim();
+        if t.is_empty() { continue; }
+
+        // Reject any item that contains Zsh parameter/command-substitution syntax.
+        // These characters appear in raw Zsh source fragments, never in real arg values.
+        let bad_chars = |c: char| matches!(c, '$' | '{' | '}' | '(' | ')' | '`' | '#' | '*' | '\\' | '\'' | '"' | ';' | '&' | '|' | '<' | '>');
+        if t.chars().any(bad_chars) { continue; }
+
+        // Reject items containing whitespace — real completion values don't
+        // have embedded spaces (paths use `/`, hostnames use `.`).
+        if t.contains(char::is_whitespace) { continue; }
+
+        // Lone single-character punctuation (not alphanumeric) is noise.
+        if t.len() == 1 && !t.chars().next().unwrap().is_ascii_alphanumeric() { continue; }
+
+        // Zsh matcher-list fragments (`r:|=*`, `l:|=*`, `b:=*`, `e:=*`).
+        if matches!(t.get(0..2), Some("r:" | "l:" | "b:" | "e:"))
+            && (t.contains('=') || t.contains('*'))
+        { continue; }
+
+        // Leading underscore → internal zsh helper/cache variable name.
+        if t.starts_with('_') { continue; }
+
+        // Dedup: first occurrence wins.
+        if seen.insert(t.to_string()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// Extract `command:'description'` pairs from Zsh completion files.
 ///
 /// Looks for patterns like:
@@ -948,7 +998,10 @@ fn apply_well_known_specs(specs: &mut HashMap<String, ArgSpec>, cmds_with_comple
         let spec = specs.entry(cmd.to_string()).or_default();
         if spec.rest_static_list.is_none() && spec.rest_call_program.is_none() {
             let items: Vec<String> = items_refs.iter().map(|s| s.to_string()).collect();
-            spec.rest_static_list = Some(items);
+            let clean = sanitize_static_list(items);
+            if !clean.is_empty() {
+                spec.rest_static_list = Some(clean);
+            }
         }
     }
 }
@@ -1081,11 +1134,13 @@ fn fold_regex_args_into_spec(ra: regex_args::ParsedRegexArgs) -> ArgSpec {
         // and there is no other slot; otherwise skip (ArgSpec has no
         // per-positional static list field — use rest_static as best-effort).
         if pos == 1 && static_lists_len == 1 {
-            spec.rest_static_list.get_or_insert(items);
+            let clean = sanitize_static_list(items);
+            if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
         }
     }
     if let Some(items) = ra.rest_static {
-        spec.rest_static_list.get_or_insert(items);
+        let clean = sanitize_static_list(items);
+        if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
     }
     spec
 }
@@ -1698,8 +1753,65 @@ pub(super) fn collect_local_arrays(body: &str) -> ArrayData {
 /// are skipped.  `_requested` is also skipped (orchestration, not data).
 pub(super) fn extract_tag_groups(body: &str, arrays: &ArrayData) -> Vec<trie::TagGroup> {
     let mut out = Vec::new();
+    // Track nesting of conditional blocks (`if`/`fi`) and `case`/`esac`
+    // state-machine blocks.  Any `_wanted` or `_description` inside either
+    // kind of block is only executed under certain runtime conditions that we
+    // cannot know statically, so we skip it entirely.
+    //
+    // `if_depth` is incremented on `if` and decremented on `fi`.
+    // `case_depth` is incremented on `case ... in` and decremented on `esac`.
+    let mut if_depth: u32 = 0;
+    let mut case_depth: u32 = 0;
+
     for line in body.lines() {
         let trimmed = line.trim();
+        // Skip blank / comment lines quickly.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // --- `if` / `elif` / `else` / `fi` ---
+        let starts_if = trimmed == "if" || trimmed.starts_with("if ")
+            || trimmed.starts_with("if\t") || trimmed.starts_with("if[")
+            || trimmed.starts_with("if(");
+        let starts_fi = trimmed == "fi" || trimmed.starts_with("fi ") || trimmed.starts_with("fi;")
+            || trimmed.starts_with("fi\t") || trimmed.starts_with("fi|")
+            || trimmed.starts_with("fi&") || trimmed == "fi\\";
+
+        if starts_if {
+            if_depth += 1;
+            continue;
+        }
+        if starts_fi {
+            if_depth = if_depth.saturating_sub(1);
+            continue;
+        }
+        // `elif`/`else` do not change depth.
+
+        // --- `case ... in` / `esac` ---
+        // A `case` opener: line contains `case ` or `case\t` followed
+        // eventually by ` in` / `\tin` (but NOT inside a comment).
+        // We use a simple check: trimmed starts with "case " and contains " in".
+        let starts_case = (trimmed.starts_with("case ") || trimmed.starts_with("case\t"))
+            && (trimmed.ends_with(" in") || trimmed.ends_with("\tin")
+                || trimmed.contains(" in\n") || trimmed.contains("\tin\n"));
+        let starts_esac = trimmed == "esac" || trimmed.starts_with("esac ")
+            || trimmed.starts_with("esac;") || trimmed.starts_with("esac\t");
+
+        if starts_case {
+            case_depth += 1;
+            continue;
+        }
+        if starts_esac {
+            case_depth = case_depth.saturating_sub(1);
+            continue;
+        }
+
+        // Skip _wanted/_description lines inside any conditional/case block.
+        if if_depth > 0 || case_depth > 0 {
+            continue;
+        }
+
         if let Some(rest) = trimmed.strip_prefix("_wanted ") {
             if let Some(tg) = parse_wanted_line(rest, arrays) {
                 out.push(tg);
@@ -2196,12 +2308,31 @@ fn extract_state_arm_action_with_arrays(arm: &str, arrays: &ArrayData) -> Option
         }
     }
 
-    // Priority 4: static list via compadd
+    // Priority 4: static list via compadd.
+    // Skip `compadd` calls that are inside `if`/`elif`/`fi` conditional blocks —
+    // those are only reached under specific runtime conditions that we cannot
+    // know statically (e.g. `compadd sftp` inside `if (( $+opt_args[-s] ))`).
     if arm.contains("compadd") {
+        let mut if_depth: u32 = 0;
         for line in arm.lines() {
-            let line = line.trim();
-            if line.contains("compadd")
-                && let Some(items) = action_to_static_list(line)
+            let t = line.trim();
+            let is_if = t == "if" || t.starts_with("if ") || t.starts_with("if\t")
+                || t.starts_with("if[") || t.starts_with("if(");
+            let is_fi = t == "fi" || t.starts_with("fi ") || t.starts_with("fi;")
+                || t.starts_with("fi\t") || t.starts_with("fi|") || t.starts_with("fi&");
+            if is_if {
+                if_depth += 1;
+                continue;
+            }
+            if is_fi {
+                if_depth = if_depth.saturating_sub(1);
+                continue;
+            }
+            if if_depth > 0 {
+                continue; // skip lines inside conditional blocks
+            }
+            if t.contains("compadd")
+                && let Some(items) = action_to_static_list(t)
                 && !items.is_empty()
             {
                 return Some(StateAction::StaticList(items));
@@ -2343,14 +2474,19 @@ fn extract_plus_opt_args_flag(line: &str) -> Vec<String> {
 fn shell_tokenize(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    // Track whether the current token was started by a quote (even if empty content).
+    let mut in_quoted_token = false;
     let mut chars = s.chars().peekable();
     while let Some(&c) = chars.peek() {
         if c.is_ascii_whitespace() {
-            if !current.is_empty() {
+            // Flush current token (may be empty if it was an empty quoted string).
+            if !current.is_empty() || in_quoted_token {
                 tokens.push(std::mem::take(&mut current));
+                in_quoted_token = false;
             }
             chars.next();
         } else if c == '\'' {
+            in_quoted_token = true;
             chars.next(); // skip opening quote
             while let Some(&ch) = chars.peek() {
                 if ch == '\'' {
@@ -2361,6 +2497,7 @@ fn shell_tokenize(s: &str) -> Vec<String> {
                 chars.next();
             }
         } else if c == '"' {
+            in_quoted_token = true;
             chars.next();
             while let Some(&ch) = chars.peek() {
                 if ch == '"' {
@@ -2375,7 +2512,7 @@ fn shell_tokenize(s: &str) -> Vec<String> {
             chars.next();
         }
     }
-    if !current.is_empty() {
+    if !current.is_empty() || in_quoted_token {
         tokens.push(current);
     }
     tokens
@@ -2416,9 +2553,38 @@ pub fn action_to_static_list(action: &str) -> Option<Vec<String>> {
         let mut items = Vec::new();
         let mut after_sep = false;
         let mut array_mode = false;
+        // Running count of unclosed `{` and `(` seen inside tokens that started
+        // with `$`, `{`, or `(`.  While this is > 0 we are inside a complex
+        // shell expansion (e.g. `${(S)${...$(cmd -p arg noglob...)...}}`) and
+        // must skip every token without treating it as a compadd flag or item.
+        let mut expansion_depth: i32 = 0;
         let mut i = 1usize;
         while i < tokens.len() {
             let t = tokens[i];
+
+            // Adjust expansion depth based on brace/paren counts in this token.
+            // Count net open braces/parens: each `{` or `(` increments depth,
+            // each `}` or `)` decrements it.
+            let net: i32 = t.chars().map(|c| match c {
+                '{' | '(' => 1,
+                '}' | ')' => -1,
+                _ => 0,
+            }).sum();
+            if expansion_depth > 0 {
+                expansion_depth = (expansion_depth + net).max(0);
+                i += 1;
+                continue;
+            }
+
+            // Start a new expansion when the token begins with a `$`, `{`, or `(`.
+            if t.starts_with('$') || t.starts_with('{') || t.starts_with('(') {
+                // This whole token (and following tokens until depth returns to 0)
+                // are part of a shell substitution — skip them all.
+                expansion_depth = net.max(0);
+                i += 1;
+                continue;
+            }
+
             // The `-` or `--` separator marks the end of compadd options.
             // Only honour the first occurrence; after `after_sep` is set,
             // a bare `-` is a literal completion item (e.g. `compadd - + -`).
@@ -2458,11 +2624,6 @@ pub fn action_to_static_list(action: &str) -> Option<Vec<String>> {
             }
             // In array mode, words after the separator are array names, not items.
             if array_mode {
-                i += 1;
-                continue;
-            }
-            // Skip shell expansions (items starting with $, {, or () )
-            if t.starts_with('$') || t.starts_with('{') || t.starts_with('(') {
                 i += 1;
                 continue;
             }
@@ -2772,7 +2933,30 @@ fn parse_state_ref(spec: &str) -> Option<(StateRefKind, String)> {
 
     let s = spec.trim();
     let kind = if s.starts_with('*') {
-        StateRefKind::Rest
+        // `*--flag=[desc]:arg:->state` — repeatable flag; `*: :->state` — rest.
+        // Strip the leading `*` and optional exclusion group `(...)` to see if
+        // what follows is a flag (`-`).
+        let after_star = s.get(1..).unwrap_or("").trim_start();
+        let after_excl_star = if after_star.starts_with('(') {
+            after_star.find(')').map(|e| after_star[e + 1..].trim()).unwrap_or(after_star)
+        } else {
+            after_star
+        };
+        if after_excl_star.starts_with('-') {
+            // It's a repeatable flag spec — classify as Flag.
+            let flag: String = after_excl_star
+                .chars()
+                .take_while(|c| !matches!(*c, '[' | ':' | ' '))
+                .collect();
+            let flag = flag.trim_end_matches('+').trim_end_matches('=').to_string();
+            if flag.starts_with('-') && flag.len() > 1 {
+                StateRefKind::Flag(flag)
+            } else {
+                StateRefKind::Rest
+            }
+        } else {
+            StateRefKind::Rest
+        }
     } else if s.starts_with('-') || s.starts_with('(') {
         let after_excl = if s.starts_with('(') {
             s.find(')').map(|end| s[end + 1..].trim()).unwrap_or(s)
@@ -2798,6 +2982,12 @@ fn parse_state_ref(spec: &str) -> Option<(StateRefKind, String)> {
     } else if s.starts_with(':') {
         // Bare ':desc:->state' — means "next positional argument" (position 1)
         StateRefKind::Positional(1)
+    } else if s.starts_with('[') {
+        // Spec starting with `[description]...` is the description+action fragment
+        // from a brace-expanded flag spec like `'{-f,--flag}'[desc]:arg:->state'`.
+        // We cannot determine the flag name from this fragment alone, so skip it
+        // to avoid misclassifying it as Rest and polluting `spec.rest`.
+        return None;
     } else {
         StateRefKind::Rest
     };
@@ -3316,10 +3506,36 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
     // all assignment sites (including conditional branches).
     let array_specs = extract_array_specs(content);
 
+    // Track whether we are inside a `case $service in … esac` block.
+    // These blocks are used by multi-command completion files (e.g. `_libvirt`
+    // covers `virsh`, `virt-admin`, `virt-xml-validate`, …) to dispatch per-
+    // command specs.  We cannot determine which command a nested spec belongs
+    // to, so we skip the whole block to prevent one command's specs (e.g.
+    // `'1:file:_files'` from `virt-xml-validate`) from leaking into siblings.
+    let mut in_service_case: u32 = 0; // nesting depth (for nested case/esac)
+
     for line in content.lines() {
         let trimmed = line.trim().trim_end_matches('\\').trim();
         if trimmed.starts_with('#') {
             continue;
+        }
+
+        // Detect `case $service in` (or `case "$service" in`).
+        if trimmed.starts_with("case ")
+            && (trimmed.contains("$service") || trimmed.contains("\"$service\""))
+            && (trimmed.ends_with(" in") || trimmed.contains(" in;") || trimmed.contains(" in "))
+        {
+            in_service_case += 1;
+            continue;
+        }
+        // Track nested case/esac inside the service block.
+        if in_service_case > 0 {
+            if trimmed.starts_with("case ") && (trimmed.ends_with(" in") || trimmed.contains(" in;") || trimmed.contains(" in ")) {
+                in_service_case += 1;
+            } else if trimmed == "esac" || trimmed.starts_with("esac;") || trimmed.starts_with("esac ") {
+                in_service_case -= 1;
+            }
+            continue; // skip all lines inside the service-dispatch block
         }
 
         // We're looking for _arguments spec strings.
@@ -3403,7 +3619,8 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                         spec.rest_call_program.get_or_insert((tag, argv));
                     }
                     (StateRefKind::Rest, StateAction::StaticList(items)) => {
-                        spec.rest_static_list.get_or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
                     }
                     (StateRefKind::Positional(pos), StateAction::ArgType(t)) => {
                         spec.positional.entry(pos).or_insert(t);
@@ -3413,7 +3630,8 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                         spec.rest_call_program.get_or_insert((tag, argv));
                     }
                     (StateRefKind::Positional(_), StateAction::StaticList(items)) => {
-                        spec.rest_static_list.get_or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
                     }
                     (StateRefKind::Flag(flag), StateAction::ArgType(t)) => {
                         spec.flag_args.entry(flag).or_insert(t);
@@ -3423,16 +3641,20 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
                             .or_insert_with(|| (tag, argv));
                     }
                     (StateRefKind::Flag(flag), StateAction::StaticList(items)) => {
-                        spec.flag_static_lists.entry(flag).or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.flag_static_lists.entry(flag).or_insert(clean); }
                     }
                     (StateRefKind::Rest, StateAction::StaticListWithDescs(items, _)) => {
-                        spec.rest_static_list.get_or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
                     }
                     (StateRefKind::Positional(_), StateAction::StaticListWithDescs(items, _)) => {
-                        spec.rest_static_list.get_or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.rest_static_list.get_or_insert(clean); }
                     }
                     (StateRefKind::Flag(flag), StateAction::StaticListWithDescs(items, _)) => {
-                        spec.flag_static_lists.entry(flag).or_insert(items);
+                        let clean = sanitize_static_list(items);
+                        if !clean.is_empty() { spec.flag_static_lists.entry(flag).or_insert(clean); }
                     }
                 }
             } else if let Some(&arg_type) = state_types.get(&state_name) {
@@ -3729,6 +3951,40 @@ fn parse_call_program(action: &str) -> Option<(String, Vec<String>)> {
     let cp_pos = action.find("_call_program")?;
     let after = &action[cp_pos + "_call_program".len()..];
 
+    // Reject when _call_program is embedded inside a complex Zsh parameter
+    // expansion (e.g. `${(f)"$(_call_program ...)"}`).  In these cases the
+    // command's raw output is post-processed by the surrounding `${...}`
+    // pipeline — running the argv bare would produce garbage.
+    //
+    // Two valid forms we DO handle:
+    //   Direct:   `_call_program tag cmd args`   (at line start or after whitespace)
+    //   Compadd:  `compadd ... $(_call_program tag cmd args)`
+    //
+    // The distinguishing signal: in the invalid case the `$(` wrapping
+    // `_call_program` is preceded by a double-quote (`"$(` inside `${(f)"$(..."}`).
+    // In the valid compadd form the `$(` follows whitespace or `-`.
+    if cp_pos > 0 {
+        let before = &action[..cp_pos];
+        // Check 1: `_call_program` is inside a quoted subshell in a parameter expansion.
+        // Pattern: `...${...(f)"$(_call_program ...)"...}` → before ends with `"$(`
+        if before.ends_with("\"$(") {
+            return None;
+        }
+        // Check 2: there is a `${` anywhere before cp_pos but no `$(` wrapper at all.
+        // This means `_call_program` appears as a bare word inside a `${...}` block.
+        if before.contains("${") && !before.contains("$(") {
+            return None;
+        }
+        // Check 3: `_call_program` appears inside a nested `$( )` that is itself
+        // inside a `${ }` parameter expansion.  In this case the raw output goes
+        // through post-processing (e.g. `${(L@)${(@f)$(_call_program ...)}...}`)
+        // and must not be stored directly.
+        // Signal: `before` contains BOTH `${` and `$(` → nested substitution.
+        if before.contains("${") && before.contains("$(") {
+            return None;
+        }
+    }
+
     // If embedded in $(...), stop at the closing paren; otherwise take the whole tail
     let end = after.find(')').unwrap_or(after.len());
     let inner = &after[..end];
@@ -3809,6 +4065,8 @@ fn store_call_program(spec_str: &str, tag: String, argv: Vec<String>, spec: &mut
 /// Store a static list of literal completion items in `spec` based on the spec string prefix.
 /// Follows the same routing logic as `store_call_program`.
 fn store_static_list(spec_str: &str, items: Vec<String>, spec: &mut ArgSpec) {
+    let items = sanitize_static_list(items);
+    if items.is_empty() { return; }
     let s = spec_str.trim();
 
     if s.starts_with('*') {
@@ -4150,6 +4408,11 @@ fn extract_subcommands_from_content(cmd: &str, content: &str) -> Vec<String> {
     let prefix = format!("_{}-", cmd);
 
     for line in content.lines() {
+        // Skip comment lines — documentation examples frequently reference
+        // `_git-foo` etc. which would otherwise leak as real subcommands.
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
         // Pattern: (( $+functions[_cmd-subcmd] ))
         if let Some(start) = line.find(&prefix) {
             let after = &line[start + prefix.len()..];
@@ -4158,7 +4421,7 @@ fn extract_subcommands_from_content(cmd: &str, content: &str) -> Vec<String> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect();
-            if !subcmd.is_empty() && subcmd.len() < 40 {
+            if is_plausible_subcommand_helper_name(&subcmd) {
                 subs.push(subcmd);
             }
         }
@@ -4167,6 +4430,28 @@ fn extract_subcommands_from_content(cmd: &str, content: &str) -> Vec<String> {
     subs.sort();
     subs.dedup();
     subs
+}
+
+/// Reject zsh-internal helper function names that match the `_<cmd>-<x>`
+/// shape but aren't real subcommands. Helpers tend to use camelCase
+/// (`_make-expandVars`, `_make-parseMakefile`) or the `_sm` state-machine
+/// suffix from `_regex_arguments` (`_apt-cache_sm`). Real subcommands are
+/// lowercase-with-hyphens, so anything containing a lowercase-then-uppercase
+/// transition is an internal helper.
+fn is_plausible_subcommand_helper_name(name: &str) -> bool {
+    if name.is_empty() || name.len() >= 40 {
+        return false;
+    }
+    if name.ends_with("_sm") {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i].is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extract subcommand names from a handwritten `case $words[2] in ... esac` pattern.
@@ -4353,6 +4638,56 @@ _git-commit () {
         let content = "some random content\n_arguments -S\n";
         let subs = extract_subcommands_from_content("foo", content);
         assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_skips_camelcase_helpers() {
+        // _make-expandVars / _make-parseMakefile are internal helpers, not subcommands
+        let content = "\
+_make-expandVars() { : }
+_make-parseMakefile () { : }
+_make-all () { : }
+";
+        let subs = extract_subcommands_from_content("make", content);
+        assert_eq!(subs, vec!["all"]);
+    }
+
+    #[test]
+    fn test_extract_skips_sm_state_machine_helpers() {
+        // `_regex_arguments ${funcname}_sm` generates helper functions that
+        // aren't subcommands.
+        let content = "\
+(( $+functions[_apt-cache_sm] )) || _apt-cache_sm () { : }
+(( $+functions[_apt-cdrom_sm] )) || _apt-cdrom_sm () { : }
+(( $+functions[_apt-install] )) || _apt-install () { : }
+";
+        let subs = extract_subcommands_from_content("apt", content);
+        assert_eq!(subs, vec!["install"]);
+    }
+
+    #[test]
+    fn test_extract_keeps_all_uppercase_acronym() {
+        // Names with no lowercase->uppercase transition (like MH) are kept
+        let content = "_email-MH () { : }\n_email-imap () { : }\n";
+        let subs = extract_subcommands_from_content("email", content);
+        assert_eq!(subs, vec!["MH", "imap"]);
+    }
+
+    #[test]
+    fn test_extract_skips_comment_line_example() {
+        // zsh's _git file has `#     % zstyle ... user-commands foo:'description for foo'`
+        // and `# A better solution is to create a function _git-foo() to handle ...`
+        // in doc comments. The parser must skip these.
+        let content = "\
+#compdef git
+#
+# Say you got your own git sub-commands (git will run a program `git-foo'
+# A better solution is to create a function _git-foo() to handle specific
+#     % zstyle ':completion:*:*:git:*' user-commands foo:'description for foo'
+(( $+functions[_git-checkout] )) || _git-checkout () { : }
+";
+        let subs = extract_subcommands_from_content("git", content);
+        assert_eq!(subs, vec!["checkout"]);
     }
 
     #[test]
@@ -5464,6 +5799,34 @@ _test-cmd () {
         let _ = sub_specs;
     }
 
+    #[test]
+    fn test_libvirt_no_noglob_in_virsh_spec() {
+        let path = "/usr/share/zsh/5.9/functions/_libvirt";
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return; // skip if not available
+        };
+        let spec = parse_arg_spec(&content);
+        // `noglob` is a zsh modifier used in _call_program invocations inside
+        // _libvirt (e.g. `_call_program -p servers noglob virt-admin srv-list`).
+        // It must NOT leak into virsh's static completion list. The bug was that
+        // shell_tokenize() split the `${...}` expansion on spaces, causing `-p`
+        // inside the expansion to be treated as a compadd option, which then
+        // consumed `servers` as its argument, leaving `noglob` and `virt-admin`
+        // as apparent literal items.
+        if let Some(ref items) = spec.rest_static_list {
+            assert!(
+                !items.contains(&"noglob".to_string()),
+                "noglob leaked into rest_static_list: {:?}",
+                items
+            );
+            assert!(
+                !items.contains(&"virt-admin".to_string()),
+                "virt-admin leaked into rest_static_list: {:?}",
+                items
+            );
+        }
+    }
+
     // --- State machine (->state) resolution ---
 
     #[test]
@@ -5960,6 +6323,164 @@ _git-checkout() {
     }
 
     #[test]
+    fn test_make_no_camelcase_subcommands() {
+        // expandVars and parseMakefile are _make helper function names,
+        // NOT real `make` subcommands. They should not appear in the trie.
+        use crate::trie::CommandTrie;
+        let _guard = crate::test_util::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut trie = CommandTrie::default();
+        scan_completions(&mut trie);
+        let make_node = trie.root.get_child("make");
+        if let Some(node) = make_node {
+            for subcmd in node.children.keys() {
+                assert!(
+                    subcmd != "expandVars" && subcmd != "parseMakefile",
+                    "make should not have '{}' as a subcommand", subcmd
+                );
+                // No camelCase subcommands at all
+                let bytes = subcmd.as_bytes();
+                for i in 1..bytes.len() {
+                    assert!(
+                        !(bytes[i].is_ascii_uppercase() && bytes[i-1].is_ascii_lowercase()),
+                        "make has camelCase subcommand '{}'", subcmd
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_apt_extract_subcommands_debug() {
+        // Debug: check what extract_subcommands_from_content returns for _apt
+        let content = std::fs::read_to_string("/usr/share/zsh/5.9/functions/_apt").unwrap_or_default();
+        if content.is_empty() { return; }
+        let subs = extract_subcommands_from_content("apt", &content);
+        eprintln!("apt subcommands from _apt: {:?}", subs);
+        for sub in &subs {
+            assert!(!sub.ends_with("_sm"), "extract_subcommands_from_content returned '_sm' item '{}'", sub);
+        }
+    }
+
+    #[test]
+    fn test_apt_no_sm_subcommands() {
+        // The _apt completion defines _apt-cache_sm, _apt-cmd_sm etc. as helper
+        // state-machine functions. They should NOT appear as `apt` subcommands.
+        use crate::trie::CommandTrie;
+        let _guard = crate::test_util::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut trie = CommandTrie::default();
+        scan_completions(&mut trie);
+        let apt_node = trie.root.get_child("apt");
+        if let Some(node) = apt_node {
+            for subcmd in node.children.keys() {
+                assert!(
+                    !subcmd.ends_with("_sm"),
+                    "apt should not have '_sm' subcommand '{}'", subcmd
+                );
+                assert!(
+                    !subcmd.contains('_'),
+                    "apt should not have underscore subcommand '{}' (internal helper)", subcmd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_make_apt_full_pipeline_no_camelcase_sm() {
+        // Full pipeline (Zsh + Bash scans) should not produce camelCase or _sm
+        // items as make/apt subcommands.
+        use crate::{bash_completions, fish_completions, trie::CommandTrie};
+        let _guard = crate::test_util::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut trie = CommandTrie::default();
+        scan_completions(&mut trie);
+        fish_completions::scan_fish_completions(&mut trie);
+        bash_completions::scan_bash_completions(&mut trie);
+        // Check make
+        if let Some(make_node) = trie.root.get_child("make") {
+            for subcmd in make_node.children.keys() {
+                let bytes = subcmd.as_bytes();
+                for i in 1..bytes.len() {
+                    assert!(
+                        !(bytes[i].is_ascii_uppercase() && bytes[i-1].is_ascii_lowercase()),
+                        "make has camelCase subcommand '{}' after full pipeline", subcmd
+                    );
+                }
+            }
+        }
+        // Check apt
+        if let Some(apt_node) = trie.root.get_child("apt") {
+            for subcmd in apt_node.children.keys() {
+                assert!(
+                    !subcmd.ends_with("_sm"),
+                    "apt has '_sm' subcommand '{}' after full pipeline", subcmd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rpm_full_pipeline_no_showrc() {
+        // Full pipeline test: scan_completions should not produce a
+        // rest_call_program with "rpm --showrc" for the rpm command.
+        use crate::trie::CommandTrie;
+        let _guard = crate::test_util::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut trie = CommandTrie::default();
+        scan_completions(&mut trie);
+        if let Some(spec) = trie.arg_specs.get("rpm") {
+            if let Some((tag, argv)) = &spec.rest_call_program {
+                assert!(
+                    !argv.contains(&"--showrc".to_string()),
+                    "trie rpm rest_call_program should not be 'rpm --showrc': tag={tag}, argv={argv:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rpm_call_program_not_showrc() {
+        // The rpm `macros` state uses _call_program embedded in a complex
+        // parameter expansion. Our parser should NOT store "rpm --showrc"
+        // as the rest_call_program because running it bare produces garbage.
+        let content = std::fs::read_to_string("/usr/share/zsh/5.9/functions/_rpm").unwrap_or_default();
+        if content.is_empty() {
+            return;
+        }
+        let spec = parse_arg_spec(&content);
+        if let Some((tag, argv)) = &spec.rest_call_program {
+            assert!(
+                !argv.contains(&"--showrc".to_string()),
+                "rest_call_program should not store 'rpm --showrc' (garbage output): tag={tag}, argv={argv:?}"
+            );
+            assert!(
+                !argv.contains(&"--querytags".to_string()),
+                "rest_call_program should not store 'rpm --querytags' (embedded): tag={tag}, argv={argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rpm_static_list_no_garbage() {
+        let content = std::fs::read_to_string("/usr/share/zsh/5.9/functions/_rpm").unwrap_or_default();
+        if content.is_empty() {
+            return; // skip if file not present
+        }
+        let spec = parse_arg_spec(&content);
+        // rpm uses _call_program to fetch macros at runtime — rest_static_list
+        // should be empty (no statically-known items) or contain only clean identifiers.
+        if let Some(items) = &spec.rest_static_list {
+            eprintln!("rpm rest_static_list ({} items): {:?}", items.len(), &items[..items.len().min(30)]);
+            for item in items {
+                // None of these should appear — they are from dynamic rpm output or zsh syntax
+                assert!(
+                    !item.contains("RPM_") && !item.contains("export") && !item.contains("unset")
+                        && !item.contains("LANG") && !item.starts_with("-20")
+                        && !item.starts_with("-13"),
+                    "rest_static_list contains runtime or shell garbage: {:?}", item
+                );
+            }
+        }
+    }
+
+    #[test]
     fn completion_dirs_is_deduplicated() {
         let dirs = completion_dirs();
         let mut sorted = dirs.clone();
@@ -6401,4 +6922,103 @@ _description files expl 'file'
         // Restore
         crate::runtime_config::set(crate::runtime_config::RuntimeConfig::default());
     }
+
+    // --- extract_tag_groups conditional-skip tests ---
+
+    #[test]
+    fn extract_tag_groups_skips_wanted_inside_if_block() {
+        let arrays = ArrayData::new();
+        // _wanted inside an `if` block must be ignored — it's conditional.
+        let body = r#"
+if [[ $cond ]]; then
+    _wanted subsystems expl subsystem compadd sftp
+fi
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert!(groups.is_empty(), "tag groups inside `if` should be skipped");
+    }
+
+    #[test]
+    fn extract_tag_groups_skips_wanted_inside_case_block() {
+        let arrays = ArrayData::new();
+        // _wanted inside a `case ... in` arm must be ignored — state-specific.
+        let body = r#"
+case "$state" in
+    macs)
+        _wanted macs expl 'MAC algorithm' compadd - foo bar
+    ;;
+    command)
+        if (( $+opt_args[-s] )); then
+            _wanted subsystems expl subsystem compadd sftp
+        fi
+    ;;
+esac
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert!(groups.is_empty(), "tag groups inside `case` arms should be skipped");
+    }
+
+    #[test]
+    fn extract_tag_groups_keeps_top_level_wanted() {
+        let arrays = ArrayData::new();
+        // A _wanted NOT inside any conditional should still be captured.
+        let body = r#"
+_wanted commands expl 'command' compadd start stop restart
+case "$state" in
+    option)
+        _wanted options expl 'option' compadd foo bar
+    ;;
+esac
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert_eq!(groups.len(), 1, "only top-level _wanted should be captured");
+        assert_eq!(groups[0].tag, "commands");
+        assert_eq!(groups[0].items, vec!["start", "stop", "restart"]);
+    }
+
+    // --- shell_tokenize empty-quoted-string test ---
+
+    #[test]
+    fn shell_tokenize_preserves_empty_quoted_string_as_token() {
+        // Before fix: `compadd -S "" -d mods -F dedup I M` would lose the ""
+        // token, causing -S to consume -d (the next flag) as its argument, and
+        // then mods would be treated as a literal item.
+        // After fix: "" produces an empty token so -S consumes "" and -d/mods/
+        // -F/dedup are processed correctly, leaving only I and M as items.
+        let action = "compadd -S \"\" -d mods -F dedup I M";
+        let items = action_to_static_list(action);
+        assert_eq!(
+            items,
+            Some(vec!["I".to_string(), "M".to_string()]),
+            "empty-quoted arg to -S must not cause next flag to be skipped"
+        );
+    }
+
+    // --- extract_state_arm_action conditional compadd test ---
+
+    #[test]
+    fn state_arm_compadd_inside_if_is_skipped() {
+        // The compadd inside `if (( $+opt_args[-s] ))` must NOT produce a
+        // StaticList — it's conditional on a runtime flag being set.
+        let arm = r#"command)
+  if (( $+opt_args[-s] )); then
+    _wanted subsystems expl subsystem compadd sftp
+    return
+  fi
+  local -a _comp_priv_prefix
+  _normal
+  return
+"#;
+        let empty = ArrayData::new();
+        let action = extract_state_arm_action_with_arrays(arm, &empty);
+        // The arm should not produce a StaticList with "sftp" inside it.
+        match action {
+            Some(StateAction::StaticList(items)) => {
+                assert!(!items.contains(&"sftp".to_string()),
+                    "sftp from inside `if` block must not appear in arm action items");
+            }
+            _ => {} // None or ArgType is fine
+        }
+    }
+
 }
