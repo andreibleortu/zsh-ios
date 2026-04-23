@@ -13,6 +13,20 @@ use crate::trie::{self, ArgModeMap, ArgSpec, ArgSpecMap, CommandTrie, TrieNode};
 
 use super::escape::{escape_resolved_path, shell_escape_path};
 
+use std::sync::atomic::AtomicBool;
+
+/// Global toggle for the statistical tiebreaker. Set once at CLI startup
+/// from `user_config.disable_statistics`.  When true, `score_candidates_stats`
+/// short-circuits to `None` so the engine never picks between tied
+/// candidates based on local history.
+pub(super) static STATS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable the statistical tiebreaker at runtime. Called from
+/// `main.rs` after reading `UserConfig`.
+pub fn set_statistics_disabled(b: bool) {
+    STATS_DISABLED.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Debug)]
 pub enum ResolveResult {
     /// Fully resolved -- the expanded command line.
@@ -983,6 +997,12 @@ pub(super) fn score_candidates_stats<'a>(
     candidates: &[(&'a str, &'a TrieNode)],
     now: u64,
 ) -> Option<(&'a str, &'a TrieNode)> {
+    // Deterministic mode: skip the statistical tiebreaker entirely. Users
+    // who need reproducible resolution across machines set this so the
+    // engine never silently picks based on their local history.
+    if STATS_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     const DOMINANCE_MARGIN: f32 = 1.05;
     if candidates.len() <= 1 {
         return candidates.first().copied();

@@ -29,6 +29,14 @@ pub struct UserConfig {
     /// resolved first word), `resolve` returns passthrough (exit 2) so the
     /// buffer runs exactly as typed.
     pub command_blocklist: Vec<String>,
+
+    /// When true, the statistical tiebreaker (frequency × recency ×
+    /// success-rate) is skipped — if narrowing by subcommand prefix,
+    /// arg-type, and flag match still leaves >1 candidate, the user sees
+    /// the picker instead of the engine silently picking the historical
+    /// favorite. Users who want reproducible resolution across machines
+    /// and sessions turn this on.
+    pub disable_statistics: bool,
 }
 
 impl UserConfig {
@@ -78,8 +86,16 @@ mod tests {
         let c = UserConfig::default();
         assert_eq!(c.stale_threshold(), DEFAULT_STALE_THRESHOLD_SECS);
         assert!(!c.disable_learning);
+        assert!(!c.disable_statistics);
         assert!(c.command_blocklist.is_empty());
         assert!(!c.is_blocklisted("git"));
+    }
+
+    #[test]
+    fn parse_disable_statistics() {
+        let c = UserConfig::parse("disable_statistics: true").unwrap();
+        assert!(c.disable_statistics);
+        assert!(!c.disable_learning);
     }
 
     #[test]

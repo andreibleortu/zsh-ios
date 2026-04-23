@@ -19,4 +19,6 @@ mod engine;
 mod escape;
 
 pub use complete::complete;
-pub use engine::{explain, resolve_line, AmbiguityInfo, DeepCandidate, ResolveResult};
+pub use engine::{
+    explain, resolve_line, set_statistics_disabled, AmbiguityInfo, DeepCandidate, ResolveResult,
+};

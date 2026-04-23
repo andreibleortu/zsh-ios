@@ -248,6 +248,7 @@ fn cmd_resolve(line: &str) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
     let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    resolve::set_statistics_disabled(user_cfg.disable_statistics);
 
     // Blocklist pre-check: if the user typed the blocklisted name literally,
     // passthrough immediately so the engine does zero work.
@@ -339,6 +340,8 @@ fn print_path_ambiguity_shell(candidates: &[String]) {
 fn cmd_complete(line: &str) {
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    resolve::set_statistics_disabled(user_cfg.disable_statistics);
     let output = resolve::complete(line, &trie, &pin_store);
     print!("{}", output);
 }
@@ -352,6 +355,7 @@ fn cmd_learn(command: &str, exit_code: i32) {
     if user_cfg.disable_learning {
         return;
     }
+    resolve::set_statistics_disabled(user_cfg.disable_statistics);
 
     if config::ensure_config_dir().is_err() {
         return;
@@ -556,6 +560,14 @@ fn cmd_status() {
             "enabled"
         }
     );
+    println!(
+        "  Statistics:  {}",
+        if user_cfg.disable_statistics {
+            "disabled (deterministic)"
+        } else {
+            "enabled"
+        }
+    );
     println!("  Blocklist:   {}", user_cfg.command_blocklist.len());
 
     if tree_path.exists() {
@@ -612,6 +624,8 @@ fn cmd_explain(line: &str) {
     }
     let trie = load_trie();
     let pin_store = pins::Pins::load(&config::pins_path());
+    let user_cfg = user_config::UserConfig::load(&config::user_config_path());
+    resolve::set_statistics_disabled(user_cfg.disable_statistics);
     println!("{}", resolve::explain(line, &trie, &pin_store));
 }
 

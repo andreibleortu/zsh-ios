@@ -48,6 +48,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         let mut entries: Vec<(&str, &TrieNode)> = trie.root.prefix_search("");
         entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
         let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
+        output.push_str("% Possible commands:\n");
         output.push_str(&format_columns(&names, 80));
         return output;
     }
@@ -68,10 +69,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     if completed_words.is_empty() {
         let mut matches = trie.root.prefix_search(prefix);
         if matches.is_empty() {
-            output.push_str(&format!("  No commands matching \"{}\"\n", prefix));
+            output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
         } else {
             matches.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
             let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
+            output.push_str("% Possible commands:\n");
             output.push_str(&format_columns(&names, 80));
         }
         return output;
@@ -129,6 +131,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             _ => {
                 // Intermediate word is ambiguous — show its completions
                 let names: Vec<&str> = matches.iter().map(|(n, _)| *n).collect();
+                output.push_str("% Possible completions:\n");
                 output.push_str(&format_columns(&names, 80));
                 return output;
             }
@@ -163,13 +166,13 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && prev.starts_with('-')
         && let Some((tag, argv)) = spec.and_then(|s| s.flag_call_programs.get(prev))
     {
-        output.push_str(&format!("  Expects: <{}>\n", tag));
+        output.push_str(&format!("% Expects: <{}>\n", tag));
         let results = runtime_complete::call_program_cached(argv, prefix);
         if !results.is_empty() {
             let names: Vec<&str> = results.iter().map(String::as_str).collect();
             output.push_str(&format_columns(&names, 80));
         } else if !prefix.is_empty() {
-            output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+            output.push_str(&format!("% No matches for \"{}\"\n", prefix));
         }
         return output;
     }
@@ -179,7 +182,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         && prev.starts_with('-')
         && let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prev))
     {
-        output.push_str("  Expects: <value>\n");
+        output.push_str("% Expects: <value>\n");
         let filtered: Vec<&str> = items
             .iter()
             .filter(|i| prefix.is_empty() || i.starts_with(prefix))
@@ -188,7 +191,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         if !filtered.is_empty() {
             output.push_str(&format_columns(&filtered, 80));
         } else if !prefix.is_empty() {
-            output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+            output.push_str(&format!("% No matches for \"{}\"\n", prefix));
         }
         return output;
     }
@@ -202,7 +205,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     {
         let results = runtime_complete::call_program_cached(argv, prefix);
         if !results.is_empty() {
-            output.push_str(&format!("  Expects: <{}>\n", tag));
+            output.push_str(&format!("% Expects: <{}>\n", tag));
             let names: Vec<&str> = results.iter().map(String::as_str).collect();
             output.push_str(&format_columns(&names, 80));
             return output;
@@ -220,7 +223,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             .map(String::as_str)
             .collect();
         if !filtered.is_empty() {
-            output.push_str("  Expects: <value>\n");
+            output.push_str("% Expects: <value>\n");
             output.push_str(&format_columns(&filtered, 80));
             return output;
         }
@@ -262,6 +265,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             let cmd_key = resolved_words.join(" ");
             let descs = trie.descriptions.get(&cmd_key);
 
+            output.push_str("% Possible subcommands:\n");
             if descs.is_some_and(|d| !d.is_empty()) && sorted.len() <= 40 {
                 let descs = descs.unwrap();
                 let col_width = sorted.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 2;
@@ -279,6 +283,11 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         }
 
         if !flag_matches.is_empty() {
+            if subcmds.is_empty() {
+                output.push_str("% Possible flags:\n");
+            } else {
+                output.push_str("% Flags:\n");
+            }
             output.push_str(&format_flags_from_trie(&flag_matches, spec));
         }
 
@@ -345,7 +354,7 @@ pub(super) fn complete_flags(
     known_flags.sort_by(|a, b| a.0.cmp(&b.0));
 
     if known_flags.is_empty() {
-        output.push_str(&format!("  No flags matching \"{}\"\n", prefix));
+        output.push_str(&format!("% No flags matching \"{}\"\n", prefix));
         return output;
     }
 
@@ -353,7 +362,7 @@ pub(super) fn complete_flags(
     if known_flags.len() == 1 && known_flags[0].0 == prefix {
         if let Some(arg_type) = known_flags[0].1 {
             let hint = runtime_complete::type_hint(arg_type);
-            output.push_str(&format!("  {} expects: {}\n", prefix, hint));
+            output.push_str(&format!("% {} expects: {}\n", prefix, hint));
             let rt = runtime_complete::list_matches(arg_type, "");
             let names: Vec<&str> = rt.iter().map(String::as_str).collect();
             if !names.is_empty() {
@@ -363,7 +372,7 @@ pub(super) fn complete_flags(
             spec.and_then(|s| s.flag_call_programs.get(prefix))
         {
             // _call_program flag: run it now to show valid values
-            output.push_str(&format!("  {} expects: <{}>\n", prefix, tag));
+            output.push_str(&format!("% {} expects: <{}>\n", prefix, tag));
             let results = runtime_complete::call_program_cached(argv, "");
             if !results.is_empty() {
                 let names: Vec<&str> = results.iter().map(String::as_str).collect();
@@ -371,15 +380,18 @@ pub(super) fn complete_flags(
             }
         } else if let Some(items) = spec.and_then(|s| s.flag_static_lists.get(prefix)) {
             // Static list flag: show the known items
-            output.push_str(&format!("  {} expects: <value>\n", prefix));
+            output.push_str(&format!("% {} expects: <value>\n", prefix));
             let names: Vec<&str> = items.iter().map(String::as_str).collect();
             output.push_str(&format_columns(&names, 80));
         } else {
             // Boolean flag, no argument
-            output.push_str(&format!("  {} (no argument)\n", prefix));
+            output.push_str(&format!("% {} (no argument)\n", prefix));
         }
         return output;
     }
+
+    // Multiple flag matches
+    output.push_str("% Possible flags:\n");
 
     // Multiple matches or partial: show flag names with their expected arg type
     let col_width = known_flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0) + 2;
@@ -575,10 +587,10 @@ pub(super) fn show_type_completions(
                 let hosts = runtime_complete::list_matches(trie::ARG_MODE_HOSTS, host_prefix);
                 let with_user: Vec<String> =
                     hosts.iter().map(|h| format!("{user_prefix}{h}")).collect();
-                output.push_str("  Expects: <user@host>\n");
+                output.push_str("% Expects: <user@host>\n");
                 if with_user.is_empty() {
                     if !host_prefix.is_empty() {
-                        output.push_str(&format!("  No matches for \"{host_prefix}\"\n"));
+                        output.push_str(&format!("% No matches for \"{host_prefix}\"\n"));
                     }
                 } else {
                     let names: Vec<&str> = with_user.iter().map(String::as_str).collect();
@@ -587,12 +599,12 @@ pub(super) fn show_type_completions(
                 return;
             }
             let hint = runtime_complete::type_hint(type_id);
-            output.push_str(&format!("  Expects: {}\n", hint));
+            output.push_str(&format!("% Expects: {}\n", hint));
             let rt = runtime_complete::list_matches(type_id, prefix);
             let names: Vec<&str> = rt.iter().map(String::as_str).collect();
             if names.is_empty() {
                 if !prefix.is_empty() {
-                    output.push_str(&format!("  No matches for \"{}\"\n", prefix));
+                    output.push_str(&format!("% No matches for \"{}\"\n", prefix));
                 }
             } else {
                 output.push_str(&format_columns(&names, 80));
@@ -605,7 +617,7 @@ pub(super) fn show_type_completions(
                 && pos_type != 0
             {
                 let hint = runtime_complete::type_hint(pos_type);
-                output.push_str(&format!("  Expects: {}\n", hint));
+                output.push_str(&format!("% Expects: {}\n", hint));
                 let rt = runtime_complete::list_matches(pos_type, prefix);
                 let names: Vec<&str> = rt.iter().map(String::as_str).collect();
                 if !names.is_empty() {
@@ -614,9 +626,9 @@ pub(super) fn show_type_completions(
                 }
             }
             if prefix.is_empty() {
-                output.push_str("  <enter argument>\n");
+                output.push_str("% <enter argument>\n");
             } else {
-                output.push_str(&format!("  No commands matching \"{}\"\n", prefix));
+                output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
             }
         }
     }
@@ -699,8 +711,9 @@ pub(super) fn complete_filesystem(word: &str, dirs_only: bool) -> String {
 
     let mut output = String::new();
     if filtered.is_empty() {
-        output.push_str(&format!("  No matches for \"{}\"\n", word));
+        output.push_str(&format!("% No matches for \"{}\"\n", word));
     } else {
+        output.push_str("% Possible completions:\n");
         // Append directory marker and use multi-column display
         let display_names: Vec<String> = filtered
             .iter()

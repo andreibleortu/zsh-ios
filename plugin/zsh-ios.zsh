@@ -433,14 +433,14 @@ _zsh_ios_help() {
                 (( col_n++ ))
             done
             [[ -n "$line" ]] && col_output+="${line}"$'\n'
-            output="  Expects: <argument> [ZLE]\n${col_output}"
+            output="% Expects: <argument> [ZLE]\n${col_output}"
         fi
     fi
 
     if [[ -n "$output" ]]; then
         zle -M "$output"
     else
-        zle -M "  No commands found"
+        zle -M "% No commands found"
     fi
 }
 
