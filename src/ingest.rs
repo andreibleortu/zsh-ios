@@ -303,6 +303,19 @@ fn classify_matcher_spec(spec: &str) -> MatcherRule {
         let charset = extract_charset(spec);
         return MatcherRule::PartialOn(charset.unwrap_or_default());
     }
+    // l:|[CHARSET]=* or l:|=* — folded to PartialOn (same segment-match behavior).
+    if spec.starts_with("l:|") {
+        let charset = extract_charset_l(spec);
+        return MatcherRule::PartialOn(charset.unwrap_or_default());
+    }
+    // b:=* — beginning anchor (covered by exact-prefix search; recorded as honored).
+    if spec.starts_with("b:") {
+        return MatcherRule::BeginningAnchor;
+    }
+    // e:=* — end anchor (typed prefix may match a suffix of the candidate).
+    if spec.starts_with("e:") {
+        return MatcherRule::EndAnchor;
+    }
     MatcherRule::Unknown(spec.to_string())
 }
 
@@ -369,6 +382,15 @@ fn split_quoted_args(s: &str) -> Vec<&str> {
 fn extract_charset(spec: &str) -> Option<String> {
     // Expect the form r:|[...]=*
     let inner = spec.strip_prefix("r:|[")?;
+    let end = inner.find(']')?;
+    Some(inner[..end].to_string())
+}
+
+/// Extract the character-set string from `l:|[CHARSET]=*`.
+///
+/// Returns `Some("._-")` for `l:|[._-]=*`, `None` for bare `l:|=*`.
+fn extract_charset_l(spec: &str) -> Option<String> {
+    let inner = spec.strip_prefix("l:|[")?;
     let end = inner.find(']')?;
     Some(inner[..end].to_string())
 }
@@ -669,10 +691,47 @@ mod tests {
     #[test]
     fn parse_zstyle_matchers_unknown_recorded() {
         use crate::trie::MatcherRule;
+        // Something truly unrecognised should still land in Unknown.
+        let body = "zstyle ':completion:*' matcher-list 'x:weird=spec'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::Unknown("x:weird=spec".to_string()));
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_left_partial() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'l:|[-_.]=*'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::PartialOn("-_.".to_string()));
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_left_partial_any() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'l:|=*'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::PartialOn(String::new()));
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_beginning_anchor() {
+        use crate::trie::MatcherRule;
         let body = "zstyle ':completion:*' matcher-list 'b:=*'\n";
         let rules = parse_zstyle_matchers(body);
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0], MatcherRule::Unknown("b:=*".to_string()));
+        assert_eq!(rules[0], MatcherRule::BeginningAnchor);
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_end_anchor() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'e:=*'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::EndAnchor);
     }
 
     #[test]

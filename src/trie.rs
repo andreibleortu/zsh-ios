@@ -12,7 +12,15 @@ pub enum MatcherRule {
     /// Match-in-the-middle on separator characters. `PartialOn("._-")` means
     /// `r:|[._-]=*`: the prefix can start a segment delimited by those chars.
     /// `PartialOn("")` means `r:|=*`: any position is a valid anchor.
+    /// Also covers `l:|[chars]=*` and `l:|=*` (folded to same behavior).
     PartialOn(String),
+    /// `b:=*` — beginning anchor. The candidate may have a leading string the
+    /// user didn't type. Covered by the default exact-prefix search, so this
+    /// is a no-op we record for visibility/status.
+    BeginningAnchor,
+    /// `e:=*` — end anchor. The typed prefix may match a suffix of the
+    /// candidate. For a typed `verbose`, candidate `readonly-verbose` matches.
+    EndAnchor,
     /// A spec form we recognised but chose not to implement; stored verbatim so
     /// callers can count it without silently dropping it.
     Unknown(String),
@@ -157,15 +165,14 @@ impl TrieNode {
 
         // Always start with exact prefix matches.
         let mut results: Vec<(&'a str, &'a TrieNode)> = self.prefix_search(prefix);
-        let exact_names: HashSet<&str> = results.iter().map(|(n, _)| *n).collect();
+        let mut seen: HashSet<&str> = results.iter().map(|(n, _)| *n).collect();
 
         // Case-insensitive pass.
         if rules.iter().any(|r| matches!(r, MatcherRule::CaseInsensitive)) {
             let lower = prefix.to_lowercase();
             for (name, node) in &self.children {
-                if !exact_names.contains(name.as_str())
-                    && name.to_lowercase().starts_with(&lower)
-                {
+                if !seen.contains(name.as_str()) && name.to_lowercase().starts_with(&lower) {
+                    seen.insert(name.as_str());
                     results.push((name.as_str(), node));
                 }
             }
@@ -178,8 +185,7 @@ impl TrieNode {
         }) {
             let sep_chars: Vec<char> = charset.chars().collect();
             for (name, node) in &self.children {
-                // Skip names already included by an earlier pass.
-                if results.iter().any(|(n, _)| *n == name.as_str()) {
+                if seen.contains(name.as_str()) {
                     continue;
                 }
                 let hit = if sep_chars.is_empty() {
@@ -191,6 +197,21 @@ impl TrieNode {
                         .any(|seg| seg.starts_with(prefix))
                 };
                 if hit {
+                    seen.insert(name.as_str());
+                    results.push((name.as_str(), node));
+                }
+            }
+        }
+
+        // End-anchor pass: typed prefix may match a suffix of the candidate.
+        // BeginningAnchor is a no-op — exact-prefix search already covers it.
+        if rules.iter().any(|r| matches!(r, MatcherRule::EndAnchor)) {
+            for (name, node) in &self.children {
+                if seen.contains(name.as_str()) {
+                    continue;
+                }
+                if name.ends_with(prefix) {
+                    seen.insert(name.as_str());
                     results.push((name.as_str(), node));
                 }
             }
@@ -1445,9 +1466,41 @@ mod tests {
         trie.insert_command("git");
         trie.insert_command("grep");
         // An Unknown rule alone should not add any extra matches beyond prefix_search.
-        let rules = vec![MatcherRule::Unknown("b:=*".to_string())];
+        let rules = vec![MatcherRule::Unknown("x:weird=spec".to_string())];
         let res = trie.root.matcher_aware_search("gi", &rules);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, "git");
+    }
+
+    #[test]
+    fn matcher_aware_search_end_anchor() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("readonly-verbose");
+        trie.insert_command("mode-compact");
+        let rules = vec![MatcherRule::EndAnchor];
+        // "verbose" is a suffix of "readonly-verbose" — should match.
+        let res = trie.root.matcher_aware_search("verbose", &rules);
+        let names: Vec<&str> = res.iter().map(|(n, _)| *n).collect();
+        assert!(
+            names.contains(&"readonly-verbose"),
+            "expected 'readonly-verbose' in {:?}",
+            names
+        );
+        // "mode-compact" does not end with "verbose".
+        assert!(!names.contains(&"mode-compact"));
+    }
+
+    #[test]
+    fn matcher_aware_search_beginning_anchor_is_noop() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+        trie.insert_command("gitlab");
+        // BeginningAnchor should behave identically to plain prefix search.
+        let rules = vec![MatcherRule::BeginningAnchor];
+        let res = trie.root.matcher_aware_search("git", &rules);
+        let names: Vec<&str> = res.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"git"), "expected 'git' in {:?}", names);
+        assert!(names.contains(&"gitlab"), "expected 'gitlab' in {:?}", names);
+        assert_eq!(res.len(), 2);
     }
 }
