@@ -151,7 +151,8 @@ print "rc=$?"
 # ─── Ladder integration: _zsh_ios_help does not crash with all tiers empty ───
 
 @test "_zsh_ios_help falls through all worker tiers gracefully when worker absent" {
-    export ZSH_IOS_STUB_COMPLETE_OUT="% <enter argument>"
+    export ZSH_IOS_STUB_COMPLETE_OUT="% Expects: <argument>"
+    export ZSH_IOS_STUB_COMPLETE_EXIT=4
     run zsh_run '
 rm -f "${_ZSH_IOS_WORKER_DIR}/ready" 2>/dev/null
 BUFFER="git ch"

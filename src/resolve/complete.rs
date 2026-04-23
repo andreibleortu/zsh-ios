@@ -145,6 +145,15 @@ fn titlecase(s: &str) -> String {
     }
 }
 
+/// Classify a `complete()` output string as "generic" — meaning the static
+/// analysis couldn't produce useful suggestions and the caller should fall
+/// back to the ZLE worker's tiered completion. Kept close to `complete()`
+/// so the two stay in sync; previously the plugin grepped for a bare
+/// `<enter argument>` placeholder, which was fragile.
+pub fn is_generic_output(output: &str) -> bool {
+    output.contains("Expects: <argument>") || output.contains("No commands matching")
+}
+
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
     use super::engine::ContextHint;
 
@@ -1170,7 +1179,11 @@ pub(super) fn show_type_completions(
                 }
             }
             if prefix.is_empty() {
-                output.push_str(&format!("{} <enter argument>\n", hdr()));
+                // Generic-output sentinel: the caller (CLI / plugin) uses
+                // `is_generic_output` to detect this case and trigger the
+                // worker fallback. The user-visible wording is consistent
+                // with the other `Expects: <X>` sibling lines.
+                output.push_str(&format!("{} Expects: <argument>\n", hdr()));
             } else {
                 output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
             }

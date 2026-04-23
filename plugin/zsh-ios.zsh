@@ -590,22 +590,24 @@ _zsh_ios_help() {
     fi
 
     # Fast path: Rust binary handles typed completions (branches, hosts, etc.)
-    local output context
+    local output context complete_exit
     context=$(_zsh_ios_infer_context "$prefix")
     local -a _zsh_ios_extra_args
     _zsh_ios_quote_args "$prefix"
     output=$("$ZSH_IOS_BIN" complete --context "$context" "${_zsh_ios_extra_args[@]}" -- "$prefix" 2>/dev/null)
+    complete_exit=$?
 
-    # Detect "generic" output — the Rust binary signaling it has nothing useful.
-    # In these cases the ZLE worker may have better results.
-    # Also treat a static list of ≤2 items as potentially incomplete: the static
-    # parser may have captured only Zsh syntax tokens or a prefix-mode pair (+/-)
-    # when the real completions come from a dynamic dispatch (e.g. ssh -o 'Ciphers=').
+    # "Generic" output means the static analysis had nothing useful and the
+    # ZLE worker may do better. The binary signals this by exiting with
+    # code 4 (see `cmd_complete` / `resolve::is_generic_output` in the Rust
+    # crate) — no string grepping required. We still detect thin static
+    # lists (Expects: <value> with ≤2 items) as a secondary heuristic for
+    # prefix-mode pairs / Zsh-syntax fragments that look like completions
+    # but aren't what the user wants.
     local _zio_generic=0
-    if [[ "$output" == *'<enter argument>'* || "$output" == *'No commands matching'* ]]; then
+    if (( complete_exit == 4 )); then
         _zio_generic=1
     elif [[ "$output" == *'Expects: <value>'* ]]; then
-        # Count non-empty, non-header lines to detect thin static lists
         local _item_count
         _item_count=$(printf '%s' "$output" | grep -c '^  [^E]')
         (( _item_count <= 2 )) && _zio_generic=1

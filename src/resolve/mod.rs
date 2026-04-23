@@ -18,7 +18,7 @@ mod complete;
 mod engine;
 mod escape;
 
-pub use complete::complete;
+pub use complete::{complete, is_generic_output};
 pub use engine::{
     explain, resolve_line, set_statistics_disabled, AmbiguityInfo, ContextHint, DeepCandidate,
     ResolveResult,

@@ -5,7 +5,9 @@
 #   ZSH_IOS_STUB_RESOLVE_*  — per-resolve-input override:
 #                               ZSH_IOS_STUB_RESOLVE_EXIT  (default 0)
 #                               ZSH_IOS_STUB_RESOLVE_OUT   (stdout)
-#   ZSH_IOS_STUB_COMPLETE_OUT  — stdout for `complete`
+#   ZSH_IOS_STUB_COMPLETE_OUT   — stdout for `complete`
+#   ZSH_IOS_STUB_COMPLETE_EXIT  — exit code for `complete` (default 0; use 4
+#                                  to simulate a generic-output fallback)
 #   ZSH_IOS_STUB_STATUS_OUT    — stdout for `status` (defaults to a reasonable one)
 #
 # The real binary keeps the shell's state in a tree.msgpack; tests don't care
@@ -49,7 +51,7 @@ EOS
         ;;
     complete)
         [[ -n "$ZSH_IOS_STUB_COMPLETE_OUT" ]] && print -r -- "$ZSH_IOS_STUB_COMPLETE_OUT"
-        exit 0
+        exit "${ZSH_IOS_STUB_COMPLETE_EXIT:-0}"
         ;;
     build|learn|pin|unpin)
         exit 0

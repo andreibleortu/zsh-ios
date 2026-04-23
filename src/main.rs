@@ -520,6 +520,12 @@ fn cmd_complete(line: &str, context: Option<&str>, quote: Option<&str>, param_co
     let context_hint = resolve::ContextHint::from_parts(context, quote, param_context);
     let output = resolve::complete(line, &trie, &pin_store, context_hint);
     print!("{}", output);
+    // Exit code 4 signals "generic output" — the plugin uses this to trigger
+    // the ZLE worker fallback chain instead of grepping stdout for a marker
+    // string. Keep the classifier and the constant next to `complete()`.
+    if resolve::is_generic_output(&output) {
+        std::process::exit(4);
+    }
 }
 
 /// Populate the runtime_complete live-state cache from the trie's stored dumps.

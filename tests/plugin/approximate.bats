@@ -47,8 +47,10 @@ print "out=${out}"
 }
 
 @test "_zsh_ios_help does not crash when approximate fallback finds nothing" {
-    # Stub the Rust binary to return a generic <enter argument> (triggers worker path).
-    export ZSH_IOS_STUB_COMPLETE_OUT="% <enter argument>"
+    # Stub the Rust binary to signal "generic output" via exit code 4
+    # (triggers the ZLE worker fallback path).
+    export ZSH_IOS_STUB_COMPLETE_OUT="% Expects: <argument>"
+    export ZSH_IOS_STUB_COMPLETE_EXIT=4
     run zsh_run '
 # Worker not ready — both worker paths return empty. Help should not crash.
 rm -f "${_ZSH_IOS_WORKER_DIR}/ready" 2>/dev/null
