@@ -32,36 +32,76 @@ fn hdr() -> String {
 fn is_plausible_item(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() { return false; }
-    // Lone punctuation (`\`, `|`, `&`, etc.).
+
+    // Character whitelist: alphanumerics plus punctuation that can
+    // legitimately appear in command arguments (paths, job specs, flags,
+    // URLs, email addresses, etc.). Anything with `{`, `}`, `#`, `*`, `\`,
+    // `$`, `(`, `)`, `[`, `]`, `&`, `|`, `;`, `<`, `>`, backtick, quote
+    // characters, whitespace — we treat as zsh syntax leakage rather than
+    // a real value.
+    let allowed = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | ',' | '=' | '~')
+    };
+    if !t.chars().all(allowed) { return false; }
+
+    // Lone punctuation.
     if t.len() == 1 && !t.chars().next().unwrap().is_ascii_alphanumeric() {
         return false;
     }
+
     // Zsh matcher-list fragments: `r:|…=*`, `l:|…=*`, `b:=*`, `e:=*`.
     if (t.starts_with("r:") || t.starts_with("l:") || t.starts_with("b:") || t.starts_with("e:"))
-        && t.contains('*')
+        && (t.contains('*') || t.contains('='))
     {
         return false;
     }
-    // Unexpanded parameter or command substitution.
-    if t.contains("${") || t.contains("$(") {
-        return false;
-    }
-    // Bare `$varname` — starts with `$` followed by an identifier char.
-    if let Some(rest) = t.strip_prefix('$')
-        && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-    {
-        return false;
-    }
-    // Backslash-escaped content (line continuations, escape sequences).
-    if t.contains('\\') || t.contains('\n') {
-        return false;
-    }
-    // Internal cache / helper names (zsh convention: `_git_cache`,
-    // `__git_describe`, etc.). Regular flags starting with `-` are fine.
+
+    // Leading-underscore identifiers (zsh convention for private helpers
+    // and cache vars: `_git_refs_cache`, `__git_describe`, …). Regular
+    // flags starting with `-` are fine.
     if t.starts_with('_') {
         return false;
     }
+
+    // Convention suffixes that reveal a zsh *variable name* has leaked
+    // into the item list — the parser grabbed the identifier that names
+    // a list rather than the list's contents. `git_present_options`,
+    // `valid_hosts_cache`, `known_commands`, etc.
+    const INTERNAL_SUFFIXES: &[&str] = &[
+        "_options", "_cache", "_names", "_commands", "_refs",
+        "_args", "_flags", "_files", "_vars", "_tags", "_aliases",
+        "_completions", "_subcommands",
+    ];
+    if INTERNAL_SUFFIXES.iter().any(|suf| t.ends_with(suf)) {
+        return false;
+    }
+
     true
+}
+
+/// When the parser grabbed a group's own tag or label as if it were an item,
+/// the "item" text ends up matching the group's tag / label (case-insensitive,
+/// possibly plural vs singular). Filter these defensively at display time.
+fn matches_group_meta(item: &str, tag: &str, label: &str) -> bool {
+    let item_l = item.to_lowercase();
+    let tag_l = tag.to_lowercase();
+    let label_l = label.to_lowercase();
+    if item_l == tag_l || item_l == label_l {
+        return true;
+    }
+    // Plural/singular slack: "stashes" vs tag "stash", "branches" vs "branch".
+    let stem = |s: &str| {
+        if s.ends_with("ies") && s.len() > 3 {
+            format!("{}y", &s[..s.len() - 3])
+        } else if s.ends_with('s') && s.len() > 1 {
+            s[..s.len() - 1].to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    stem(&item_l) == tag_l || stem(&item_l) == label_l
+        || item_l == stem(&tag_l) || item_l == stem(&label_l)
 }
 
 /// Uppercase the first character of a string, leave the rest unchanged.
@@ -471,10 +511,20 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // --- Tag-group display ---
     // When the trie has tag_groups for the resolved command path, prefer
     // a grouped display over the flat subcommand list.  Fall through to the
-    // flat path if every group filtered to zero items, or when tag_grouping
-    // is disabled in the runtime config.
+    // flat path if every group filtered to zero items, when tag_grouping
+    // is disabled in the runtime config, or when the current node has a
+    // lot of real subcommand children (flat list wins — a parent command
+    // like `git` with 100+ subcommands gets useless noise from tag groups
+    // scraped out of state-body fragments).
     let cmd_key = resolved_words.join(" ");
-    if crate::runtime_config::get().tag_grouping
+    let subcommand_child_count = node
+        .children
+        .keys()
+        .filter(|k| !k.starts_with('-'))
+        .count();
+    let has_many_subcommands = subcommand_child_count >= 10;
+    if !has_many_subcommands
+        && crate::runtime_config::get().tag_grouping
         && let Some(groups) = trie.tag_groups.get(&cmd_key)
         && !groups.is_empty()
         && !prefix.starts_with('-')
@@ -514,6 +564,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
                     .filter(|i| is_plausible_item(i))
+                    .filter(|i| !matches_group_meta(i, &group.tag, &group.label))
                     .cloned()
                     .collect();
                 all_items.extend(filtered);
@@ -540,6 +591,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
                     .iter()
                     .filter(|i| prefix.is_empty() || i.starts_with(prefix))
                     .filter(|i| is_plausible_item(i))
+                    .filter(|i| !matches_group_meta(i, &group.tag, &group.label))
                     .map(String::as_str)
                     .collect();
                 if filtered.is_empty() {
