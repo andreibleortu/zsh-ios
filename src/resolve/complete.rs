@@ -877,12 +877,13 @@ mod tests {
         assert_eq!(resolve_first_word("zzz", &trie), "zzz");
     }
 
-    /// Verify the Rust binary never emits the "[approximate]" label in any
-    /// complete output.  That tag is exclusive to the plugin's worker fallback
-    /// path (_zsh_ios_worker_approximate) so users can distinguish fuzzy
-    /// suggestions from typed ones.
+    /// Verify the Rust binary never emits tier-tag labels that are exclusive to
+    /// the plugin's worker fallback chain.  Each tag ([approximate], [correct],
+    /// [expand], [history]) is inserted only by the plugin function that wraps
+    /// the corresponding worker request type; seeing one in Rust output would
+    /// indicate a misplaced label that confuses the UI.
     #[test]
-    fn complete_never_emits_approximate_label() {
+    fn complete_never_emits_worker_tier_labels() {
         let trie = build_test_trie();
         let pins = crate::pins::Pins::default();
         use super::super::engine::ContextHint;
@@ -896,14 +897,19 @@ mod tests {
             ("git ch",        ContextHint::Argument),  // subcommand prefix
             ("git checkout ", ContextHint::Argument),  // positional arg (unknown type)
         ];
+        // Plugin-exclusive tier tags — Rust complete() must never emit these.
+        let forbidden = ["[approximate]", "[correct]", "[expand]", "[history]"];
         for (input, hint) in inputs {
             let out = super::complete(input, &trie, &pins, hint);
-            assert!(
-                !out.contains("[approximate]"),
-                "complete({:?}) must not emit [approximate], got: {:?}",
-                input,
-                out
-            );
+            for tag in forbidden {
+                assert!(
+                    !out.contains(tag),
+                    "complete({:?}) must not emit {}, got: {:?}",
+                    input,
+                    tag,
+                    out
+                );
+            }
         }
     }
 

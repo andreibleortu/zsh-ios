@@ -478,16 +478,54 @@ _zsh_ios_help() {
             _zsh_ios_format_items "ZLE" "$worker_items"
             output="$_zio_format_result"
         else
-            # Worker complete returned nothing — try approximate fallback
+            # Worker complete returned nothing — try the fallback ladder:
+            # approximate → correct → expand_alias → history_complete_word
+            local _zio_format_result
+
             local _wa_out="${TMPDIR:-/tmp}/zio-wa-out.$$"
             _zsh_ios_worker_approximate "$_worker_prefix" > "$_wa_out" 2>/dev/null
             local _approx_out=""
             [[ -s "$_wa_out" ]] && _approx_out=$(<"$_wa_out")
             rm -f "$_wa_out"
             if [[ -n "$_approx_out" ]]; then
-                local _zio_format_result
                 _zsh_ios_format_items "approximate" "$_approx_out"
                 output="$_zio_format_result"
+            fi
+
+            if [[ -z "$output" ]]; then
+                local _corr_out="${TMPDIR:-/tmp}/zio-corr-out.$$"
+                _zsh_ios_worker_correct "$_worker_prefix" > "$_corr_out" 2>/dev/null
+                local _correct_out=""
+                [[ -s "$_corr_out" ]] && _correct_out=$(<"$_corr_out")
+                rm -f "$_corr_out"
+                if [[ -n "$_correct_out" ]]; then
+                    _zsh_ios_format_items "correct" "$_correct_out"
+                    output="$_zio_format_result"
+                fi
+            fi
+
+            if [[ -z "$output" ]]; then
+                local _exp_out="${TMPDIR:-/tmp}/zio-exp-out.$$"
+                _zsh_ios_worker_expand_alias "$_worker_prefix" > "$_exp_out" 2>/dev/null
+                local _expand_out=""
+                [[ -s "$_exp_out" ]] && _expand_out=$(<"$_exp_out")
+                rm -f "$_exp_out"
+                if [[ -n "$_expand_out" ]]; then
+                    _zsh_ios_format_items "expand" "$_expand_out"
+                    output="$_zio_format_result"
+                fi
+            fi
+
+            if [[ -z "$output" ]]; then
+                local _hist_out="${TMPDIR:-/tmp}/zio-hist-out.$$"
+                _zsh_ios_worker_history_complete_word "$_worker_prefix" > "$_hist_out" 2>/dev/null
+                local _history_out=""
+                [[ -s "$_hist_out" ]] && _history_out=$(<"$_hist_out")
+                rm -f "$_hist_out"
+                if [[ -n "$_history_out" ]]; then
+                    _zsh_ios_format_items "history" "$_history_out"
+                    output="$_zio_format_result"
+                fi
             fi
         fi
     fi
@@ -876,6 +914,53 @@ _zio_accept_line() {
                 BUFFER=""
                 CURSOR=0
                 ;;
+            correct)
+                BUFFER="\$_ZIO_BUFFER"
+                CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+                local _zio_prev_completer
+                if ! zstyle -s ':completion:*' completer _zio_prev_completer 2>/dev/null; then
+                    _zio_prev_completer=""
+                fi
+                zstyle ':completion:*' completer _correct
+                zle _correct 2>/dev/null || zle complete-word 2>/dev/null
+                if [[ -n "\$_zio_prev_completer" ]]; then
+                    zstyle ':completion:*' completer "\$_zio_prev_completer"
+                else
+                    zstyle -d ':completion:*' completer
+                fi
+                BUFFER=""
+                CURSOR=0
+                ;;
+            expand_alias)
+                BUFFER="\$_ZIO_BUFFER"
+                CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+                # _expand_alias mutates BUFFER in place rather than emitting
+                # compadd completions.  Capture the before/after delta and emit it.
+                local _zio_before="\$BUFFER"
+                zle _expand_alias 2>/dev/null || true
+                if [[ "\$BUFFER" != "\$_zio_before" ]]; then
+                    print -r -- "\$BUFFER" >> "\$_ZIO_RF" 2>/dev/null
+                fi
+                BUFFER=""
+                CURSOR=0
+                ;;
+            history_complete_word)
+                BUFFER="\$_ZIO_BUFFER"
+                CURSOR="\${_ZIO_CURSOR:-\${#BUFFER}}"
+                local _zio_prev_completer
+                if ! zstyle -s ':completion:*' completer _zio_prev_completer 2>/dev/null; then
+                    _zio_prev_completer=""
+                fi
+                zstyle ':completion:*' completer _history_complete_word
+                zle _history-complete-word 2>/dev/null || zle complete-word 2>/dev/null
+                if [[ -n "\$_zio_prev_completer" ]]; then
+                    zstyle ':completion:*' completer "\$_zio_prev_completer"
+                else
+                    zstyle -d ':completion:*' completer
+                fi
+                BUFFER=""
+                CURSOR=0
+                ;;
             dump-aliases)
                 alias >> "\$_ZIO_RF" 2>/dev/null
                 ;;
@@ -1044,6 +1129,57 @@ EOF
     rm -f "$_rf" "$_df" "$_bf" "$_req"
     return $_rc
 }
+
+# Shared implementation for the completer-chain fallback functions.
+# Usage: _zsh_ios_worker_dispatch_completion <kind> <buffer>
+# Sends a request of the given type to the worker and prints any results.
+_zsh_ios_worker_dispatch_completion() {
+    local _kind="$1" _buf="$2"
+    _zsh_ios_worker_is_ready || return 1
+    [[ -n "$_kind" && -n "$_buf" ]] || return 1
+
+    # Drain accumulated pty output
+    local _zio_drain_buf _zio_drain_n=0
+    while zpty -t _zsh_ios_worker 2>/dev/null; do
+        zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        (( ++_zio_drain_n > 200 )) && break
+    done
+
+    local _rf
+    _rf=$(mktemp "${TMPDIR:-/tmp}/zio-${_kind}.XXXXXX") || return 1
+    local _df="${_rf}.done"
+    local _req="${_ZSH_IOS_WORKER_DIR}/request"
+    local _bf="${_rf}.buf"
+    printf '%s' "$_buf" > "$_bf"
+    cat > "$_req" <<EOF
+_ZIO_REQUEST='${_kind}'
+_ZIO_RF='$_rf'
+_ZIO_DF='$_df'
+_ZIO_BUFFER="\$(<'$_bf')"
+_ZIO_CURSOR=${#_buf}
+EOF
+
+    zpty -w -n _zsh_ios_worker $'\n' 2>/dev/null || {
+        rm -f "$_rf" "$_df" "$_bf" "$_req"; return 1
+    }
+
+    local _slices=$(( ZSH_IOS_WORKER_TIMEOUT_MS / 10 )) _i
+    for _i in $(seq 1 $_slices); do
+        [[ -f "$_df" ]] && break
+        sleep 0.01
+        while zpty -t _zsh_ios_worker 2>/dev/null; do
+            zpty -r _zsh_ios_worker _zio_drain_buf 2>/dev/null || break
+        done
+    done
+    local _rc=1
+    if [[ -f "$_rf" && -s "$_rf" ]]; then cat "$_rf"; _rc=0; fi
+    rm -f "$_rf" "$_df" "$_bf" "$_req"
+    return $_rc
+}
+
+_zsh_ios_worker_correct()               { _zsh_ios_worker_dispatch_completion correct "$1"; }
+_zsh_ios_worker_expand_alias()          { _zsh_ios_worker_dispatch_completion expand_alias "$1"; }
+_zsh_ios_worker_history_complete_word() { _zsh_ios_worker_dispatch_completion history_complete_word "$1"; }
 
 _zsh_ios_worker_dump() {
     _zsh_ios_worker_is_ready || return 1
