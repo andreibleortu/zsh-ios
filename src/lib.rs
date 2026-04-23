@@ -10,8 +10,10 @@
 //! `pub(crate)` inside its own module.
 
 pub mod bash_completions;
+pub mod carapace_completions;
 pub mod completions;
 pub mod config;
+pub mod fig_completions;
 pub mod galiases;
 pub mod fish_completions;
 pub mod history;

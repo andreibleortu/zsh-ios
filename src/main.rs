@@ -113,6 +113,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Clone / update the withfig/autocomplete repo, build it, and dump every
+    /// compiled spec to JSON under $XDG_CACHE_HOME/zsh-ios/fig-json/.
+    /// Requires Node.js and pnpm (or npm) on PATH. Run once per upstream update.
+    #[command(name = "fig-fetch")]
+    FigFetch,
 }
 
 fn main() {
@@ -137,6 +142,7 @@ fn main() {
         Commands::Ingest => ingest::cmd_ingest(),
         Commands::RegexArgsIngest => cmd_regex_args_ingest(),
         Commands::Preset { name, show, force } => presets::cmd_preset(name.as_deref(), show, force),
+        Commands::FigFetch => fig_completions::cmd_fig_fetch(),
     }
 }
 
@@ -221,6 +227,28 @@ fn cmd_build(aliases_stdin: bool) {
         );
     }
 
+    // 5e. Supplement with carapace spec data (static YAMLs + optional binary dump).
+    let (cara_cmds, cara_subs, cara_flags) =
+        carapace_completions::scan_carapace_completions(&mut ct);
+    if cara_cmds > 0 {
+        eprintln!(
+            "Enriched {} commands with carapace spec data ({} subs, {} flags)",
+            cara_cmds, cara_subs, cara_flags,
+        );
+    }
+
+    // 5f. Supplement with Fig spec data from the cached JSON dump (additive).
+    // If the user has never run `zsh-ios fig-fetch` the cache dir is absent
+    // and scan_fig_completions returns (0, 0, 0) silently.
+    let (fig_cmds, fig_subs, fig_flags) =
+        fig_completions::scan_fig_completions(&mut ct);
+    if fig_cmds > 0 {
+        eprintln!(
+            "Enriched {} commands with Fig spec data ({} subs, {} flags)",
+            fig_cmds, fig_subs, fig_flags,
+        );
+    }
+
     // 5c. Import user-defined shell functions so they're resolvable as commands.
     // We run `zsh -ic` (interactive) so .zshrc runs and user's functions are
     // visible. Cheap because the result only needs to be fetched at build time.
@@ -232,7 +260,7 @@ fn cmd_build(aliases_stdin: bool) {
     // 6. Register our own subcommands so `zsh-ios reb` -> `zsh-ios rebuild` works
     for sub in &[
         "build", "resolve", "complete", "learn", "pin", "unpin", "pins", "toggle", "rebuild",
-        "status", "explain", "ingest", "regex-args-ingest", "preset",
+        "status", "explain", "ingest", "regex-args-ingest", "preset", "fig-fetch",
     ] {
         ct.insert(&["zsh-ios", sub]);
     }
