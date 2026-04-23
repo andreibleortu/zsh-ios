@@ -368,8 +368,19 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // Rest position with call_program (and not completing a subcommand / flag)
     let prev_is_flag_consuming =
         prev_word.is_some_and(|p| p.starts_with('-') && spec.is_some_and(|s| s.flag_takes_value(p)));
+
+    // Only offer rest_* completions when we've exhausted the subcommand tree —
+    // otherwise a parent command like `git` with a leaked rest_static_list from
+    // some nested `_values` block would hide its 100+ real subcommands behind
+    // a random enumeration. Subcommands always win while children exist.
+    let node_has_subcommands = node
+        .children
+        .keys()
+        .any(|k| !k.starts_with('-'));
+
     if !prefix.starts_with('-')
         && !prev_is_flag_consuming
+        && !node_has_subcommands
         && let Some((tag, argv)) = spec.and_then(|s| s.rest_call_program.as_ref())
     {
         let results = runtime_complete::call_program_cached(argv, prefix);
@@ -384,6 +395,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     // Rest position with static list
     if !prefix.starts_with('-')
         && !prev_is_flag_consuming
+        && !node_has_subcommands
         && let Some(items) = spec.and_then(|s| s.rest_static_list.as_ref())
     {
         let filtered: Vec<&str> = items

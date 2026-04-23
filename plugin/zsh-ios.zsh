@@ -1678,7 +1678,16 @@ _zsh_ios_ghost_preview_widget() {
     resolved=$("$ZSH_IOS_BIN" resolve -- "$BUFFER" 2>/dev/null)
     local rc=$?
 
-    if (( rc == 0 )) && [[ -n "$resolved" && "$resolved" != "$BUFFER" ]]; then
+    # Strip trailing whitespace from both sides before deciding whether the
+    # resolved form is meaningfully different. Without this, typing "git
+    # commit " (trailing space) produces resolved="git commit" which is
+    # byte-different from BUFFER and spuriously ghosts the user's own input.
+    local _ghost_b="$BUFFER"
+    local _ghost_r="$resolved"
+    while [[ "$_ghost_b" == *[[:space:]] ]]; do _ghost_b="${_ghost_b% }"; _ghost_b="${_ghost_b%$'\t'}"; done
+    while [[ "$_ghost_r" == *[[:space:]] ]]; do _ghost_r="${_ghost_r% }"; _ghost_r="${_ghost_r%$'\t'}"; done
+
+    if (( rc == 0 )) && [[ -n "$_ghost_r" && "$_ghost_r" != "$_ghost_b" ]]; then
         POSTDISPLAY="${_zsh_ios_ghost_prefix}${resolved}"
         local _start=${#BUFFER}
         local _end=$(( _start + ${#POSTDISPLAY} ))
