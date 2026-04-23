@@ -22,11 +22,11 @@ If an abbreviation is ambiguous, you're told -- just like IOS. Pick a number and
   In ~/Library/Application Support/zsh-ios/pins.txt
 ```
 
-Selection is keystroke-driven — the moment your digits uniquely identify an option, it fires without Enter. So in a 3-option menu, typing `2` picks immediately; with 20 options, typing `1` waits (because 10-19 are still reachable) but `13` fires on the `3`. Enter force-commits the current digits; Enter on an empty buffer cancels.
+Selection is keystroke-driven — the moment your digits uniquely identify an option, it fires without Enter. So in a 3-option menu, typing `2` picks immediately; with 20 options, typing `1` waits (because 10-19 are still reachable) but `13` fires on the `3`. Enter force-commits the current digits; Enter on an empty buffer cancels. Arrow keys and Tab cycle the highlight.
 
 ## How it works
 
-zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, and Zsh completion definitions. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
+zsh-ios builds a **prefix trie** from your PATH executables, shell history, aliases, Zsh builtins, Zsh/Fish/Bash completion definitions, and live shell state. When you press Enter or Tab, every word is resolved against this trie using prefix matching. If a prefix uniquely identifies a command or subcommand, it expands. If it's ambiguous, you're prompted to pick.
 
 **Deep disambiguation** looks ahead at subsequent words to narrow things down. `gi pu orig main` resolves to `git push origin main` because `git` is the only `gi*` command with a `pu*` subcommand. The same technique works for filesystem paths -- `cd ~/Lib/Applic/zsh-` resolves through `Application Support` (not `Application Scripts`) because only `Application Support` has a `zsh-*` child.
 
@@ -39,17 +39,22 @@ zsh-ios builds a **prefix trie** from your PATH executables, shell history, alia
 - **Suffix matching** -- `!` prefix matches by suffix: `cd te/!5` -> `cd tests/test-5` (matches entries ending with `5`)
 - **Contains matching** -- `*` prefix matches by substring: `cd *prod` -> `cd app-config-prod` (matches entries containing `prod`)
 - **Shell glob passthrough** -- `**` passes a literal `*` to the shell: `chmod +x **.py` -> `chmod +x *.py` (shell expands the glob)
+- **Named directory expansion** -- `proj:/file` expands via Zsh `hash -d` named dirs; `~2/file` expands via dirstack
+- **Global alias expansion** -- global aliases (`alias -g`) are expanded token-by-token before the trie walk
 - **Pipe/chain resolution** -- commands joined by `|`, `&&`, `||`, `;` are each resolved independently
 - **Context-aware argument resolution** -- commands like `cd` and `ls` resolve arguments against the filesystem (not the trie); commands like `which` and `man` resolve against executables only
 - **Deep disambiguation** -- subsequent words narrow ambiguous prefixes automatically
 - **Tab expansion** -- Tab expands to the longest common prefix, then falls through to native Zsh completion for cycling
-- **`?` key** -- show all available completions for the current prefix (IOS-style help)
+- **`?` key** -- show all available completions for the current prefix (IOS-style help) with a five-tier fallback ladder: Rust resolver → worker `complete-word` → worker `_approximate` → worker `_correct` → worker `_expand_alias` / `_history-complete-word`
+- **Ghost-text preview** -- live resolved command rendered faintly after the cursor as you type (via `POSTDISPLAY` + `region_highlight`), updated on every redraw without re-invoking the binary when the buffer hasn't changed
 - **Incremental learning** -- every successful command is added to the trie (failed commands are ignored)
 - **Pins** -- persistent user-defined abbreviation rules stored in a plain text file
-- **Interactive clarifier** -- ambiguous commands on Enter show a numbered menu with full command paths; selecting saves a pin
+- **Interactive clarifier** -- ambiguous commands on Enter show a numbered menu; arrow keys and Tab cycle, digits jump directly, selecting saves a pin
 - **Path disambiguation** -- when multiple directories match, shows a numbered picker with single-keypress selection
 - **Toggle on/off** -- `zsh-ios toggle` to disable without uninstalling
+- **Config presets** -- `zsh-ios preset` to apply `deterministic`, `privacy`, or `power` profiles
 - **Fast** -- Rust binary with MessagePack-serialized trie; resolution takes < 10ms
+- **Over 70 runtime resolvers** -- live data at `?`/Tab time: git (branches/tags/remotes/files/stash/worktree/submodule/commit/reflog/bisect), docker, k8s, systemd, tmux, screen, brew, apt, dnf, pacman, npm, pip, cargo, and project scripts from Makefile/justfile/package.json/Cargo.toml/pyproject.toml/composer.json/build.gradle/Rakefile/Pipfile/pnpm-workspace.yaml/lerna.json
 
 ## Data sources
 
@@ -58,8 +63,15 @@ The command trie is built from:
 1. **PATH** -- all executable files in your `$PATH`
 2. **Zsh builtins** -- `cd`, `echo`, `source`, etc.
 3. **Aliases** -- both the alias name and the commands inside the alias value (e.g., `tfa='terraform apply'` teaches `terraform -> apply`)
-4. **Shell history** -- commands from `~/.zsh_history` that correspond to known executables (typos and gone scripts are filtered out)
-5. **Zsh completions** -- subcommand patterns and per-position argument specs from completion files. Parses `_arguments` specs, `->state` resolution, `_alternative` blocks, and `_regex_arguments`. Recognizes completion action functions (`__git_branch_names`, `_users`, `_hosts`, `_signals`, etc.) to determine what type of argument each position expects.
+4. **Global aliases** -- `alias -g` entries stored separately; expanded before every trie walk
+5. **Shell history** -- commands from `~/.zsh_history` that correspond to known executables (typos and gone scripts are filtered out)
+6. **Shell functions** -- user-defined functions enumerated via `zsh -ic 'print -l ${(k)functions}'` at build time (skipped when `disable_build_time_shell_exec` is set)
+7. **Zsh completion files** -- subcommand patterns and per-position argument specs from `$fpath` directories, including system paths and plugin-framework trees (Oh-My-Zsh, Prezto, zinit, antidote, antibody, znap, zplug, `~/.config/zsh`)
+8. **Fish completion files** -- `.fish` completion files from standard Fish completion directories (`/usr/share/fish/completions`, `~/.config/fish/completions`, etc.)
+9. **Bash completion files** -- `complete -F` / `complete -W` stanzas from `/etc/bash_completion.d`, `/usr/share/bash-completion/completions`, and equivalents
+10. **Project-local manifests** -- `package.json`, `Makefile`, `justfile`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `build.gradle`, `Rakefile`, `Pipfile`, `pnpm-workspace.yaml`, `lerna.json` (scripts and targets resolved by walking up from cwd)
+11. **Live worker state** -- on first shell startup the background zpty worker dumps: aliases, galiases, saliases, functions, named dirs, history, dirstack, jobs, commands, parameters, options, widgets, modules, and zstyle settings; all folded into the trie via `zsh-ios ingest`
+12. **Runtime resolvers** -- live data queried when `?` / Tab fires: git (`git for-each-ref`, `git log`, `git remote`, `git ls-files`, …), docker (`docker ps`, `docker images`, …), k8s (`kubectl get`), systemd (`systemctl list-units`), tmux (`tmux list-sessions`), package managers (brew, apt, dnf, pacman, npm, pip, cargo), and project scripts from manifests found by walking up from cwd
 
 ## Installation
 
@@ -100,10 +112,11 @@ alias | zsh-ios build --aliases-stdin
 
 | Key | Action |
 |-----|--------|
-| **Enter** | Resolve abbreviations and execute. If ambiguous, show a keystroke-driven picker (auto-accepts the moment your digits uniquely identify an option). |
-| **Tab** | First press: expand to longest common prefix and show the candidate list (one per line). Second Tab on the unchanged buffer opens the numbered picker; inside it, Tab cycles the highlight and a number jumps directly. Picking populates the buffer without executing, so you can edit or Enter. |
-| **?** | IOS-style help. Show completions for the current position — subcommands, flags with expected argument type, or live argument values (branches, hosts, signals, users, tracked files, ...). |
+| **Enter** | Resolve abbreviations and execute. If ambiguous, show a keystroke-driven picker (auto-accepts the moment your digits uniquely identify an option; arrow keys and Tab cycle the highlight). |
+| **Tab** | First press: expand to longest common prefix and show the candidate list (one per line). Second Tab on the unchanged buffer opens the numbered picker; inside it, Tab cycles the highlight, arrows cycle too, and a number jumps directly. Picking populates the buffer without executing, so you can edit or Enter. |
+| **?** | IOS-style help. Show completions for the current position — subcommands, flags with expected argument type, or live argument values (branches, hosts, signals, users, tracked files, …). Falls back through five tiers: Rust resolver → worker complete-word → approximate → correct → expand_alias / history. |
 | **Leading `!`** | Bypass zsh-ios entirely — the buffer runs exactly as typed (history expansion, literal-run). |
+| **Ghost preview** | As you type, the resolved command appears faintly two spaces after the cursor. Nothing is committed; pressing Enter runs the resolution. |
 
 The `?` key is position and context-aware:
 
@@ -131,6 +144,11 @@ zsh-ios pin "g ch" --to "git checkout"    # Save an abbreviation rule
 zsh-ios unpin "g ch"    # Remove a pin
 zsh-ios pins            # List all saved pins
 zsh-ios explain "gi br" # Trace step-by-step how an input would resolve
+zsh-ios ingest          # Read a sectioned @<kind> state payload from stdin
+zsh-ios regex-args-ingest  # Fold a _regex_arguments harvest capture from stdin
+zsh-ios preset          # List available config presets
+zsh-ios preset power    # Apply the power-user preset (backs up existing config)
+zsh-ios preset deterministic --show   # Print preset YAML without writing
 ```
 
 ### Debugging resolution
@@ -169,21 +187,24 @@ Optional YAML at `~/.config/zsh-ios/config.yaml` (or `~/Library/Application Supp
 
 ```yaml
 # How many seconds old tree.msgpack can be before the plugin auto-rebuilds
-# on shell startup. Default: 3600.
 stale_threshold_seconds: 3600
 
-# Set true to make `zsh-ios learn` a no-op. Useful if you'd rather curate
-# the trie explicitly via `rebuild` and keep it deterministic across shells.
+# Set true to make `zsh-ios learn` a no-op
 disable_learning: false
 
-# Commands zsh-ios must never touch. Matched against the first word you
-# typed AND against what it would resolve to, so `kubectl` here catches
-# `kub ...` too. Blocklist hits exit as passthrough (the buffer runs as
-# typed).
+# Suppress the ghost-text preview after the cursor
+disable_ghost_preview: false
+
+# Skip statistical tiebreaker — ties always surface as a picker
+disable_statistics: false
+
+# Commands zsh-ios must never touch (matched literally and on resolution)
 command_blocklist:
   - kubectl
   - docker
 ```
+
+There are 29 config knobs covering behaviour, resolution determinism, privacy/attack surface, performance, retention, and display. See `docs/config.md` for the full reference. Use `zsh-ios preset` as a shortcut to apply a named profile.
 
 Run `zsh-ios status` to see which values are in effect.
 
@@ -192,12 +213,17 @@ Run `zsh-ios status` to see which values are in effect.
 Given input `ter ap --auto-approve`:
 
 1. **Pin check** -- longest-prefix match against saved pins
-2. **Trie walk** -- `ter` prefix-matches `terraform` (unique), then `ap` prefix-matches `apply` (unique)
-3. **Flags** -- `--auto-approve` starts with `-`, passed through as-is (flags are never expanded)
-4. **Path resolution** -- arguments are checked against the real filesystem; if a matching file or directory exists, the abbreviation is expanded
-5. **Result**: `terraform apply --auto-approve`
+2. **Global alias expansion** -- any `alias -g` tokens are substituted before the trie walk
+3. **Trie walk** -- `ter` prefix-matches `terraform` (unique), then `ap` prefix-matches `apply` (unique)
+4. **Deep disambiguation** -- if still ambiguous after the trie walk, subsequent words are used to narrow candidates
+5. **Arg-type narrowing** -- positional type evidence (e.g. a directory path favours `cd` over `cat`) narrows candidates further
+6. **Flag-match narrowing** -- flags typed on the command line are counted against each candidate's known flag set
+7. **Statistical tiebreaker** -- frequency × recency (14-day half-life) × success-rate × cwd-frequency boost × sibling-command boost, with a configurable dominance margin
+8. **Flags** -- `--auto-approve` starts with `-`, passed through as-is (flags are never prefix-expanded)
+9. **Path resolution** -- arguments are checked against the real filesystem; if a matching file or directory exists, the abbreviation is expanded
+10. **Result**: `terraform apply --auto-approve`
 
-The engine is context-aware about what kind of arguments each command and subcommand takes. Arg specs are extracted from Zsh completion files for 1400+ commands, supplemented by hardcoded overrides for commands with complex dynamic completions:
+The engine is context-aware about what kind of arguments each command and subcommand takes. Arg specs are extracted from Zsh, Fish, and Bash completion files for 1400+ commands. See `docs/DATA-SOURCES.md` for the full arg-type list and resolver inventory.
 
 | Argument type | Examples | Resolved from |
 |---------------|----------|---------------|
@@ -216,7 +242,12 @@ The engine is context-aware about what kind of arguments each command and subcom
 | **Network interface** | `ifconfig`, `ping -I` | `ifconfig -l` (or `/sys/class/net`) |
 | **Port** | port-related flags | `/etc/services` |
 | **Locale** | locale flags | `locale -a` |
-| **Normal** | everything else | Trie first; path-like args (`./foo`, `~/bar`) resolve against filesystem |
+| **Docker container** | `docker exec`, `docker stop` | `docker ps --all` |
+| **k8s pod** | `kubectl exec`, `kubectl logs` | `kubectl get pods` |
+| **systemd unit** | `systemctl start`, `systemctl status` | `systemctl list-units` |
+| **npm script** | `npm run` | `package.json` scripts section |
+| **make target** | `make` | Makefile targets |
+| **…and 63 more** | | See `docs/DATA-SOURCES.md` |
 
 Arg type detection is per-position and per-flag: `git push <remote> <branch>` knows position 1 is a remote and position 2 is a branch. `ssh -l <user>` knows `-l` expects a username.
 
@@ -321,25 +352,40 @@ Removes the binary, offers to delete config directories (with confirmation), and
 ```
 src/
   main.rs               CLI entry point (clap subcommands)
-  trie.rs               Prefix trie with MessagePack serialization; 16 arg type constants
+  lib.rs                Re-exports all modules; houses test_util::CWD_LOCK
+  trie.rs               Prefix trie, 83 ARG_MODE_* constants, MessagePack serialization
   resolve/              Abbreviation resolution subsystem:
-    engine.rs             Core trie walk, deep disambiguation, arg-spec, explain
+    engine.rs             Core trie walk, deep disambiguation, scoring, explain
     complete.rs           `?` key completion path
     escape.rs             Shell-quoting helpers for resolved paths
-  path_resolve.rs       Filesystem path abbreviation with deep disambiguation
-  runtime_complete.rs   Runtime resolvers: git branches/tags/remotes/files, users,
-                        groups, hosts, signals, ports, network interfaces, locales
-  history.rs            Zsh history parser
+  path_resolve.rs       Filesystem path abbreviation; named-dir + dirstack expansion
+  runtime_complete.rs   71 runtime resolvers (git, docker, k8s, systemd, tmux,
+                        brew, apt, npm, pip, cargo, project scripts, shell state, …)
+  completions.rs        Zsh completion file parser (→state, _alternative,
+                        _regex_arguments, _values, tag groups, …); ~1400 commands
+  bash_completions.rs   Bash completion file parser (complete -F / -W)
+  fish_completions.rs   Fish completion file parser (.fish files)
   scanner.rs            PATH scanner, builtins, alias parser
-  completions.rs        Zsh completion file parser (→state, _alternative, _regex_arguments);
-                        also extracts subcommand descriptions from completion arrays
+  history.rs            Zsh history parser
   pins.rs               Pin storage (load/save/match)
-  config.rs             Config directory paths
+  config.rs             Config directory paths (XDG / macOS Application Support)
+  user_config.rs        29-knob config.yaml; serde(deny_unknown_fields)
+  runtime_config.rs     RuntimeConfig under OnceLock<RwLock>; runtime_config::get()
+  type_resolver.rs      TypeResolver trait + Registry
+  runtime_cache.rs      On-disk MessagePack TTL cache for resolver results
+  galiases.rs           Global-alias buffer rewrite before trie walk
+  ingest.rs             `zsh-ios ingest` — sectioned live-state ingest
+  locks.rs              Shared fs2 advisory flock helper
+  presets.rs            Three built-in YAML presets (deterministic/privacy/power)
+  regex_args.rs         _regex_arguments DSL parser + dynamic harvest support
 data/
-  descriptions.yaml     Fallback subcommand descriptions for IOS-style ? help
-                        (bundled at compile time; parsed Zsh descriptions override these)
+  descriptions.yaml     Fallback subcommand descriptions (bundled at compile time)
 plugin/
-  zsh-ios.zsh           Zsh plugin (ZLE widgets, key bindings, preexec/precmd hooks)
+  zsh-ios.zsh           Zsh plugin (ZLE widgets, ghost preview, zpty worker,
+                        key bindings, preexec/precmd hooks, context inference)
+docs/
+  config.md             Full config knob reference (29 fields with examples)
+  DATA-SOURCES.md       Exhaustive reference of every data source and resolver
 install.sh              Installer
 uninstall.sh            Uninstaller
 ```
