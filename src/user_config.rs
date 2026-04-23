@@ -141,6 +141,23 @@ pub struct UserConfig {
     /// When false, tag-grouped display is never used. Default: true.
     #[serde(default = "default_tag_grouping")]
     pub tag_grouping: bool,
+
+    // ── Ghost preview ─────────────────────────────────────────────────────────
+
+    /// When true, the live resolved-command preview is suppressed. Default
+    /// is to show it in the configured style two spaces after the cursor
+    /// (via POSTDISPLAY — see docs/config.md).
+    pub disable_ghost_preview: bool,
+
+    /// region_highlight style spec for the ghost text. Passed verbatim to
+    /// `region_highlight=("P0 N <style>")`. Examples: `fg=240`, `fg=#888`,
+    /// `fg=blue,italic`. Default: `"fg=240"` (256-color gray).
+    pub ghost_preview_style: Option<String>,
+
+    /// Literal bytes inserted between the user's buffer and the ghost text.
+    /// Default: `"  "` (two spaces). Set to the empty string for a tight
+    /// render, or ` -> ` for an arrow separator.
+    pub ghost_preview_prefix: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -172,6 +189,9 @@ impl Default for UserConfig {
             disable_list_colors: false,
             max_completions_shown: default_max_completions_shown(),
             tag_grouping: default_tag_grouping(),
+            disable_ghost_preview: false,
+            ghost_preview_style: None,
+            ghost_preview_prefix: None,
         }
     }
 }
@@ -236,6 +256,15 @@ impl UserConfig {
             disable_list_colors: self.disable_list_colors,
             max_completions_shown: self.max_completions_shown,
             tag_grouping: self.tag_grouping,
+            disable_ghost_preview: self.disable_ghost_preview,
+            ghost_preview_style: self
+                .ghost_preview_style
+                .clone()
+                .unwrap_or_else(|| "fg=240".into()),
+            ghost_preview_prefix: self
+                .ghost_preview_prefix
+                .clone()
+                .unwrap_or_else(|| "  ".into()),
         }
     }
 }
@@ -433,5 +462,35 @@ tag_grouping: false
         assert!(!c.disable_list_colors);
         assert_eq!(c.max_completions_shown, 200);
         assert!(c.tag_grouping);
+        assert!(!c.disable_ghost_preview);
+        assert!(c.ghost_preview_style.is_none());
+        assert!(c.ghost_preview_prefix.is_none());
+    }
+
+    #[test]
+    fn parse_ghost_preview_fields() {
+        let yaml = r#"
+disable_ghost_preview: true
+ghost_preview_style: "fg=blue,italic"
+ghost_preview_prefix: " -> "
+"#;
+        let c = UserConfig::parse(yaml).unwrap();
+        assert!(c.disable_ghost_preview);
+        assert_eq!(c.ghost_preview_style.as_deref(), Some("fg=blue,italic"));
+        assert_eq!(c.ghost_preview_prefix.as_deref(), Some(" -> "));
+
+        let rc = c.to_runtime_config();
+        assert!(rc.disable_ghost_preview);
+        assert_eq!(rc.ghost_preview_style, "fg=blue,italic");
+        assert_eq!(rc.ghost_preview_prefix, " -> ");
+    }
+
+    #[test]
+    fn ghost_preview_runtime_config_defaults_when_unset() {
+        let c = UserConfig::default();
+        let rc = c.to_runtime_config();
+        assert!(!rc.disable_ghost_preview);
+        assert_eq!(rc.ghost_preview_style, "fg=240");
+        assert_eq!(rc.ghost_preview_prefix, "  ");
     }
 }

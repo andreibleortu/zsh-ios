@@ -19,6 +19,13 @@ typeset -g _zsh_ios_last_tab_buffer=""
 # subsequent precmd invocations don't re-run it.
 typeset -g _zsh_ios_ingested=0
 
+# Ghost preview state.
+typeset -g _zsh_ios_ghost_disabled=0
+typeset -g _zsh_ios_ghost_style="fg=240"
+typeset -g _zsh_ios_ghost_prefix="  "
+typeset -g _zsh_ios_ghost_last_buffer=""
+typeset -g _zsh_ios_ghost_last_postdisplay=""
+
 # Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
 # have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
 # an already-open file descriptor containing the simulated keystrokes.
@@ -73,6 +80,21 @@ _zsh_ios_build_if_stale() {
     export _zsh_ios_worker_disabled="$worker_disabled"
     [[ -n "$picker_prefix" ]] && typeset -g _zsh_ios_picker_prefix="$picker_prefix"
     [[ "$worker_timeout" =~ '^[0-9]+$' ]] && ZSH_IOS_WORKER_TIMEOUT_MS="$worker_timeout"
+
+    # Ghost preview config.
+    local ghost_preview ghost_style ghost_prefix_quoted
+    ghost_preview=$(print -r -- "$status_out" | grep 'Ghost preview:')
+    if [[ "$ghost_preview" == *"disabled"* ]]; then
+        _zsh_ios_ghost_disabled=1
+    else
+        _zsh_ios_ghost_disabled=0
+    fi
+    ghost_style=$(print -r -- "$status_out" | grep 'Ghost style:' | sed -E 's/.*Ghost style:[[:space:]]+(.*)/\1/')
+    [[ -n "$ghost_style" ]] && typeset -g _zsh_ios_ghost_style="$ghost_style"
+    if print -r -- "$status_out" | grep -q 'Ghost prefix:'; then
+        ghost_prefix_quoted=$(print -r -- "$status_out" | grep 'Ghost prefix:' | sed -E 's/.*Ghost prefix:[[:space:]]+"(.*)"/\1/')
+        typeset -g _zsh_ios_ghost_prefix="$ghost_prefix_quoted"
+    fi
 
     local rebuild=0
     if [[ ! -f "$tree_file" ]]; then
@@ -260,6 +282,10 @@ _zsh_ios_quote_args() {
 
 # --- ZLE Widget: Enter key (resolve + execute) ---
 _zsh_ios_accept_line() {
+    POSTDISPLAY=""
+    region_highlight=("${(@)region_highlight:#P0 *}")
+    _zsh_ios_ghost_last_buffer=""
+
     if _zsh_ios_is_disabled || [[ -z "${BUFFER// /}" ]]; then
         zle accept-line
         return
@@ -360,6 +386,9 @@ _zsh_ios_expand_or_complete() {
             if [[ "$output" != "$BUFFER" ]]; then
                 BUFFER="$output"
                 CURSOR=${#BUFFER}
+                POSTDISPLAY=""
+                region_highlight=("${(@)region_highlight:#P0 *}")
+                _zsh_ios_ghost_last_buffer=""
             else
                 zle expand-or-complete
             fi
@@ -1598,6 +1627,43 @@ add-zle-hook-widget line-init _zsh_ios_worker_lazy_start 2>/dev/null
 # ─────────────────────────────────────────────────────────────────────────────
 # END WORKER
 # ─────────────────────────────────────────────────────────────────────────────
+
+# --- ZLE Widget: ghost-text preview (hooked into line-pre-redraw) ---
+# Shows the fully-resolved command as faint text after the cursor via
+# POSTDISPLAY so it never touches BUFFER or CURSOR.
+_zsh_ios_ghost_preview_widget() {
+    # Always start clean so stale ghosts don't linger across redraws.
+    POSTDISPLAY=""
+    region_highlight=("${(@)region_highlight:#P0 *}")
+
+    (( _zsh_ios_ghost_disabled )) && return 0
+    _zsh_ios_is_disabled && return 0
+    [[ -z "${BUFFER// /}" ]] && { _zsh_ios_ghost_last_buffer=""; return 0; }
+    [[ "$BUFFER" == \!* ]] && return 0
+    [[ "$BUFFER" == *$'\n'* ]] && return 0
+
+    if [[ "$BUFFER" == "$_zsh_ios_ghost_last_buffer" ]]; then
+        POSTDISPLAY="$_zsh_ios_ghost_last_postdisplay"
+        if [[ -n "$POSTDISPLAY" ]]; then
+            region_highlight+=("P0 ${#POSTDISPLAY} $_zsh_ios_ghost_style")
+        fi
+        return 0
+    fi
+
+    local resolved
+    resolved=$("$ZSH_IOS_BIN" resolve -- "$BUFFER" 2>/dev/null)
+    local rc=$?
+
+    if (( rc == 0 )) && [[ -n "$resolved" && "$resolved" != "$BUFFER" ]]; then
+        POSTDISPLAY="${_zsh_ios_ghost_prefix}${resolved}"
+        region_highlight+=("P0 ${#POSTDISPLAY} $_zsh_ios_ghost_style")
+    fi
+
+    _zsh_ios_ghost_last_buffer="$BUFFER"
+    _zsh_ios_ghost_last_postdisplay="$POSTDISPLAY"
+}
+
+add-zle-hook-widget line-pre-redraw _zsh_ios_ghost_preview_widget 2>/dev/null
 
 # --- Register widgets ---
 zle -N _zsh_ios_accept_line

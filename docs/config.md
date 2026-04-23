@@ -243,6 +243,45 @@ Tag groups come from zstyle `_alternative` specs in Zsh completion functions
 (for example, `kill` groups processes and jobs separately). Set to false for
 a simpler, consistent output format.
 
+### Ghost preview
+
+The ghost preview shows what `zsh-ios resolve` would produce if you pressed
+Enter right now. It is rendered as faint text after the cursor using Zsh's
+`POSTDISPLAY` variable, styled via `region_highlight` with the `P` prefix so
+it is visually separate from the buffer and never committed to it. The preview
+updates on every redraw but only re-invokes the binary when the buffer has
+changed — repeated redraws on the same buffer are free.
+
+The preview shows nothing when:
+
+- The buffer is empty or starts with `!` (bang-bypass).
+- The buffer contains a newline (multi-line paste).
+- The buffer is already equal to the resolved form (no abbreviation to expand).
+- The resolve call returns ambiguous (exit 1) or passthrough (exit 2).
+
+#### `disable_ghost_preview: bool` (default false)
+
+When true, the live preview is suppressed entirely. The binary is not invoked
+on redraws and `POSTDISPLAY` stays empty.
+
+#### `ghost_preview_style: string` (default `fg=240`)
+
+The `region_highlight` style spec applied to the ghost text. Passed verbatim
+as the style component of `region_highlight+=("P0 N <style>")`. Any style
+string accepted by `zshzle(1)` `region_highlight` works here. Examples:
+
+- `fg=240` — 256-color gray (default)
+- `fg=#888888` — hex gray
+- `fg=blue,italic` — blue italic
+- `fg=gray,dim` — dimmed gray
+
+#### `ghost_preview_prefix: string` (default `"  "` — two spaces)
+
+Literal text inserted between the end of the buffer and the ghost text. Two
+spaces by default so the resolved command is visually detached. Set to the
+empty string for a tight render immediately after the cursor, or to ` -> ` for
+an arrow separator.
+
 ---
 
 ## Configuration profiles

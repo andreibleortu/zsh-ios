@@ -761,6 +761,24 @@ fn cmd_status() {
     );
     println!("  Worker timeout: {}ms", user_cfg.worker_timeout_ms);
     println!("  Picker prefix: {}", user_cfg.picker_header_prefix);
+    println!(
+        "  Ghost preview: {}",
+        if user_cfg.disable_ghost_preview {
+            "disabled (config)"
+        } else {
+            "enabled"
+        }
+    );
+    let ghost_style = user_cfg
+        .ghost_preview_style
+        .as_deref()
+        .unwrap_or("fg=240");
+    println!("  Ghost style: {}", ghost_style);
+    let ghost_prefix = user_cfg
+        .ghost_preview_prefix
+        .as_deref()
+        .unwrap_or("  ");
+    println!("  Ghost prefix: \"{}\"", ghost_prefix);
 
     if tree_path.exists() {
         if let Ok(meta) = std::fs::metadata(&tree_path) {

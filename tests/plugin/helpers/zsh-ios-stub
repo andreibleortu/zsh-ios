@@ -36,6 +36,9 @@ zsh-ios status
   Blocklist:   0
   Tree:        not built yet
   Pins:        none
+  Ghost preview: enabled
+  Ghost style: fg=240
+  Ghost prefix: "  "
 EOS
         fi
         exit 0

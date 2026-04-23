@@ -88,6 +88,15 @@ pub struct RuntimeConfig {
     /// When true, tag-grouped display is used for commands with tag_groups in
     /// the trie. When false, always use the flat subcommand list.
     pub tag_grouping: bool,
+
+    // Ghost preview
+    /// When true, the live resolved-command preview is suppressed.
+    pub disable_ghost_preview: bool,
+    /// region_highlight style spec for the ghost text. Default: `"fg=240"`.
+    pub ghost_preview_style: String,
+    /// Literal bytes inserted between the user's buffer and the ghost text.
+    /// Default: `"  "` (two spaces).
+    pub ghost_preview_prefix: String,
 }
 
 impl Default for RuntimeConfig {
@@ -113,6 +122,9 @@ impl Default for RuntimeConfig {
             disable_list_colors: false,
             max_completions_shown: 200,
             tag_grouping: true,
+            disable_ghost_preview: false,
+            ghost_preview_style: "fg=240".into(),
+            ghost_preview_prefix: "  ".into(),
         }
     }
 }
@@ -149,6 +161,9 @@ mod tests {
         assert!(c.tag_grouping);
         assert!(!c.disable_cwd_scoring);
         assert!(!c.disable_arg_type_narrowing);
+        assert!(!c.disable_ghost_preview);
+        assert_eq!(c.ghost_preview_style, "fg=240");
+        assert_eq!(c.ghost_preview_prefix, "  ");
     }
 
     #[test]

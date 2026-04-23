@@ -77,6 +77,33 @@ fn status_without_tree_reports_not_built() {
 }
 
 #[test]
+fn status_shows_ghost_preview_lines_with_defaults() {
+    let td = tempfile::tempdir().unwrap();
+    let (code, stdout, _) = run(cmd_in(td.path()).arg("status"));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Ghost preview:"),
+        "missing Ghost preview line: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Ghost preview:") && stdout.contains("enabled"),
+        "Ghost preview should default to enabled: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Ghost style:") && stdout.contains("fg=240"),
+        "Ghost style should default to fg=240: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Ghost prefix:") && stdout.contains("\"  \""),
+        "Ghost prefix should default to two spaces in quotes: {}",
+        stdout
+    );
+}
+
+#[test]
 fn build_creates_tree_and_status_reports_it() {
     let td = tempfile::tempdir().unwrap();
     seed_build(td.path());
