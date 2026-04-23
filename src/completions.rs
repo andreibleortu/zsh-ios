@@ -103,9 +103,12 @@ fn sanitize_static_list(items: Vec<String>) -> Vec<String> {
         let t = item.trim();
         if t.is_empty() { continue; }
 
-        // Reject any item that contains Zsh parameter/command-substitution syntax.
-        // These characters appear in raw Zsh source fragments, never in real arg values.
-        let bad_chars = |c: char| matches!(c, '$' | '{' | '}' | '(' | ')' | '`' | '#' | '*' | '\\' | '\'' | '"' | ';' | '&' | '|' | '<' | '>');
+        // Reject Zsh parameter/command-substitution syntax and shell operators.
+        // `*` is omitted from this set — it's a legitimate glob pattern value
+        // in some flag-value enums (`git clean -e '*.o'`).  Matcher-list
+        // fragments that use `*` (`r:|=*`, `b:=*`) are caught by the dedicated
+        // check further down.
+        let bad_chars = |c: char| matches!(c, '$' | '{' | '}' | '(' | ')' | '`' | '#' | '\\' | '\'' | '"' | ';' | '&' | '|' | '<' | '>');
         if t.chars().any(bad_chars) { continue; }
 
         // Reject items containing whitespace — real completion values don't
@@ -119,6 +122,9 @@ fn sanitize_static_list(items: Vec<String>) -> Vec<String> {
         if matches!(t.get(0..2), Some("r:" | "l:" | "b:" | "e:"))
             && (t.contains('=') || t.contains('*'))
         { continue; }
+
+        // A bare `*` or `**` on its own is matcher-list or glob noise.
+        if t == "*" || t == "**" { continue; }
 
         // Leading underscore → internal zsh helper/cache variable name.
         if t.starts_with('_') { continue; }
@@ -1753,15 +1759,14 @@ pub(super) fn collect_local_arrays(body: &str) -> ArrayData {
 /// are skipped.  `_requested` is also skipped (orchestration, not data).
 pub(super) fn extract_tag_groups(body: &str, arrays: &ArrayData) -> Vec<trie::TagGroup> {
     let mut out = Vec::new();
-    // Track nesting of conditional blocks (`if`/`fi`) and `case`/`esac`
-    // state-machine blocks.  Any `_wanted` or `_description` inside either
-    // kind of block is only executed under certain runtime conditions that we
-    // cannot know statically, so we skip it entirely.
-    //
-    // `if_depth` is incremented on `if` and decremented on `fi`.
-    // `case_depth` is incremented on `case ... in` and decremented on `esac`.
+    // Track nesting of conditional blocks (`if`/`fi`), `case`/`esac`
+    // state-machine blocks, and `for`/`while`/`until`/`done` loops.  Any
+    // `_wanted` or `_description` inside any of these is only executed under
+    // runtime conditions (or zero times if the condition is false / the loop
+    // body is skipped) we cannot know statically, so we skip it entirely.
     let mut if_depth: u32 = 0;
     let mut case_depth: u32 = 0;
+    let mut loop_depth: u32 = 0;
 
     for line in body.lines() {
         let trimmed = line.trim();
@@ -1807,8 +1812,37 @@ pub(super) fn extract_tag_groups(body: &str, arrays: &ArrayData) -> Vec<trie::Ta
             continue;
         }
 
-        // Skip _wanted/_description lines inside any conditional/case block.
-        if if_depth > 0 || case_depth > 0 {
+        // --- `for` / `while` / `until` loops and their closing `done` ---
+        // Openers: any line that starts the loop header.  `do` by itself on a
+        // new line (a common zsh style) does NOT change depth — the `for` /
+        // `while` / `until` already did.
+        let starts_loop = trimmed.starts_with("for ")
+            || trimmed.starts_with("for\t")
+            || trimmed == "for"
+            || trimmed.starts_with("while ")
+            || trimmed.starts_with("while\t")
+            || trimmed == "while"
+            || trimmed.starts_with("until ")
+            || trimmed.starts_with("until\t")
+            || trimmed == "until";
+        let starts_done = trimmed == "done"
+            || trimmed.starts_with("done ")
+            || trimmed.starts_with("done;")
+            || trimmed.starts_with("done\t")
+            || trimmed.starts_with("done|")
+            || trimmed.starts_with("done&");
+
+        if starts_loop {
+            loop_depth += 1;
+            continue;
+        }
+        if starts_done {
+            loop_depth = loop_depth.saturating_sub(1);
+            continue;
+        }
+
+        // Skip _wanted/_description lines inside any conditional / case / loop block.
+        if if_depth > 0 || case_depth > 0 || loop_depth > 0 {
             continue;
         }
 
@@ -2309,17 +2343,25 @@ fn extract_state_arm_action_with_arrays(arm: &str, arrays: &ArrayData) -> Option
     }
 
     // Priority 4: static list via compadd.
-    // Skip `compadd` calls that are inside `if`/`elif`/`fi` conditional blocks —
-    // those are only reached under specific runtime conditions that we cannot
-    // know statically (e.g. `compadd sftp` inside `if (( $+opt_args[-s] ))`).
+    // Skip `compadd` calls that are inside `if`/`fi` conditional blocks or
+    // `for`/`while`/`until`/`done` loops — those are reached under specific
+    // runtime conditions we cannot know statically (e.g. `compadd sftp`
+    // inside `if (( $+opt_args[-s] ))`, or items accumulated inside a loop
+    // over an external command's output).
     if arm.contains("compadd") {
         let mut if_depth: u32 = 0;
+        let mut loop_depth: u32 = 0;
         for line in arm.lines() {
             let t = line.trim();
             let is_if = t == "if" || t.starts_with("if ") || t.starts_with("if\t")
                 || t.starts_with("if[") || t.starts_with("if(");
             let is_fi = t == "fi" || t.starts_with("fi ") || t.starts_with("fi;")
                 || t.starts_with("fi\t") || t.starts_with("fi|") || t.starts_with("fi&");
+            let is_loop = t.starts_with("for ") || t.starts_with("for\t") || t == "for"
+                || t.starts_with("while ") || t.starts_with("while\t") || t == "while"
+                || t.starts_with("until ") || t.starts_with("until\t") || t == "until";
+            let is_done = t == "done" || t.starts_with("done ") || t.starts_with("done;")
+                || t.starts_with("done\t") || t.starts_with("done|") || t.starts_with("done&");
             if is_if {
                 if_depth += 1;
                 continue;
@@ -2328,8 +2370,16 @@ fn extract_state_arm_action_with_arrays(arm: &str, arrays: &ArrayData) -> Option
                 if_depth = if_depth.saturating_sub(1);
                 continue;
             }
-            if if_depth > 0 {
-                continue; // skip lines inside conditional blocks
+            if is_loop {
+                loop_depth += 1;
+                continue;
+            }
+            if is_done {
+                loop_depth = loop_depth.saturating_sub(1);
+                continue;
+            }
+            if if_depth > 0 || loop_depth > 0 {
+                continue; // skip lines inside conditional/loop blocks
             }
             if t.contains("compadd")
                 && let Some(items) = action_to_static_list(t)
@@ -6974,6 +7024,55 @@ esac
         assert_eq!(groups.len(), 1, "only top-level _wanted should be captured");
         assert_eq!(groups[0].tag, "commands");
         assert_eq!(groups[0].items, vec!["start", "stop", "restart"]);
+    }
+
+    #[test]
+    fn extract_tag_groups_skips_wanted_inside_for_loop() {
+        // _wanted accumulated inside a `for … done` loop is context-specific
+        // (loop body may not execute at all, or items depend on loop variable).
+        let arrays = ArrayData::new();
+        let body = r#"
+for target in ${targets}; do
+    _wanted targets expl 'target' compadd $target
+done
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert!(groups.is_empty(), "tag groups inside `for` must be skipped: {:?}", groups);
+    }
+
+    #[test]
+    fn extract_tag_groups_skips_wanted_inside_while_loop() {
+        let arrays = ArrayData::new();
+        let body = r#"
+while read -r line; do
+    _wanted lines expl 'line' compadd "$line"
+done
+"#;
+        let groups = extract_tag_groups(body, &arrays);
+        assert!(groups.is_empty(), "tag groups inside `while` must be skipped: {:?}", groups);
+    }
+
+    #[test]
+    fn sanitize_static_list_allows_glob_patterns() {
+        // Leading-star glob patterns are legitimate flag-value enums
+        // (e.g. `git clean -e '*.o'`). They must survive sanitization.
+        let clean = sanitize_static_list(vec!["*.txt".into(), "*.o".into(), "normal".into()]);
+        assert_eq!(clean, vec!["*.txt", "*.o", "normal"]);
+    }
+
+    #[test]
+    fn sanitize_static_list_still_blocks_matcher_list_fragments() {
+        // Matcher-list syntax like `r:|=*`, `b:=*` is zsh internal noise.
+        let clean = sanitize_static_list(vec![
+            "r:|=*".into(),
+            "b:=*".into(),
+            "l:|=*".into(),
+            "e:=*".into(),
+            "*".into(),  // bare star
+            "**".into(), // bare double-star
+            "real".into(),
+        ]);
+        assert_eq!(clean, vec!["real"]);
     }
 
     // --- shell_tokenize empty-quoted-string test ---

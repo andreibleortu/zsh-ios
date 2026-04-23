@@ -57,8 +57,11 @@ pub fn parse_history(
                 if words.len() > 1 {
                     let cmd = words[1];
                     if !should_skip_command(cmd, trie) {
-                        trie.root.insert_with_time(&words[1..], ts);
-                        count += 1;
+                        let clean = truncate_at_implausible(&words[1..]);
+                        if !clean.is_empty() {
+                            trie.root.insert_with_time(&clean, ts);
+                            count += 1;
+                        }
                     }
                 }
                 continue;
@@ -82,12 +85,66 @@ pub fn parse_history(
                 continue;
             }
 
-            trie.root.insert_with_time(&words, ts);
+            let clean = truncate_at_implausible(&words);
+            if clean.is_empty() {
+                continue;
+            }
+            trie.root.insert_with_time(&clean, ts);
             count += 1;
         }
     }
 
     Ok(count)
+}
+
+/// Truncate a word list at the first word that looks like shell-syntax junk
+/// rather than a real subcommand/arg. History-sourced words are inserted as
+/// trie children verbatim, so things like `'export`, `$TOKEN`, backticks, and
+/// `#`-prefixed fragments would otherwise surface as "subcommands" later.
+///
+/// We truncate (rather than skip-and-continue) because anything after an
+/// implausible word is syntactically disconnected from the command root —
+/// learning `git 'export foo` as `git → 'export → foo` produces two pieces of
+/// junk, not one.
+fn truncate_at_implausible<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    words
+        .iter()
+        .take_while(|w| is_plausible_word(w))
+        .copied()
+        .collect()
+}
+
+/// Reject words that carry shell-syntax characters (quotes, `$`, backticks,
+/// `#`, `*`, redirections, braces, parentheses). These never appear in
+/// legitimate subcommand / arg names and always mean the history segment is
+/// shell source rather than a simple command invocation.
+fn is_plausible_word(w: &str) -> bool {
+    if w.is_empty() {
+        return false;
+    }
+    if w.chars().any(|c| {
+        matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '$'
+                | '#'
+                | '*'
+                | '<'
+                | '>'
+                | '|'
+                | ';'
+                | '&'
+                | '{'
+                | '}'
+                | '('
+                | ')'
+                | '\\'
+        )
+    }) {
+        return false;
+    }
+    true
 }
 
 /// Check whether a command word from history should be skipped.
@@ -429,6 +486,62 @@ mod tests {
 
         let git = trie.root.get_child("git").unwrap();
         assert_eq!(git.last_used, 1700000200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_at_implausible_drops_shell_junk() {
+        // `echo 'export FOO=bar'` splits into `echo`, `'export`, `FOO=bar`.
+        // We should keep `echo` and stop — `'export` is shell-quoted junk and
+        // inserting `echo -> 'export -> FOO=bar` would surface both as
+        // apparent subcommands. Quotes, `$`, backticks, `#`, `*`, and shell
+        // operators all truncate.
+        assert_eq!(
+            truncate_at_implausible(&["echo", "'export", "FOO=bar"]),
+            vec!["echo"]
+        );
+        assert_eq!(
+            truncate_at_implausible(&["echo", "$TOKEN"]),
+            vec!["echo"]
+        );
+        assert_eq!(
+            truncate_at_implausible(&["sort", "`foo`"]),
+            vec!["sort"]
+        );
+        // URLs pass is_plausible_word (no shell-syntax chars) — they're
+        // filtered at display time by is_plausible_item's `://` check
+        // instead. Belt and suspenders.
+    }
+
+    #[test]
+    fn truncate_at_implausible_keeps_clean_invocation() {
+        assert_eq!(
+            truncate_at_implausible(&["git", "checkout", "main"]),
+            vec!["git", "checkout", "main"]
+        );
+        assert_eq!(
+            truncate_at_implausible(&["docker", "run", "-it", "alpine"]),
+            vec!["docker", "run", "-it", "alpine"]
+        );
+    }
+
+    #[test]
+    fn parse_history_filters_quoted_args() {
+        let dir = std::env::temp_dir().join(format!("zsh-ios-hist-junk-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history");
+        std::fs::write(&path, "echo 'export FOO=bar'\n").unwrap();
+
+        let mut trie = CommandTrie::new();
+        trie.insert_command("echo");
+
+        parse_history(&path, &mut trie).unwrap();
+
+        // echo learned, but 'export must NOT be a subcommand.
+        let echo = trie.root.get_child("echo").unwrap();
+        assert!(echo.get_child("'export").is_none(), "quoted junk leaked");
+        assert!(echo.get_child("FOO=bar").is_none(), "assignment leaked");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

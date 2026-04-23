@@ -688,10 +688,16 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
         // No trie matches — show type-aware completions based on arg spec
         show_type_completions(&mut output, current_mode, prefix, spec, arg_position);
     } else {
-        // Separate subcommands from flags (flags from history are trie children too)
+        // Separate subcommands from flags (flags from history are trie children too).
+        // Subcommands sourced from history can include shell-syntax junk
+        // (`'export`, `$TOKEN`, backticks, `#`-prefixed fragments) — apply the
+        // same plausibility filter we use elsewhere. Flags are kept as-is
+        // since they're structurally constrained (must start with `-`) and
+        // formatted separately via format_flags_from_trie.
         let subcmds: Vec<(&str, &TrieNode)> = trie_matches
             .iter()
             .filter(|(n, _)| !n.starts_with('-'))
+            .filter(|(n, _)| is_plausible_item(n))
             .copied()
             .collect();
         let flag_matches: Vec<(&str, &TrieNode)> = trie_matches
