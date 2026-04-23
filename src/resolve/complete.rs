@@ -93,7 +93,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
 
     // If no completed words, just search the root
     if completed_words.is_empty() {
-        let mut matches = trie.root.prefix_search(prefix);
+        let mut matches = trie.root.matcher_aware_search(prefix, &trie.matcher_rules);
         if matches.is_empty() {
             output.push_str(&format!("% No commands matching \"{}\"\n", prefix));
         } else {
@@ -144,7 +144,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
             node = child;
             continue;
         }
-        let matches = node.prefix_search(word);
+        let matches = node.matcher_aware_search(word, &trie.matcher_rules);
         match matches.len() {
             1 => {
                 resolved_words.push(matches[0].0.to_string());
@@ -264,7 +264,7 @@ pub(super) fn complete_segment(input: &str, trie: &CommandTrie, pins: &Pins) -> 
     let trie_matches = if in_flag_value_context {
         vec![]
     } else {
-        node.prefix_search(prefix)
+        node.matcher_aware_search(prefix, &trie.matcher_rules)
     };
 
     if trie_matches.is_empty() {
@@ -687,7 +687,7 @@ pub(super) fn resolve_first_word(word: &str, trie: &CommandTrie) -> String {
     if trie.root.get_child(word).is_some() {
         return word.to_string();
     }
-    let matches = trie.root.prefix_search(word);
+    let matches = trie.root.matcher_aware_search(word, &trie.matcher_rules);
     if matches.len() == 1 {
         return matches[0].0.to_string();
     }

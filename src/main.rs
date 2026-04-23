@@ -616,6 +616,18 @@ fn cmd_status() {
                 keys.sort_unstable();
                 println!("  Live state:  {} ({})", keys.len(), keys.join(", "));
             }
+            if !trie.matcher_rules.is_empty() {
+                let supported = trie
+                    .matcher_rules
+                    .iter()
+                    .filter(|r| !matches!(r, trie::MatcherRule::Unknown(_)))
+                    .count();
+                println!(
+                    "  Matcher rules: {} ({} honored)",
+                    trie.matcher_rules.len(),
+                    supported
+                );
+            }
             println!(
                 "  Global aliases: {} ({})",
                 trie.galiases.len(),

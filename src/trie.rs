@@ -1,7 +1,22 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+/// A single parsed zstyle matcher rule derived from the `matcher-list` setting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MatcherRule {
+    /// Case-insensitive match: fold both input and candidate to lowercase before
+    /// comparing. Covers `m:{a-z}={A-Z}`, `m:{A-Z}={a-z}`, and `m:{a-zA-Z}={A-Za-z}`.
+    CaseInsensitive,
+    /// Match-in-the-middle on separator characters. `PartialOn("._-")` means
+    /// `r:|[._-]=*`: the prefix can start a segment delimited by those chars.
+    /// `PartialOn("")` means `r:|=*`: any position is a valid anchor.
+    PartialOn(String),
+    /// A spec form we recognised but chose not to implement; stored verbatim so
+    /// callers can count it without silently dropping it.
+    Unknown(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrieNode {
@@ -118,6 +133,70 @@ impl TrieNode {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.as_str(), v))
             .collect()
+    }
+
+    /// Like `prefix_search` but honours zstyle matcher rules.
+    ///
+    /// With no rules (or an empty prefix) it delegates straight to
+    /// `prefix_search`.  Otherwise it layers up to two extra passes on top of
+    /// the exact-prefix results:
+    ///
+    /// - `CaseInsensitive`: children whose lowercased name starts with the
+    ///   lowercased prefix are added (deduped against the exact-prefix set).
+    /// - `PartialOn(charset)`: children that contain the prefix at the start
+    ///   of any segment delimited by `charset` characters are added.  An empty
+    ///   charset (`r:|=*`) accepts any position as an anchor.
+    pub fn matcher_aware_search<'a>(
+        &'a self,
+        prefix: &str,
+        rules: &[MatcherRule],
+    ) -> Vec<(&'a str, &'a TrieNode)> {
+        if rules.is_empty() || prefix.is_empty() {
+            return self.prefix_search(prefix);
+        }
+
+        // Always start with exact prefix matches.
+        let mut results: Vec<(&'a str, &'a TrieNode)> = self.prefix_search(prefix);
+        let exact_names: HashSet<&str> = results.iter().map(|(n, _)| *n).collect();
+
+        // Case-insensitive pass.
+        if rules.iter().any(|r| matches!(r, MatcherRule::CaseInsensitive)) {
+            let lower = prefix.to_lowercase();
+            for (name, node) in &self.children {
+                if !exact_names.contains(name.as_str())
+                    && name.to_lowercase().starts_with(&lower)
+                {
+                    results.push((name.as_str(), node));
+                }
+            }
+        }
+
+        // Partial-on-separator pass.
+        if let Some(charset) = rules.iter().find_map(|r| match r {
+            MatcherRule::PartialOn(cs) => Some(cs.as_str()),
+            _ => None,
+        }) {
+            let sep_chars: Vec<char> = charset.chars().collect();
+            for (name, node) in &self.children {
+                // Skip names already included by an earlier pass.
+                if results.iter().any(|(n, _)| *n == name.as_str()) {
+                    continue;
+                }
+                let hit = if sep_chars.is_empty() {
+                    // r:|=* — any position is a valid anchor.
+                    name.contains(prefix)
+                } else {
+                    // r:|[CHARSET]=* — prefix must begin a separator-delimited segment.
+                    name.split(|c: char| sep_chars.contains(&c))
+                        .any(|seg| seg.starts_with(prefix))
+                };
+                if hit {
+                    results.push((name.as_str(), node));
+                }
+            }
+        }
+
+        results
     }
 
     /// Exact lookup for a child by name.
@@ -645,6 +724,10 @@ pub struct CommandTrie {
     /// `dump-galiases` request.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub galiases: HashMap<String, String>,
+    /// Parsed zstyle matcher-list rules from the `zstyle` live-state dump.
+    /// Empty = use the default strict prefix matcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matcher_rules: Vec<MatcherRule>,
 }
 
 impl CommandTrie {
@@ -1301,5 +1384,57 @@ mod tests {
         let score_b = node.cwd_score("/b");
         assert!((score_b - 0.25).abs() < 1e-6, "expected 0.25 got {}", score_b);
         assert_eq!(node.cwd_score("/unseen"), 0.0);
+    }
+
+    // ── matcher_aware_search ──────────────────────────────────────────────────
+
+    #[test]
+    fn matcher_aware_search_empty_rules_behaves_like_prefix() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+        trie.insert_command("grep");
+        // No rules → identical to prefix_search.
+        let res = trie.root.matcher_aware_search("gi", &[]);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, "git");
+    }
+
+    #[test]
+    fn matcher_aware_search_case_insensitive() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("Git");
+        trie.insert_command("grep");
+        let rules = vec![MatcherRule::CaseInsensitive];
+        // "gi" (lower) should fold-match "Git" (mixed case).
+        let res = trie.root.matcher_aware_search("gi", &rules);
+        let names: Vec<&str> = res.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"Git"), "expected 'Git' in {:?}", names);
+        // "grep" does not start with "gi" in any case folding.
+        assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn matcher_aware_search_partial_on_separator() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("web-server");
+        trie.insert_command("db-backup");
+        let rules = vec![MatcherRule::PartialOn("-".to_string())];
+        // "server" starts the second segment of "web-server".
+        let res = trie.root.matcher_aware_search("server", &rules);
+        let names: Vec<&str> = res.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"web-server"), "expected 'web-server' in {:?}", names);
+        assert!(!names.contains(&"db-backup"));
+    }
+
+    #[test]
+    fn matcher_aware_search_unknown_rule_falls_back() {
+        let mut trie = CommandTrie::new();
+        trie.insert_command("git");
+        trie.insert_command("grep");
+        // An Unknown rule alone should not add any extra matches beyond prefix_search.
+        let rules = vec![MatcherRule::Unknown("b:=*".to_string())];
+        let res = trie.root.matcher_aware_search("gi", &rules);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, "git");
     }
 }

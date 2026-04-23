@@ -9,7 +9,7 @@
 use crate::path_resolve;
 use crate::pins::Pins;
 use crate::runtime_complete;
-use crate::trie::{self, ArgModeMap, ArgSpec, ArgSpecMap, CommandTrie, TrieNode};
+use crate::trie::{self, ArgModeMap, ArgSpec, ArgSpecMap, CommandTrie, MatcherRule, TrieNode};
 
 use super::escape::{escape_resolved_path, shell_escape_path};
 
@@ -544,13 +544,13 @@ pub fn resolve(input: &str, trie: &CommandTrie, pins: &Pins) -> ResolveResult {
         }
 
         let mut result_words = expanded_prefix;
-        match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes, &trie.arg_specs) {
+        match resolve_from_node(remaining_words, node, &mut result_words, &trie.arg_modes, &trie.arg_specs, &trie.matcher_rules) {
             Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
     } else {
         let mut result_words: Vec<String> = Vec::new();
-        match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes, &trie.arg_specs) {
+        match resolve_from_node(&words, &trie.root, &mut result_words, &trie.arg_modes, &trie.arg_specs, &trie.matcher_rules) {
             Ok(()) => finalize_with_paths(input, result_words, trie),
             Err(ambiguity) => ResolveResult::Ambiguous(*ambiguity),
         }
@@ -663,6 +663,7 @@ pub(super) fn resolve_from_node(
     result: &mut Vec<String>,
     modes: &ArgModeMap,
     arg_specs: &ArgSpecMap,
+    matcher_rules: &[MatcherRule],
 ) -> Result<(), Box<AmbiguityInfo>> {
     if words.is_empty() {
         return Ok(());
@@ -697,7 +698,7 @@ pub(super) fn resolve_from_node(
             let has_subcmd_match = !force_skip
                 && !word.starts_with('-')
                 && start_node
-                    .prefix_search(word)
+                    .matcher_aware_search(word, matcher_rules)
                     .iter()
                     .any(|(n, _)| !n.starts_with('-'));
             if !has_subcmd_match {
@@ -717,7 +718,7 @@ pub(super) fn resolve_from_node(
         if let Some(exact_node) = start_node.get_child(word) {
             result.push(word.to_string());
             if !rest.is_empty() && !exact_node.children.is_empty() {
-                return resolve_from_node(rest, exact_node, result, modes, arg_specs);
+                return resolve_from_node(rest, exact_node, result, modes, arg_specs, matcher_rules);
             }
         } else {
             result.push(word.to_string());
@@ -743,7 +744,7 @@ pub(super) fn resolve_from_node(
     if let Some(exact_node) = start_node.get_child(word) {
         result.push(word.to_string());
         if !rest.is_empty() && !exact_node.children.is_empty() {
-            return resolve_from_node(rest, exact_node, result, modes, arg_specs);
+            return resolve_from_node(rest, exact_node, result, modes, arg_specs, matcher_rules);
         }
         for w in rest {
             result.push(w.to_string());
@@ -769,7 +770,7 @@ pub(super) fn resolve_from_node(
         return Ok(());
     }
 
-    let matches = start_node.prefix_search(word);
+    let matches = start_node.matcher_aware_search(word, matcher_rules);
 
     match matches.len() {
         0 => {
@@ -785,7 +786,7 @@ pub(super) fn resolve_from_node(
             result.push(full_name.to_string());
 
             if !rest.is_empty() && !child_node.children.is_empty() {
-                resolve_from_node(rest, child_node, result, modes, arg_specs)
+                resolve_from_node(rest, child_node, result, modes, arg_specs, matcher_rules)
             } else {
                 for w in rest {
                     result.push(w.to_string());
@@ -838,7 +839,7 @@ pub(super) fn resolve_from_node(
                     result.push(full_name.to_string());
 
                     if !child_node.children.is_empty() {
-                        return resolve_from_node(rest, child_node, result, modes, arg_specs);
+                        return resolve_from_node(rest, child_node, result, modes, arg_specs, matcher_rules);
                     } else {
                         for w in rest {
                             result.push(w.to_string());
@@ -906,7 +907,7 @@ pub(super) fn resolve_from_node(
                     let (full_name, child_node) = pool[0];
                     result.push(full_name.to_string());
                     if !child_node.children.is_empty() {
-                        return resolve_from_node(rest, child_node, result, modes, arg_specs);
+                        return resolve_from_node(rest, child_node, result, modes, arg_specs, matcher_rules);
                     } else {
                         for w in rest {
                             result.push(w.to_string());
@@ -4809,6 +4810,24 @@ mod tests {
                 assert!(s.contains("| grep"), "expected galias expansion in passthrough, got: {}", s);
             }
             other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    // ── matcher-rule integration ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_honors_case_insensitive_matcher() {
+        use crate::trie::MatcherRule;
+        let mut trie = CommandTrie::new();
+        // Trie has "Git" (mixed case) — "gi" would not match it with strict prefix.
+        trie.insert_command("Git");
+        trie.matcher_rules = vec![MatcherRule::CaseInsensitive];
+        let pins = Pins::default();
+        // With CaseInsensitive, "gi" should fold-match "Git".
+        let result = resolve("gi", &trie, &pins);
+        match result {
+            ResolveResult::Resolved(s) => assert_eq!(s, "Git"),
+            other => panic!("expected Resolved(\"Git\"), got {:?}", other),
         }
     }
 }

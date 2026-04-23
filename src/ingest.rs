@@ -1,3 +1,4 @@
+use crate::trie::MatcherRule;
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -73,7 +74,12 @@ pub fn apply_ingest(trie: &mut crate::trie::CommandTrie, input: &str) {
             trie.live_state.insert((*meta_kind).to_string(), body.to_string());
         }
     }
-    // zstyle and any future unknown sections are tolerated but not consumed.
+    if let Some(body) = sections.get("zstyle") {
+        let rules = parse_zstyle_matchers(body);
+        if !rules.is_empty() {
+            trie.matcher_rules = rules;
+        }
+    }
 }
 
 /// Split an ingest payload into named sections.
@@ -250,6 +256,121 @@ pub fn apply_dirstack(trie: &mut crate::trie::CommandTrie, body: &str) {
         stack.push(path.to_string());
     }
     trie.dir_stack = stack;
+}
+
+/// Parse `zstyle -L` output and extract matcher-list rules.
+///
+/// Only lines of the form `zstyle '<context>' matcher-list <args>` are
+/// examined; all other `zstyle` lines are ignored.  Each quoted argument
+/// after `matcher-list` is a single matcher string; within it, individual
+/// specs are whitespace-separated.
+pub fn parse_zstyle_matchers(body: &str) -> Vec<MatcherRule> {
+    let mut rules = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("zstyle ") else {
+            continue;
+        };
+        // Skip the context argument (first quoted token).
+        let Some(after_context) = skip_quoted(rest) else {
+            continue;
+        };
+        let after_context = after_context.trim_start();
+        let Some(after_key) = after_context.strip_prefix("matcher-list") else {
+            continue;
+        };
+        // Each remaining quoted token is one matcher string.
+        for matcher in split_quoted_args(after_key) {
+            for spec in matcher.split_whitespace() {
+                rules.push(classify_matcher_spec(spec));
+            }
+        }
+    }
+    rules
+}
+
+/// Classify one zstyle match spec into a `MatcherRule`.
+fn classify_matcher_spec(spec: &str) -> MatcherRule {
+    // m:{...}={...} forms that reference a-z or A-Z → case-insensitive.
+    if spec.starts_with("m:{")
+        && (spec.contains("a-z") || spec.contains("A-Z"))
+        && spec.contains('=')
+    {
+        return MatcherRule::CaseInsensitive;
+    }
+    // r:|[CHARSET]=* or r:|=* — partial / any-position matching.
+    if spec.starts_with("r:|") {
+        let charset = extract_charset(spec);
+        return MatcherRule::PartialOn(charset.unwrap_or_default());
+    }
+    MatcherRule::Unknown(spec.to_string())
+}
+
+/// Advance past the first shell-quoted token in `s` and return the remainder.
+///
+/// Handles single-quoted (`'...'`) and double-quoted (`"..."`) tokens as well
+/// as bare (unquoted) tokens terminated by whitespace.  Returns `None` when
+/// `s` is empty after trimming leading whitespace.
+fn skip_quoted(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let quote = bytes[0];
+    if quote == b'\'' || quote == b'"' {
+        // Find the matching closing quote.
+        let mut i = 1;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        // i now points at the closing quote (or end-of-string).
+        Some(&s[i.saturating_add(1)..])
+    } else {
+        // Bare token — advance until whitespace.
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        Some(&s[end..])
+    }
+}
+
+/// Split the remainder of a `zstyle ... matcher-list` line into individual
+/// quoted argument strings, stripping the outer quotes.
+///
+/// Handles `'...'` and `"..."` quoting only; unquoted tokens are returned
+/// verbatim.
+fn split_quoted_args(s: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        let bytes = rest.as_bytes();
+        let quote = bytes[0];
+        if quote == b'\'' || quote == b'"' {
+            // Find closing quote.
+            let mut i = 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            // Content between quotes.
+            args.push(&rest[1..i]);
+            rest = rest[i.saturating_add(1)..].trim_start();
+        } else {
+            // Bare token.
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            args.push(&rest[..end]);
+            rest = rest[end..].trim_start();
+        }
+    }
+    args
+}
+
+/// Extract the character-set string from `r:|[CHARSET]=*`.
+///
+/// Returns `Some("._-")` for `r:|[._-]=*`, `None` for bare `r:|=*`.
+fn extract_charset(spec: &str) -> Option<String> {
+    // Expect the form r:|[...]=*
+    let inner = spec.strip_prefix("r:|[")?;
+    let end = inner.find(']')?;
+    Some(inner[..end].to_string())
 }
 
 /// Apply named-directory lines (`name=/abs/path`) to `trie.named_dirs`.
@@ -515,5 +636,63 @@ mod tests {
         assert_eq!(trie.galiases.get("G"), Some(&"| grep".to_string()));
         // Must NOT have been inserted into the trie root as a command.
         assert!(trie.root.get_child("G").is_none());
+    }
+
+    // ── parse_zstyle_matchers ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_zstyle_matchers_case_insensitive() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::CaseInsensitive);
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_partial() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'r:|[._-]=* r:|=*'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 2, "expected 2 rules, got {:?}", rules);
+        assert_eq!(rules[0], MatcherRule::PartialOn("._-".to_string()));
+        assert_eq!(rules[1], MatcherRule::PartialOn(String::new()));
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_ignores_unrelated_zstyle() {
+        let body = "zstyle ':completion:*' completer _complete _approximate _ignored\n";
+        let rules = parse_zstyle_matchers(body);
+        assert!(rules.is_empty(), "expected no rules, got {:?}", rules);
+    }
+
+    #[test]
+    fn parse_zstyle_matchers_unknown_recorded() {
+        use crate::trie::MatcherRule;
+        let body = "zstyle ':completion:*' matcher-list 'b:=*'\n";
+        let rules = parse_zstyle_matchers(body);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], MatcherRule::Unknown("b:=*".to_string()));
+    }
+
+    #[test]
+    fn apply_ingest_populates_matcher_rules() {
+        use crate::trie::MatcherRule;
+        let mut trie = CommandTrie::new();
+        let input = concat!(
+            "@zstyle\n",
+            "zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}' 'r:|[._-]=* r:|=*'\n",
+        );
+        apply_ingest(&mut trie, input);
+        // Three rules: CaseInsensitive, PartialOn("._-"), PartialOn("").
+        assert_eq!(
+            trie.matcher_rules.len(),
+            3,
+            "expected 3 matcher rules, got {:?}",
+            trie.matcher_rules
+        );
+        assert_eq!(trie.matcher_rules[0], MatcherRule::CaseInsensitive);
+        assert_eq!(trie.matcher_rules[1], MatcherRule::PartialOn("._-".to_string()));
+        assert_eq!(trie.matcher_rules[2], MatcherRule::PartialOn(String::new()));
     }
 }
