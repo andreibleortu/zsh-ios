@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,18 +19,37 @@ pub enum PathResult {
 ///
 /// When ambiguous, looks ahead at subsequent components to disambiguate.
 /// If multiple candidates survive, returns all fully-resolved paths.
-pub fn resolve_path(abbreviated: &str) -> PathResult {
-    resolve_path_inner(abbreviated, false)
+///
+/// `named_dirs` maps Zsh `hash -d` names to their absolute paths.
+/// Tokens of the form `~name`, `name/rest`, or `name:rest` are expanded
+/// before filesystem resolution when `name` is a key in `named_dirs`.
+pub fn resolve_path(abbreviated: &str, named_dirs: &HashMap<String, String>) -> PathResult {
+    resolve_path_inner(abbreviated, false, named_dirs)
 }
 
 /// Like `resolve_path` but only matches directories (for cd, pushd, etc.).
-pub fn resolve_path_dirs_only(abbreviated: &str) -> PathResult {
-    resolve_path_inner(abbreviated, true)
+pub fn resolve_path_dirs_only(
+    abbreviated: &str,
+    named_dirs: &HashMap<String, String>,
+) -> PathResult {
+    resolve_path_inner(abbreviated, true, named_dirs)
 }
 
-fn resolve_path_inner(abbreviated: &str, dirs_only: bool) -> PathResult {
+fn resolve_path_inner(
+    abbreviated: &str,
+    dirs_only: bool,
+    named_dirs: &HashMap<String, String>,
+) -> PathResult {
     if abbreviated.is_empty() {
         return PathResult::Unchanged;
+    }
+
+    // Expand named-dir references before doing filesystem resolution.
+    // A reference expands to an absolute path, so we recurse once with an
+    // empty named_dirs to avoid a second expansion pass.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(expanded) = expand_named_dir_with_cwd(abbreviated, named_dirs, &cwd) {
+        return resolve_path_inner(&expanded, dirs_only, &HashMap::new());
     }
 
     let trailing_slash = abbreviated.ends_with('/');
@@ -188,6 +208,108 @@ fn resolve_components(
     }
 
     ComponentsResult::Resolved(resolved_parts)
+}
+
+/// Returns true when `word` looks like a named-dir reference (`name/rest`,
+/// `name:rest`, or `~name`) that would be expanded by `expand_named_dir`.
+/// Used in `ArgMode::Normal` to decide whether to call `resolve_path` on
+/// words that don't otherwise look like paths.
+pub fn looks_like_named_dir_ref(word: &str, named_dirs: &HashMap<String, String>) -> bool {
+    if named_dirs.is_empty() {
+        return false;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    expand_named_dir_with_cwd(word, named_dirs, &cwd).is_some()
+}
+
+/// Expand a token whose prefix references a named directory.
+///
+/// Returns `None` if the token doesn't start with a named-dir reference or
+/// if a real directory in `cwd` takes precedence over the named-dir entry.
+///
+/// Handles three forms:
+/// - `~name` / `~name/rest` / `~name:rest`
+/// - `name/rest` where `name` is a full key in `named_dirs`
+/// - `name:rest` (same, but Zsh colon-separator convention)
+///
+/// A bare `name` (no `/` or `:`) is NOT expanded — the caller probably
+/// means the name literally.
+///
+/// URL-like tokens (`scheme://...`) and SSH targets (`user@host:...`) are
+/// left alone even if they happen to contain a matching name.
+pub fn expand_named_dir(
+    token: &str,
+    named_dirs: &HashMap<String, String>,
+) -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    expand_named_dir_with_cwd(token, named_dirs, &cwd)
+}
+
+pub(crate) fn expand_named_dir_with_cwd(
+    token: &str,
+    named_dirs: &HashMap<String, String>,
+    cwd: &Path,
+) -> Option<String> {
+    if named_dirs.is_empty() {
+        return None;
+    }
+
+    // ~name form: tilde immediately followed by the dir name (no space).
+    if let Some(rest) = token.strip_prefix('~') {
+        // Split on the first '/' or ':' to isolate the name.
+        let (name, sep_and_tail) = match rest.find(['/', ':']) {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if name.is_empty() {
+            // Plain `~` or `~/...` — home dir, not a named dir.
+            return None;
+        }
+        if let Some(base) = named_dirs.get(name) {
+            // sep_and_tail starts with '/' or ':'; convert ':' to '/'.
+            let tail = if let Some(after_colon) = sep_and_tail.strip_prefix(':') {
+                format!("/{after_colon}")
+            } else {
+                sep_and_tail.to_string()
+            };
+            return Some(format!("{base}{tail}"));
+        }
+        return None;
+    }
+
+    // name/rest or name:rest
+    let sep_idx = token.find(['/', ':'])?;
+    let name = &token[..sep_idx];
+    let sep = &token[sep_idx..sep_idx + 1];
+
+    // Skip URL-like tokens: `scheme://...`
+    if sep == ":" {
+        if token.get(sep_idx..sep_idx + 3) == Some("://") {
+            return None;
+        }
+        // Skip SSH-style targets: `user@host:/path`
+        if token[..sep_idx].contains('@') {
+            return None;
+        }
+    }
+
+    // A real directory in cwd wins over the named dir.
+    if cwd.join(name).is_dir() {
+        return None;
+    }
+
+    // For `name/rest` the separator is already `/`, so tail includes it.
+    // For `name:rest` we replace the `:` with `/` so the result is a valid path.
+    named_dirs.get(name).map(|base| {
+        let after_sep = &token[sep_idx + 1..];
+        if sep == ":" && !after_sep.is_empty() {
+            format!("{base}/{after_sep}")
+        } else {
+            // sep is '/' (or ':' with empty remainder — keep base as-is)
+            let tail = &token[sep_idx..];
+            format!("{base}{tail}")
+        }
+    })
 }
 
 fn parse_path_parts(abbreviated: &str) -> (PathBuf, Vec<String>, String) {
@@ -375,9 +497,13 @@ fn join_path_parts(parts: &[String]) -> String {
 mod tests {
     use super::*;
 
+    fn empty_named_dirs() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     #[test]
     fn test_resolve_absolute() {
-        let result = resolve_path("/usr/lo");
+        let result = resolve_path("/usr/lo", &empty_named_dirs());
         if Path::new("/usr/local").exists() {
             match result {
                 PathResult::Resolved(s) => assert_eq!(s, "/usr/local"),
@@ -390,7 +516,7 @@ mod tests {
     fn test_resolve_tilde() {
         let home = dirs::home_dir().unwrap();
         if home.join("Desktop").exists() && !home.join("Desk").exists() {
-            match resolve_path("~/Desk") {
+            match resolve_path("~/Desk", &empty_named_dirs()) {
                 PathResult::Resolved(s) => assert_eq!(s, "~/Desktop"),
                 _ => panic!("Expected Resolved"),
             }
@@ -627,7 +753,7 @@ mod tests {
     #[test]
     fn test_resolve_path_unchanged() {
         // A completely non-matching path should return Unchanged
-        match resolve_path("zzzznonexistent") {
+        match resolve_path("zzzznonexistent", &empty_named_dirs()) {
             PathResult::Unchanged => {}
             other => panic!("Expected Unchanged for nonexistent, got {:?}", other),
         }
@@ -635,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_empty() {
-        match resolve_path("") {
+        match resolve_path("", &empty_named_dirs()) {
             PathResult::Unchanged => {}
             other => panic!("Expected Unchanged for empty, got {:?}", other),
         }
@@ -712,7 +838,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("application")).unwrap();
         let abbrev = format!("{}/appl", td.path().display());
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Resolved(s) => {
                 assert!(s.ends_with("/application"), "got: {}", s);
             }
@@ -728,7 +854,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("Application Support/zsh-ios")).unwrap();
         std::fs::create_dir_all(td.path().join("Application Scripts/other")).unwrap();
         let abbrev = format!("{}/Appli/zsh-", td.path().display());
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Resolved(s) => {
                 assert!(s.contains("Application Support"), "branched wrong: {}", s);
                 assert!(s.ends_with("zsh-ios"), "didn't complete leaf: {}", s);
@@ -747,7 +873,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("apple")).unwrap();
         std::fs::create_dir_all(td.path().join("application")).unwrap();
         let abbrev = format!("{}/app", td.path().display());
-        match resolve_path_dirs_only(&abbrev) {
+        match resolve_path_dirs_only(&abbrev, &empty_named_dirs()) {
             PathResult::Ambiguous(paths) => {
                 assert_eq!(paths.len(), 2);
                 assert!(paths.iter().any(|p| p.ends_with("/apple")));
@@ -756,7 +882,7 @@ mod tests {
             other => panic!("expected Ambiguous, got {:?}", other),
         }
         // Same input in non-dirs-only mode: Unchanged (caller handles it).
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Unchanged => {}
             other => panic!("expected Unchanged for plain resolve, got {:?}", other),
         }
@@ -767,7 +893,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("targetdir")).unwrap();
         let abbrev = format!("{}/target/", td.path().display());
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Resolved(s) => assert!(s.ends_with('/'), "lost trailing slash: {}", s),
             other => panic!("expected Resolved, got {:?}", other),
         }
@@ -778,7 +904,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("only-a-file"), "").unwrap();
         let abbrev = format!("{}/only", td.path().display());
-        match resolve_path_dirs_only(&abbrev) {
+        match resolve_path_dirs_only(&abbrev, &empty_named_dirs()) {
             PathResult::Unchanged => {}
             // Allow Resolved only if the platform for some reason creates
             // a matching dir — in our tempdir we only made a file.
@@ -793,7 +919,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("tests/test-1")).unwrap();
         std::fs::create_dir_all(td.path().join("tests/test-5")).unwrap();
         let abbrev = format!("{}/tests/!5", td.path().display());
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Resolved(s) => assert!(s.ends_with("test-5"), "got: {}", s),
             other => panic!("expected Resolved, got {:?}", other),
         }
@@ -805,7 +931,7 @@ mod tests {
         std::fs::write(td.path().join("a.py"), "").unwrap();
         std::fs::write(td.path().join("b.py"), "").unwrap();
         let abbrev = format!("{}/**.py", td.path().display());
-        match resolve_path(&abbrev) {
+        match resolve_path(&abbrev, &empty_named_dirs()) {
             PathResult::Resolved(s) => assert!(s.ends_with("/*.py"), "got: {}", s),
             // It is also valid for this to be Unchanged if the path already
             // starts with "*/*.py" after joining — but our tempdir abbrev
@@ -845,5 +971,123 @@ mod tests {
         let dirs = list_dir(td.path(), true);
         assert!(dirs.contains(&"somedir".to_string()));
         assert!(!dirs.contains(&"somefile".to_string()));
+    }
+
+    // --- expand_named_dir tests ---
+
+    fn named_dirs_fixture() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("proj".to_string(), "/home/me/proj".to_string());
+        m
+    }
+
+    #[test]
+    fn expand_named_dir_slash_form() {
+        let dirs = named_dirs_fixture();
+        let td = tempfile::tempdir().unwrap();
+        let result = expand_named_dir_with_cwd("proj/src/lib.rs", &dirs, td.path());
+        assert_eq!(result, Some("/home/me/proj/src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn expand_named_dir_colon_form() {
+        let dirs = named_dirs_fixture();
+        let td = tempfile::tempdir().unwrap();
+        let result = expand_named_dir_with_cwd("proj:src/lib.rs", &dirs, td.path());
+        assert_eq!(result, Some("/home/me/proj/src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn expand_named_dir_tilde_form() {
+        let dirs = named_dirs_fixture();
+        let td = tempfile::tempdir().unwrap();
+        let result = expand_named_dir_with_cwd("~proj/file", &dirs, td.path());
+        assert_eq!(result, Some("/home/me/proj/file".to_string()));
+    }
+
+    #[test]
+    fn expand_named_dir_bare_name_no_expand() {
+        let dirs = named_dirs_fixture();
+        let td = tempfile::tempdir().unwrap();
+        let result = expand_named_dir_with_cwd("proj", &dirs, td.path());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn expand_named_dir_cwd_wins() {
+        let _g = crate::test_util::CWD_LOCK.lock().unwrap();
+        let dirs = named_dirs_fixture();
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("proj")).unwrap();
+        // cwd has a "proj" directory — named dir should not expand
+        let result = expand_named_dir_with_cwd("proj/file", &dirs, td.path());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn expand_named_dir_skips_urls() {
+        let mut dirs = HashMap::new();
+        dirs.insert("https".to_string(), "/some/path".to_string());
+        dirs.insert("ssh".to_string(), "/other/path".to_string());
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(
+            expand_named_dir_with_cwd("https://example.com", &dirs, td.path()),
+            None
+        );
+        assert_eq!(
+            expand_named_dir_with_cwd("ssh://host/path", &dirs, td.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_named_dir_skips_ssh_target() {
+        let mut dirs = HashMap::new();
+        dirs.insert("host".to_string(), "/local/path".to_string());
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(
+            expand_named_dir_with_cwd("user@host:/remote/path", &dirs, td.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_named_dir_miss_returns_none() {
+        let dirs = empty_named_dirs();
+        let td = tempfile::tempdir().unwrap();
+        assert_eq!(
+            expand_named_dir_with_cwd("unknown/path", &dirs, td.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_named_dir_empty_map_is_fast() {
+        let dirs = empty_named_dirs();
+        let td = tempfile::tempdir().unwrap();
+        // Empty map short-circuits before any filesystem call
+        assert_eq!(
+            expand_named_dir_with_cwd("proj/src/main.rs", &dirs, td.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn path_resolve_uses_named_dir() {
+        // End-to-end: set up a tempdir as the mapped path, add a file, call
+        // resolve_path with `proj:fil` where `proj → tempdir`, assert it
+        // expands and the file-abbrev resolves.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("file.rs"), "").unwrap();
+
+        let mut dirs = HashMap::new();
+        dirs.insert("proj".to_string(), td.path().to_str().unwrap().to_string());
+
+        match resolve_path("proj:fil", &dirs) {
+            PathResult::Resolved(s) => {
+                assert!(s.ends_with("file.rs"), "expected file.rs, got: {s}");
+            }
+            other => panic!("expected Resolved, got {:?}", other),
+        }
     }
 }
