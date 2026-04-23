@@ -1,2 +1,9 @@
 /target
 Cargo.lock
+
+# Editor / OS junk
+.DS_Store
+**/.DS_Store
+
+# One-off agent-definition files — per-checkout, never commit
+.claude/agents/
