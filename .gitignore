@@ -7,3 +7,6 @@ Cargo.lock
 
 # One-off agent-definition files — per-checkout, never commit
 .claude/agents/
+
+# cargo-fuzz build artifacts
+fuzz/target/

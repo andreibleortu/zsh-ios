@@ -1,0 +1,11 @@
+@aliases
+ll='ls -la'
+la='ls -a'
+@history
+git commit -m 'msg'
+echo @not-a-section
+ls | grep foo
+@aliases
+G='| grep'
+@galiases
+L='| less'

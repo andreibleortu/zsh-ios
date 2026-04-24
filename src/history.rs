@@ -190,6 +190,9 @@ pub fn split_command_segments(line: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    // Track [[ ... ]] depth so that `||` / `&&` inside Zsh conditionals
+    // (e.g. `[[ $x == a || $x == b ]]`) are not treated as segment separators.
+    let mut bracket_depth: u32 = 0;
     let bytes = line.as_bytes();
     let mut i = 0;
 
@@ -201,7 +204,19 @@ pub fn split_command_segments(line: &str) -> Vec<&str> {
             b'\\' if !in_single_quote => {
                 i += 1; // skip escaped char
             }
-            b'|' | b';' if !in_single_quote && !in_double_quote => {
+            b'[' if !in_single_quote && !in_double_quote => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                    bracket_depth += 1;
+                    i += 1; // consume second [
+                }
+            }
+            b']' if !in_single_quote && !in_double_quote && bracket_depth > 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    i += 1; // consume second ]
+                }
+            }
+            b'|' | b';' if !in_single_quote && !in_double_quote && bracket_depth == 0 => {
                 // Also handle || and && as segment separators
                 let seg = line[start..i].trim();
                 if !seg.is_empty() {
@@ -213,7 +228,7 @@ pub fn split_command_segments(line: &str) -> Vec<&str> {
                 }
                 start = i + 1;
             }
-            b'&' if !in_single_quote && !in_double_quote => {
+            b'&' if !in_single_quote && !in_double_quote && bracket_depth == 0 => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
                     let seg = line[start..i].trim();
                     if !seg.is_empty() {

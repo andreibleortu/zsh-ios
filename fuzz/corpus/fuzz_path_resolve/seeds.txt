@@ -1,0 +1,5 @@
+~/projects/zsh
+~0/subdir
+proj!/subdir
+foo*/bar
+~projects/nested/path

@@ -85,12 +85,23 @@ pub fn apply_ingest(trie: &mut crate::trie::CommandTrie, input: &str) {
     }
 }
 
+/// Known section names accepted by `apply_ingest`.  Any `@`-prefixed line
+/// whose name is NOT in this set is treated as body content, not a header.
+/// This prevents alias values or history entries that happen to start a line
+/// with `@` from corrupting the section parse.
+const KNOWN_SECTIONS: &[&str] = &[
+    "aliases", "galiases", "saliases", "functions", "nameddirs",
+    "history", "dirstack", "jobs", "commands", "parameters",
+    "options", "widgets", "modules", "zstyle",
+];
+
 /// Split an ingest payload into named sections.
 ///
-/// Lines that begin with `@` at column 0 are section headers.  The body of
-/// each section is the text between that header and the next `@`-line (or
-/// end-of-input).  Returns a map of section name -> body (including trailing
-/// newline, if any).
+/// Lines that begin with `@<known-name>` at column 0 are section headers.
+/// The body of each section is the text between that header and the next
+/// recognised `@`-line (or end-of-input).  Unrecognised `@`-prefixed lines
+/// are treated as ordinary body content.  Returns a map of section name ->
+/// body (including trailing newline, if any).
 pub fn split_sections(input: &str) -> HashMap<&str, &str> {
     let mut map = HashMap::new();
     let mut current_name: Option<&str> = None;
@@ -100,8 +111,12 @@ pub fn split_sections(input: &str) -> HashMap<&str, &str> {
     for line in input.split_inclusive('\n') {
         let line_start = pos;
         pos += line.len();
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        // Strip CR/LF and trailing spaces so "@aliases " is still recognised.
+        let trimmed = line.trim_end();
         if let Some(name) = trimmed.strip_prefix('@') {
+            if !KNOWN_SECTIONS.contains(&name) {
+                continue; // body line starting with @, not a section header
+            }
             // Close the previous section.
             if let Some(prev_name) = current_name {
                 map.insert(prev_name, &input[current_start..line_start]);

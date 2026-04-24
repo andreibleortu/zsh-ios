@@ -129,9 +129,10 @@ fn sanitize_static_list(items: Vec<String>) -> Vec<String> {
         // Leading underscore → internal zsh helper/cache variable name.
         if t.starts_with('_') { continue; }
 
-        // Dedup: first occurrence wins.
+        // Dedup: first occurrence wins.  Push the trimmed form so that
+        // "  foo  " and "foo" don't both end up in the output.
         if seen.insert(t.to_string()) {
-            out.push(item);
+            out.push(t.to_string());
         }
     }
     out
@@ -2240,7 +2241,8 @@ fn extract_state_handlers(body: &str) -> HashMap<String, StateAction> {
 
     let Some(case_body_start) = case_start else { return result; };
 
-    // Find `esac` that closes this case block (simplified: first one after case_body_start)
+    // Find `esac` that closes this case block (simplified: first `esac` at the
+    // start of a line after case_body_start).
     let case_body_end = body[case_body_start..].find("\nesac")
         .map(|p| case_body_start + p)
         .unwrap_or(body.len());
@@ -4773,6 +4775,7 @@ fn extract_flags_from_spec(spec: &str) -> Vec<String> {
         && flag_part.contains('}')
         && let Some(start) = flag_part.find('{')
         && let Some(end) = flag_part.find('}')
+        && start < end
     {
         let inner = &flag_part[start + 1..end];
         for part in inner.split(',') {

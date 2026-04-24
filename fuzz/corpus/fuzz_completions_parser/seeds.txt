@@ -1,0 +1,5 @@
+_arguments '(-v --verbose)--verbose[enable verbose]' ':file:_files'
+_arguments '--flag[desc]:label:_files' '--bool[boolean flag]'
+_values 'items' 'add[add something]' 'remove[remove something]'
+_alternative 'files:file:_files' 'dirs:dir:_dirs'
+local -a cmds; cmds=('start:start it' 'stop:stop it'); _describe 'cmd' cmds

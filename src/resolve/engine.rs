@@ -351,13 +351,14 @@ pub(super) fn wrapper_inner_start(words: &[&str]) -> Option<usize> {
             None
         }
         // doas (sudo alternative on BSDs / some Linux): [-flags] <command>
+        // doas (sudo alternative on BSDs / some Linux): [-u user] [-C config] [-flags] <command>
         "doas" => {
             let mut i = 1;
             while i < words.len() {
                 let w = words[i];
                 if !w.starts_with('-') {
-                    // -u consumes the next word
-                    if i > 1 && words[i - 1] == "-u" {
+                    // -u and -C each consume the next word as their argument
+                    if i > 1 && matches!(words[i - 1], "-u" | "-C") {
                         i += 1;
                         continue;
                     }

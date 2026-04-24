@@ -1,0 +1,39 @@
+[package]
+name = "zsh-ios-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zsh-ios = { path = ".." }
+arbitrary = { version = "1.3", features = ["derive"] }
+
+# cargo-fuzz requires each target as a [[bin]] with test=false doc=false.
+
+[[bin]]
+name = "fuzz_completions_parser"
+path = "fuzz_targets/fuzz_completions_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ingest"
+path = "fuzz_targets/fuzz_ingest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_path_resolve"
+path = "fuzz_targets/fuzz_path_resolve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_history"
+path = "fuzz_targets/fuzz_history.rs"
+test = false
+doc = false
