@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 zsh-ios = { path = ".." }
 arbitrary = { version = "1.3", features = ["derive"] }
+rmp-serde = "1.3"
 
 # cargo-fuzz requires each target as a [[bin]] with test=false doc=false.
 
@@ -35,5 +36,29 @@ doc = false
 [[bin]]
 name = "fuzz_history"
 path = "fuzz_targets/fuzz_history.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_resolve"
+path = "fuzz_targets/fuzz_resolve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bash_completions"
+path = "fuzz_targets/fuzz_bash_completions.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_regex_args"
+path = "fuzz_targets/fuzz_regex_args.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_trie_serde"
+path = "fuzz_targets/fuzz_trie_serde.rs"
 test = false
 doc = false

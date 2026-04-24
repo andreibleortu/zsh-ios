@@ -448,9 +448,10 @@ fn split_quoted_args(s: &str) -> Vec<&str> {
             while i < bytes.len() && bytes[i] != quote {
                 i += 1;
             }
-            // Content between quotes.
+            // Content between quotes (guard against unclosed quote at EOF).
             args.push(&rest[1..i]);
-            rest = rest[i.saturating_add(1)..].trim_start();
+            let after_quote = if i < bytes.len() { i + 1 } else { i };
+            rest = rest[after_quote..].trim_start();
         } else {
             // Bare token.
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());

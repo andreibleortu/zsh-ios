@@ -10,3 +10,8 @@ Cargo.lock
 
 # cargo-fuzz build artifacts
 fuzz/target/
+
+# cargo-fuzz runtime output — corpus (auto-generated) and crash artifacts.
+# The hand-written seed files (seeds.txt) are tracked separately via git add -f.
+fuzz/corpus/
+fuzz/artifacts/

@@ -278,10 +278,16 @@ fn split_shell_tokens(s: &str) -> Vec<String> {
     let mut rest = s.trim();
     while !rest.is_empty() {
         if rest.starts_with('\'') {
-            // Find the closing single quote.
-            let end = rest[1..].find('\'').map(|i| i + 1).unwrap_or(rest.len() - 1);
-            tokens.push(rest[1..end].to_string());
-            rest = rest[end + 1..].trim_start();
+            // Find the closing single quote.  Guard against unclosed quotes
+            // (malformed input): take everything up to EOF in that case.
+            if let Some(inner) = rest[1..].find('\'') {
+                let end = inner + 1; // position of closing quote in `rest`
+                tokens.push(rest[1..end].to_string());
+                rest = rest[end + 1..].trim_start();
+            } else {
+                tokens.push(rest[1..].to_string());
+                break;
+            }
         } else {
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             tokens.push(rest[..end].to_string());
