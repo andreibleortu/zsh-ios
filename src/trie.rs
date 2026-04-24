@@ -562,6 +562,10 @@ pub struct ArgSpec {
     /// Same as `positional_alternatives` but for the rest/positional fallback type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rest_alternatives: Vec<u8>,
+    /// Boolean flags: flags that take no argument, extracted from `_arguments`
+    /// specs of the form `--flag[description]` (no colon-delimited action).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boolean_flags: Vec<String>,
 }
 
 /// Returns a specificity score for an `ARG_MODE_*` constant.
@@ -786,6 +790,7 @@ impl ArgSpec {
             && self.positional_alternatives.is_empty()
             && self.flag_alternatives.is_empty()
             && self.rest_alternatives.is_empty()
+            && self.boolean_flags.is_empty()
     }
 
     /// Whether a flag consumes the next word (either via typed arg, call_program, or static list).
@@ -970,6 +975,13 @@ impl ArgSpec {
                 }
             }
             self.flag_exclusions.push(other_excl.clone());
+        }
+
+        // --- boolean_flags: union ---
+        for flag in &other.boolean_flags {
+            if !self.boolean_flags.contains(flag) {
+                self.boolean_flags.push(flag.clone());
+            }
         }
     }
 }

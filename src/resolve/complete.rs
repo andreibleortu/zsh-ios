@@ -861,6 +861,12 @@ pub(super) fn complete_flags(
                 known_flags.push((flag.clone(), None));
             }
         }
+        // Include boolean flags (take no argument)
+        for flag in &spec.boolean_flags {
+            if flag.starts_with(prefix) && !known_flags.iter().any(|(f, _)| f == flag) {
+                known_flags.push((flag.clone(), None));
+            }
+        }
 
         // Filter out flags that are mutually exclusive with a flag already on the line.
         if !spec.flag_exclusions.is_empty() {
@@ -1121,11 +1127,11 @@ pub(super) fn show_type_completions(
 ) {
     match mode {
         ArgMode::DirsOnly => {
-            output.push_str("  Expects: <directory>\n");
+            output.push_str(&format!("{} Expects: <directory>\n", hdr()));
             output.push_str(&complete_filesystem(prefix, true));
         }
         ArgMode::Paths => {
-            output.push_str("  Expects: <file>\n");
+            output.push_str(&format!("{} Expects: <file>\n", hdr()));
             output.push_str(&complete_filesystem(prefix, false));
         }
         ArgMode::Runtime(type_id) => {

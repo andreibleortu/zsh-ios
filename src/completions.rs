@@ -3737,6 +3737,12 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
         for spec_str in extract_argument_specs(trimmed) {
             process_spec_string(&spec_str, &mut spec);
         }
+        // Extract boolean flags: flags with [description] but no colon-delimited action.
+        for flag in extract_boolean_flags_from_line(trimmed) {
+            if !spec.boolean_flags.contains(&flag) {
+                spec.boolean_flags.push(flag);
+            }
+        }
         // Extract flag alias groups from brace-expanded specs on this line.
         for alias_group in extract_brace_alias_groups(trimmed) {
             if !spec.flag_aliases.iter().any(|g| g.iter().any(|f| alias_group.contains(f))) {
@@ -3745,18 +3751,16 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
         }
 
         // Also catch bare _files/_directories calls used as direct actions
-        // in non-_arguments style completions (e.g., `_diff_options ... ':file:_files'`)
+        // in non-_arguments style completions (e.g., `_diff_options ... ':file:_files'`).
+        // Use extract_argument_specs to correctly parse quoted spec strings — splitting
+        // on whitespace breaks multi-word specs like '(-D ... --version)*:dir:_files -/'.
         if !trimmed.contains("_arguments")
             && (trimmed.contains(":_files")
                 || trimmed.contains(":_directories")
                 || trimmed.contains(":_command"))
         {
-            // Try to parse colon-separated specs in the line
-            for part in trimmed.split_whitespace() {
-                let part = part.trim_matches('\'').trim_matches('"');
-                if part.contains(':') {
-                    process_spec_string(part, &mut spec);
-                }
+            for spec_str in extract_argument_specs(trimmed) {
+                process_spec_string(&spec_str, &mut spec);
             }
         }
 
@@ -3895,6 +3899,185 @@ fn parse_arg_spec(content: &str) -> ArgSpec {
 /// handles direct calls, `_alternative` specs, and `_regex_arguments` actions.
 fn detect_dominant_action(content: &str) -> Option<u8> {
     detect_type_in_block(content)
+}
+
+/// Return true if a spec string is a boolean flag (takes no argument).
+///
+/// A boolean spec starts with `-` (after stripping a leading `*` and/or exclusion
+/// group `(...)`) and has no colon-delimited action outside of `[...]` brackets.
+/// Examples:
+/// - `--flag[description]` → true
+/// - `(excl1 excl2)--flag[description]` → true
+/// - `*-print` → true (repeatable boolean)
+/// - `--flag[desc]:label:_files` → false (typed flag)
+/// - `:desc:_files` → false (positional)
+fn is_boolean_spec(s: &str) -> bool {
+    let s = s.trim();
+    // Strip leading * (repeatable marker)
+    let s = if let Some(r) = s.strip_prefix('*') { r.trim_start() } else { s };
+    // Strip leading exclusion group (...)
+    let s = if s.starts_with('(') {
+        match s.find(')') {
+            Some(end) => s[end + 1..].trim(),
+            None => return false,
+        }
+    } else {
+        s
+    };
+    // Must start with - to be a flag
+    if !s.starts_with('-') { return false; }
+    // No colon at bracket_depth == 0 means no typed action → boolean
+    let mut bracket_depth: u32 = 0;
+    for ch in s.chars() {
+        match ch {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Extract boolean flag names from `{-f,--flag}[description]` patterns where
+/// the brace group is directly followed by `[...]` or `'[...]'` with no action.
+fn extract_brace_boolean_flags(line: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+
+        let brace_start = i;
+        let mut depth = 0u32;
+        let mut j = i;
+        while j < len {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= len { i += 1; continue; }
+        let brace_end = j;
+        let brace_content = &line[brace_start + 1..brace_end];
+
+        if !brace_content.contains('-') { i = brace_end + 1; continue; }
+
+        // Skip whitespace after '}'
+        let mut k = brace_end + 1;
+        while k < len && bytes[k] == b' ' { k += 1; }
+        if k >= len { i = brace_end + 1; continue; }
+
+        // Determine if this is a boolean flag (description with no typed action).
+        // Two forms after '}':
+        //   A) '[description]'   — unquoted description (boolean if no ':' follows ']')
+        //   B) '\'[description]\''  — single-quoted description (boolean if content has no ':')
+        let is_boolean = if bytes[k] == b'[' {
+            // Form A: directly followed by '[description]'
+            // Find matching ']' and check what comes after
+            let mut m = k + 1;
+            let mut bdepth: u32 = 0;
+            while m < len {
+                match bytes[m] {
+                    b'[' => bdepth += 1,
+                    b']' if bdepth == 0 => break,
+                    b']' => bdepth -= 1,
+                    _ => {}
+                }
+                m += 1;
+            }
+            let after = m + 1; // position after ']'
+            let mut n = after;
+            while n < len && bytes[n] == b' ' { n += 1; }
+            // Boolean if nothing follows, or next char is not ':'
+            n >= len || bytes[n] != b':'
+        } else if bytes[k] == b'\'' {
+            // Form B: single-quoted '[description]' — boolean if quoted content has no ':'
+            let mut m = k + 1;
+            let mut s = String::new();
+            while m < len && bytes[m] != b'\'' {
+                s.push(bytes[m] as char);
+                m += 1;
+            }
+            s.starts_with('[') && !s.contains(':')
+        } else {
+            false
+        };
+
+        if is_boolean {
+            for flag_raw in brace_content.split(',') {
+                let f = flag_raw.trim().trim_end_matches('+').trim_end_matches('=');
+                if f.starts_with('-') && f.len() > 1 {
+                    let f = unescape_zsh_spec(f);
+                    if !result.contains(&f) {
+                        result.push(f);
+                    }
+                }
+            }
+        }
+
+        i = brace_end + 1;
+    }
+
+    result
+}
+
+/// Extract boolean flag names from single-quoted specs on a line.
+///
+/// Finds specs of the form `'--flag[description]'` or `'(excl)*-flag'` —
+/// any spec that is a flag but has no colon-delimited action — and returns
+/// the flag names. Also handles brace-expanded boolean flags: `{-f,--flag}[desc]`.
+fn extract_boolean_flags_from_line(line: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        if ch == '\'' {
+            chars.next();
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '\'' { chars.next(); break; }
+                s.push(c);
+                chars.next();
+            }
+            if is_boolean_spec(&s) {
+                // Strip leading * before passing to extract_flags_from_spec
+                let after_star = s.strip_prefix('*').map(|r| r.trim_start()).unwrap_or(s.trim());
+                for flag in extract_flags_from_spec(after_star) {
+                    if !result.contains(&flag) {
+                        result.push(flag);
+                    }
+                }
+            }
+        } else if ch == '"' {
+            // Skip double-quoted strings (handled by extract_argument_specs for typed specs)
+            chars.next();
+            let mut escaped = false;
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if escaped { escaped = false; continue; }
+                if c == '\\' { escaped = true; continue; }
+                if c == '"' { break; }
+            }
+        } else {
+            chars.next();
+        }
+    }
+
+    // Brace-expanded boolean: {-f,--flag}[description] or {-f,--flag}'[description]'
+    result.extend(extract_brace_boolean_flags(line));
+
+    result
 }
 
 /// Extract argument spec strings from a line.
@@ -4546,6 +4729,24 @@ fn find_action_in_spec(spec: &str) -> Option<String> {
     }
 }
 
+/// Strip zsh glob-protection backslashes from a flag name.
+/// In `_arguments` specs, `\+` means a literal `+`, `\#` means `#`, etc.
+/// The backslash has no meaning in a flag name itself, only to zsh's glob engine.
+fn unescape_zsh_spec(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                result.push(next);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Extract flag names from a spec string.
 fn extract_flags_from_spec(spec: &str) -> Vec<String> {
     let mut flags = Vec::new();
@@ -4562,8 +4763,9 @@ fn extract_flags_from_spec(spec: &str) -> Vec<String> {
         s
     };
 
-    // The flag is at the start, up to the first [ or :
-    let flag_part: String = s.chars().take_while(|c| *c != '[' && *c != ':').collect();
+    // The flag is at the start, up to the first [, :, or ) — ) is never valid
+    // in a flag name and can appear when a multi-word spec is mis-split.
+    let flag_part: String = s.chars().take_while(|c| *c != '[' && *c != ':' && *c != ')').collect();
     let flag_part = flag_part.trim();
 
     // Handle comma-separated alternatives inside braces: {-f,--flag}
@@ -4576,7 +4778,7 @@ fn extract_flags_from_spec(spec: &str) -> Vec<String> {
         for part in inner.split(',') {
             let f = part.trim().trim_end_matches('+').trim_end_matches('=');
             if f.starts_with('-') {
-                flags.push(f.to_string());
+                flags.push(unescape_zsh_spec(f));
             }
         }
         return flags;
@@ -4585,7 +4787,7 @@ fn extract_flags_from_spec(spec: &str) -> Vec<String> {
     // Single flag: strip trailing + or =
     let flag = flag_part.trim_end_matches('+').trim_end_matches('=');
     if flag.starts_with('-') && !flag.is_empty() {
-        flags.push(flag.to_string());
+        flags.push(unescape_zsh_spec(flag));
     }
 
     flags
