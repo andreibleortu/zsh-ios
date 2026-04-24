@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# Watch all fuzz artifact directories for new crash/timeout/leak files.
-# Run this in a terminal while fuzzing: ./fuzz/watch-crashes.sh
+# Start all fuzz targets and watch for crashes/timeouts/leaks.
+# Usage: ./fuzz/watch-crashes.sh
 #
+# Ctrl-C stops all fuzzers and exits cleanly.
 # Prints an alert with reproduce + minimize commands when a new artifact
 # appears.  Also prints a live exec/s summary from each fuzzer every minute.
 
 set -euo pipefail
 
-ARTIFACTS_DIR="$(cd "$(dirname "$0")" && pwd)/artifacts"
+FUZZ_DIR="$(cd "$(dirname "$0")" && pwd)"
+ARTIFACTS_DIR="$FUZZ_DIR/artifacts"
 
-# All 8 fuzzer logs — hyphens for the original four, underscores for the new four.
+# target-name → log-file (hyphens for original four, underscores for new four)
+declare -A TARGETS=(
+  [fuzz_ingest]=/tmp/fuzz-ingest.log
+  [fuzz_history]=/tmp/fuzz-history.log
+  [fuzz_completions_parser]=/tmp/fuzz-completions.log
+  [fuzz_path_resolve]=/tmp/fuzz-path.log
+  [fuzz_resolve]=/tmp/fuzz_resolve.log
+  [fuzz_bash_completions]=/tmp/fuzz_bash_completions.log
+  [fuzz_regex_args]=/tmp/fuzz_regex_args.log
+  [fuzz_trie_serde]=/tmp/fuzz_trie_serde.log
+)
+
 LOGS=(
   /tmp/fuzz-ingest.log
   /tmp/fuzz-history.log
@@ -21,9 +34,43 @@ LOGS=(
   /tmp/fuzz_trie_serde.log
 )
 
-echo "Watching $ARTIFACTS_DIR for crashes..."
+# PIDs of background fuzz processes, collected during startup.
+FUZZ_PIDS=()
+
+cleanup() {
+    echo
+    echo "Stopping fuzzers..."
+    for pid in "${FUZZ_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # Wait briefly so nohup children also get the signal.
+    wait 2>/dev/null || true
+    echo "Done."
+    exit 0
+}
+trap cleanup INT TERM
+
+# ── Build first ──────────────────────────────────────────────────────────────
+echo "Building fuzz targets..."
+(cd "$FUZZ_DIR" && cargo +nightly fuzz build 2>&1) || {
+    echo "Build failed — aborting." >&2
+    exit 1
+}
+
+# ── Launch fuzzers ────────────────────────────────────────────────────────────
+echo "Starting fuzzers..."
+for target in "${!TARGETS[@]}"; do
+    log="${TARGETS[$target]}"
+    # Truncate old log so print_status doesn't show stale numbers.
+    : > "$log"
+    cargo +nightly fuzz run "$target" -- -max_len=4096 -timeout=5 \
+        > "$log" 2>&1 &
+    FUZZ_PIDS+=($!)
+    echo "  started $target (pid $!, log $log)"
+done
 echo
 
+# ── Monitor loop ─────────────────────────────────────────────────────────────
 declare -A seen
 
 print_status() {
@@ -39,6 +86,7 @@ print_status() {
     done
 }
 
+echo "Watching $ARTIFACTS_DIR for crashes... (Ctrl-C to stop)"
 print_status
 tick=0
 
@@ -47,7 +95,6 @@ while true; do
     tick=$((tick + 1))
 
     # Check for new crash/timeout/leak artifacts.
-    # Use find to avoid glob-expansion errors when directories don't exist yet.
     while IFS= read -r f; do
         [[ -f "$f" ]] || continue
         key=$(basename "$f")
