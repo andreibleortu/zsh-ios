@@ -418,9 +418,11 @@ fn extract_quoted_value(s: &str) -> Option<(&str, &str)> {
         while i < bytes.len() && bytes[i] != quote {
             i += 1;
         }
-        // i points at the closing quote (or end-of-string).
+        // i points at the closing quote, or bytes.len() if the quote is
+        // unclosed (malformed input).  Guard against indexing past the end.
         let content = &s[1..i];
-        let rest = &s[i.saturating_add(1)..];
+        let after_quote = if i < bytes.len() { i + 1 } else { i };
+        let rest = &s[after_quote..];
         Some((content, rest))
     } else {
         // Bare token — advance until whitespace.
