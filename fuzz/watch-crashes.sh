@@ -78,9 +78,9 @@ print_status() {
     for log in "${LOGS[@]}"; do
         [[ -f "$log" ]] || continue
         name=$(basename "$log" .log | sed 's/^fuzz[-_]//')
-        execs=$(grep -oP '#\K[0-9]+' "$log" 2>/dev/null | tail -1)
-        speed=$(grep -oP 'exec/s: \K[0-9]+' "$log" 2>/dev/null | tail -1)
-        cov=$(grep -oP 'cov: \K[0-9]+' "$log" 2>/dev/null | tail -1)
+        execs=$(grep -oP '#\K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
+        speed=$(grep -oP 'exec/s: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
+        cov=$(grep -oP 'cov: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         printf "  %-28s execs=%-12s exec/s=%-8s cov=%s\n" \
             "$name" "${execs:--}" "${speed:--}" "${cov:--}"
     done
