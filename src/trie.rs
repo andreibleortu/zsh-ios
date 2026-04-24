@@ -65,7 +65,7 @@ impl TrieNode {
             return;
         }
         let child = self.children.entry(words[0].to_string()).or_default();
-        child.count += 1;
+        child.count = child.count.saturating_add(1);
         if unix_ts > child.last_used {
             child.last_used = unix_ts;
         }
@@ -87,7 +87,7 @@ impl TrieNode {
         }
         match self.children.get_mut(words[0]) {
             Some(child) => {
-                child.failures += 1;
+                child.failures = child.failures.saturating_add(1);
                 if unix_ts > child.last_used {
                     child.last_used = unix_ts;
                 }
@@ -240,7 +240,7 @@ impl TrieNode {
     pub fn record_cwd(&mut self, cwd: &str) {
         const MAX_CWDS: usize = 8;
         if let Some(entry) = self.cwd_hits.iter_mut().find(|(k, _)| k == cwd) {
-            entry.1 += 1;
+            entry.1 = entry.1.saturating_add(1);
             return;
         }
         if self.cwd_hits.len() >= MAX_CWDS {

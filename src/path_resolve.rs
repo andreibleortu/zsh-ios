@@ -544,7 +544,7 @@ fn join_path_parts(parts: &[String]) -> String {
     let first = &parts[0];
     let rest = &parts[1..];
     if first.is_empty() && rest.is_empty() {
-        return String::new();
+        return "/".to_string(); // [""] encodes the root directory
     }
     if first == "~" {
         if rest.is_empty() {
@@ -754,8 +754,9 @@ mod tests {
 
     #[test]
     fn test_join_path_parts_root_only() {
+        // [""] encodes the root directory; join must produce "/" not "".
         let parts: Vec<String> = vec!["".into()];
-        assert_eq!(join_path_parts(&parts), "");
+        assert_eq!(join_path_parts(&parts), "/");
     }
 
     // --- Tests for resolve_path_dirs_only ---
