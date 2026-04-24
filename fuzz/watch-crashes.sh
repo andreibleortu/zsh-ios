@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start all fuzz targets and watch for crashes/timeouts/leaks.
+# Build all fuzz targets, start them, and watch for crashes/timeouts/leaks.
 # Usage: ./fuzz/watch-crashes.sh
 #
 # Ctrl-C stops all fuzzers and exits cleanly.
@@ -10,19 +10,20 @@ set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "$0")" && pwd)"
 ARTIFACTS_DIR="$FUZZ_DIR/artifacts"
+CORPUS_DIR="$FUZZ_DIR/corpus"
 
-# target-name → log-file (hyphens for original four, underscores for new four)
-declare -A TARGETS=(
-  [fuzz_ingest]=/tmp/fuzz-ingest.log
-  [fuzz_history]=/tmp/fuzz-history.log
-  [fuzz_completions_parser]=/tmp/fuzz-completions.log
-  [fuzz_path_resolve]=/tmp/fuzz-path.log
-  [fuzz_resolve]=/tmp/fuzz_resolve.log
-  [fuzz_bash_completions]=/tmp/fuzz_bash_completions.log
-  [fuzz_regex_args]=/tmp/fuzz_regex_args.log
-  [fuzz_trie_serde]=/tmp/fuzz_trie_serde.log
+# Ordered list of (target, log) pairs — kept as parallel arrays so the status
+# table always prints in a consistent order.
+TARGETS=(
+  fuzz_ingest
+  fuzz_history
+  fuzz_completions_parser
+  fuzz_path_resolve
+  fuzz_resolve
+  fuzz_bash_completions
+  fuzz_regex_args
+  fuzz_trie_serde
 )
-
 LOGS=(
   /tmp/fuzz-ingest.log
   /tmp/fuzz-history.log
@@ -34,7 +35,6 @@ LOGS=(
   /tmp/fuzz_trie_serde.log
 )
 
-# PIDs of background fuzz processes, collected during startup.
 FUZZ_PIDS=()
 
 cleanup() {
@@ -43,27 +43,42 @@ cleanup() {
     for pid in "${FUZZ_PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
-    # Wait briefly so nohup children also get the signal.
     wait 2>/dev/null || true
     echo "Done."
     exit 0
 }
 trap cleanup INT TERM
 
-# ── Build first ──────────────────────────────────────────────────────────────
+# ── Build ─────────────────────────────────────────────────────────────────────
 echo "Building fuzz targets..."
 (cd "$FUZZ_DIR" && cargo +nightly fuzz build 2>&1) || {
     echo "Build failed — aborting." >&2
     exit 1
 }
 
-# ── Launch fuzzers ────────────────────────────────────────────────────────────
-echo "Starting fuzzers..."
-for target in "${!TARGETS[@]}"; do
-    log="${TARGETS[$target]}"
-    # Truncate old log so print_status doesn't show stale numbers.
+# Locate the binary directory produced by cargo fuzz build.
+BIN_DIR=$(dirname "$(find "$FUZZ_DIR/target" -name 'fuzz_ingest' -type f 2>/dev/null | head -1)")
+if [[ -z "$BIN_DIR" || "$BIN_DIR" == "." ]]; then
+    echo "Cannot find fuzz binaries under $FUZZ_DIR/target" >&2
+    exit 1
+fi
+
+# ── Launch fuzzers directly (no cargo lock contention) ────────────────────────
+# Match cargo fuzz run defaults: disable leak-sanitizer so only real crashes
+# produce artifacts (leaks can be investigated separately).
+export LSAN_OPTIONS="${LSAN_OPTIONS:-detect_leaks=0}"
+export RUST_BACKTRACE=1
+
+echo "Starting fuzzers from $BIN_DIR ..."
+for i in "${!TARGETS[@]}"; do
+    target="${TARGETS[$i]}"
+    log="${LOGS[$i]}"
+    mkdir -p "$ARTIFACTS_DIR/$target" "$CORPUS_DIR/$target"
     : > "$log"
-    cargo +nightly fuzz run "$target" -- -max_len=4096 -timeout=5 \
+    "$BIN_DIR/$target" \
+        -artifact_prefix="$ARTIFACTS_DIR/$target/" \
+        -max_len=4096 -timeout=5 \
+        "$CORPUS_DIR/$target" \
         > "$log" 2>&1 &
     FUZZ_PIDS+=($!)
     echo "  started $target (pid $!, log $log)"
@@ -75,14 +90,15 @@ declare -A seen
 
 print_status() {
     echo "──── $(date '+%H:%M:%S') ────────────────────────────────────────────"
-    for log in "${LOGS[@]}"; do
+    for i in "${!TARGETS[@]}"; do
+        target="${TARGETS[$i]}"
+        log="${LOGS[$i]}"
         [[ -f "$log" ]] || continue
-        name=$(basename "$log" .log | sed 's/^fuzz[-_]//')
         execs=$(grep -oP '#\K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         speed=$(grep -oP 'exec/s: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         cov=$(grep -oP 'cov: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         printf "  %-28s execs=%-12s exec/s=%-8s cov=%s\n" \
-            "$name" "${execs:--}" "${speed:--}" "${cov:--}"
+            "$target" "${execs:--}" "${speed:--}" "${cov:--}"
     done
 }
 
