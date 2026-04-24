@@ -244,7 +244,16 @@ fn resolve_components(
                     return ComponentsResult::Unchanged(resolved_parts);
                 }
 
-                // Multiple candidates survive -- fork resolution for each
+                // Multiple candidates survive -- fork resolution for each.
+                // Hard-cap to avoid O(n^k) blowup when wildcards match many
+                // entries at each level (e.g. `*1` in /proc/ matches 200+ dirs).
+                const MAX_FORKS: usize = 16;
+                let winners = if winners.len() > MAX_FORKS {
+                    winners.into_iter().take(MAX_FORKS).collect::<Vec<_>>()
+                } else {
+                    winners
+                };
+
                 let mut all_paths: Vec<Vec<String>> = Vec::new();
                 for winner in &winners {
                     let child_dir = current_dir.join(winner);
