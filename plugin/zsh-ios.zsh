@@ -1823,8 +1823,7 @@ add-zle-hook-widget line-init _zsh_ios_ghost_line_init 2>/dev/null
 # --- ZLE Widget: Esc key (dismiss ghost text + enter passthrough mode) ---
 # Pressing Esc when ghost text is visible clears it and sets passthrough mode
 # so the next Enter runs BUFFER exactly as typed.  When there is no ghost text
-# to dismiss, Esc passes through to the default behavior for the current keymap
-# (send-break in emacs, vi-cmd-mode in viins).
+# to dismiss, Esc is a no-op.
 _zsh_ios_escape_widget() {
     if [[ -n "$POSTDISPLAY" ]]; then
         # Ghost text is showing — dismiss it and enter passthrough mode.
@@ -1836,18 +1835,8 @@ _zsh_ios_escape_widget() {
         _zsh_ios_ghost_last_postdisplay=""
         _zsh_ios_esc_passthrough=1
         _zsh_ios_last_esc_buffer="$BUFFER"
-    else
-        # No ghost text — fall through to the keymap's native Esc behavior.
-        # In emacs mode that's typically send-break; in viins it's vi-cmd-mode.
-        case "$KEYMAP" in
-            viins|vi)
-                zle vi-cmd-mode 2>/dev/null || true
-                ;;
-            *)
-                zle send-break 2>/dev/null || true
-                ;;
-        esac
     fi
+    # No ghost text: do nothing. Esc has no effect without a suggestion to dismiss.
 }
 
 # --- Register widgets ---

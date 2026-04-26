@@ -71,7 +71,7 @@ print "PT=${_zsh_ios_esc_passthrough}"
     [[ "$output" == *"PT=0"* ]]
 }
 
-@test "Esc without ghost text: calls send-break (emacs behavior)" {
+@test "Esc without ghost text: is a no-op (no ZLE calls)" {
     run zsh_run '
 typeset -g POSTDISPLAY=""
 typeset -ga region_highlight=()
@@ -82,7 +82,8 @@ _zsh_ios_escape_widget
 print "ZLE=${_zle_calls[*]}"
 '
     [[ "$status" -eq 0 ]]
-    [[ "$output" == *"send-break"* ]]
+    [[ "$output" != *"send-break"* ]]
+    [[ "$output" != *"vi-cmd-mode"* ]]
 }
 
 # ─── Accept-line passthrough mode ───────────────────────────────────────────
