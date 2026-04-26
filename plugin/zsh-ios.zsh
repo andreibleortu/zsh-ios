@@ -351,11 +351,27 @@ _zsh_ios_accept_line() {
         return
     fi
 
-    # Leading `!` bypass: anything starting with ! is run as-is. Lets zsh's
-    # history expansion (!!, !$, !string) and explicit "run the literal
-    # command" usage pass through without zsh-ios touching the buffer.
+    # Leading `!` bypass: strip the `!` prefix and run the remainder literally,
+    # without zsh-ios resolution and without Zsh's history expansion.
+    # This fixes the bug where `!host 10.57.37.2` was history-expanded to
+    # `host <last-host-arg> 10.57.37.2` by native accept-line.
+    #
+    # Special cases that keep their `!` and fall through to native accept-line
+    # so Zsh's history-expansion semantics are preserved:
+    #   !!        — repeat last command
+    #   !<digit>  — repeat Nth history entry
+    #   !$, !*    — last argument / all arguments of previous command
     if [[ "$BUFFER" == \!* ]]; then
-        zle accept-line
+        local _bang_rest="${BUFFER[2,-1]}"
+        # Empty buffer (`!` alone), `!!`, `!N` (digit), `!$`, `!*` →
+        # fall through to native Zsh accept-line so history expansion fires.
+        if [[ -z "$_bang_rest" || "$_bang_rest" == \!* || "$_bang_rest" == [0-9]* || "$_bang_rest" == '$'* || "$_bang_rest" == \** ]]; then
+            zle accept-line
+            return
+        fi
+        # All other `!cmd args` → strip the `!` and run literally.
+        BUFFER="$_bang_rest"
+        zle .accept-line
         return
     fi
 

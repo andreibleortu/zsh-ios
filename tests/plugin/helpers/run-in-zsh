@@ -40,6 +40,14 @@ add-zsh-hook() { :; }
 add-zle-hook-widget() { :; }
 autoload() { :; }
 
+# Pre-create the fake tree file that the stub's `status` output references
+# (/tmp/zsio-test/tree.msgpack) so that _zsh_ios_build_if_stale sees it as
+# fresh and never spawns a background `build` subprocess.  Without this,
+# the background build writes to ZSH_IOS_STUB_LOG after the log-clear step,
+# causing flaky failures in tests that check the log is empty.
+mkdir -p /tmp/zsio-test
+touch /tmp/zsio-test/tree.msgpack
+
 # Now source the real plugin.
 source "${REPO_ROOT}/plugin/zsh-ios.zsh" || {
     print -r -- "FATAL: plugin source failed" >&2

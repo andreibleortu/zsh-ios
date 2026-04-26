@@ -10,6 +10,14 @@ load 'helpers/test_helper'
 # Rule: any BUFFER starting with `!` must pass through untouched — no binary
 # call, no resolution, no completion. History expansion and literal-run are
 # zsh's business, not ours.
+#
+# Literal-run semantics (new): `!cmd args` strips the leading `!` and executes
+# `cmd args` exactly as typed, bypassing both zsh-ios resolution AND Zsh's
+# own history expansion. This fixes the bug where `!host 10.57.37.2` was
+# history-expanded by native accept-line to `host <prev-arg> 10.57.37.2`.
+#
+# History-expansion forms (`!!`, `!N`, `!$`, `!*`, bare `!`) still fall
+# through to native `zle accept-line` so Zsh can expand them normally.
 
 @test "bang bypass: Enter widget delegates to zle accept-line verbatim" {
     export ZSH_IOS_STUB_LOG="$BATS_TMPDIR/stub_log_bang_enter_$$"
@@ -25,6 +33,64 @@ print -r -- "ZLE=${_zle_calls[*]}"
     # No resolve call to the stub — the log file should not exist or be empty.
     [[ ! -s "$ZSH_IOS_STUB_LOG" ]]
     rm -f "$ZSH_IOS_STUB_LOG"
+}
+
+@test "bang literal-run: !cmd args strips ! and calls zle .accept-line" {
+    # `!host 10.0.0.1` must run as `host 10.0.0.1`, not as a history expansion.
+    # BUFFER check: leading ! stripped so Zsh histexpand never sees it.
+    # ZLE check:    .accept-line (builtin) called, not accept-line (may re-expand).
+    run zsh_run '
+BUFFER="!host 10.0.0.1"
+_zsh_ios_accept_line
+print -r -- "BUFFER=$BUFFER"
+print -r -- "ZLE=${_zle_calls[*]}"
+'
+    [[ "$status" -eq 0 ]]
+    # The leading ! must be stripped so the real command runs.
+    [[ "$output" == *"BUFFER=host 10.0.0.1"* ]]
+    # Must use the built-in .accept-line, NOT the (hook-wrapped) accept-line,
+    # to prevent any further history expansion.
+    [[ "$output" == *".accept-line"* ]]
+}
+
+@test "bang literal-run: !ls -la strips ! and calls zle .accept-line" {
+    run zsh_run '
+BUFFER="!ls -la"
+_zsh_ios_accept_line
+print -r -- "BUFFER=$BUFFER"
+print -r -- "ZLE=${_zle_calls[*]}"
+'
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=ls -la"* ]]
+    [[ "$output" == *".accept-line"* ]]
+}
+
+@test "bang literal-run: bare ! alone falls through to native accept-line" {
+    # A buffer of just `!` has no command — preserve old native behavior.
+    run zsh_run '
+BUFFER="!"
+_zsh_ios_accept_line
+print -r -- "BUFFER=$BUFFER"
+print -r -- "ZLE=${_zle_calls[*]}"
+'
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=!"* ]]
+    [[ "$output" == *"ZLE=accept-line"* ]]
+    # Must NOT use .accept-line for bare `!`.
+    ! [[ "$output" == *".accept-line"* ]]
+}
+
+@test "bang literal-run: !! falls through to native accept-line (history repeat)" {
+    run zsh_run '
+BUFFER="!!"
+_zsh_ios_accept_line
+print -r -- "BUFFER=$BUFFER"
+print -r -- "ZLE=${_zle_calls[*]}"
+'
+    [[ "$status" -eq 0 ]]
+    [[ "$output" == *"BUFFER=!!"* ]]
+    [[ "$output" == *"ZLE=accept-line"* ]]
+    ! [[ "$output" == *".accept-line"* ]]
 }
 
 @test "bang bypass: Tab widget delegates to zle expand-or-complete" {
