@@ -12,6 +12,23 @@ thread_local! {
     static FS_OPS_REMAINING: Cell<usize> = const { Cell::new(MAX_FS_OPS) };
 }
 
+/// Reset the per-call FS-ops budget to `MAX_FS_OPS`.
+///
+/// Called once at the start of each `resolve_line` / `complete` invocation so
+/// the budget is **shared across all `resolve_path` calls within a single
+/// top-level operation** rather than being reset per path word.  This prevents
+/// a command with many path-like arguments from each getting a fresh 48-op
+/// allowance — otherwise a single `resolve_line` call could perform
+/// O(words × MAX_FS_OPS) filesystem reads.
+///
+/// Standalone callers (tests, fuzz_path_resolve) that call `resolve_path` or
+/// `resolve_path_dirs_only` directly without going through `resolve_line` /
+/// `complete` still work correctly because the thread-local is initialised to
+/// `MAX_FS_OPS` at program start.
+pub fn reset_budget() {
+    FS_OPS_REMAINING.with(|c| c.set(MAX_FS_OPS));
+}
+
 #[derive(Debug)]
 pub enum PathResult {
     Resolved(String),
@@ -92,7 +109,11 @@ pub fn resolve_path(
     named_dirs: &HashMap<String, String>,
     dir_stack: &[String],
 ) -> PathResult {
-    FS_OPS_REMAINING.with(|c| c.set(MAX_FS_OPS));
+    // NOTE: the budget is NOT reset here.  `resolve_line` / `complete` call
+    // `reset_budget()` once at entry so all path resolutions within a single
+    // top-level operation share the same budget.  Standalone callers (tests,
+    // fuzz_path_resolve) rely on the thread-local being initialised to
+    // MAX_FS_OPS at program start.
     resolve_path_inner(abbreviated, false, named_dirs, dir_stack)
 }
 
@@ -102,7 +123,7 @@ pub fn resolve_path_dirs_only(
     named_dirs: &HashMap<String, String>,
     dir_stack: &[String],
 ) -> PathResult {
-    FS_OPS_REMAINING.with(|c| c.set(MAX_FS_OPS));
+    // See note on `resolve_path` — budget is managed by the top-level caller.
     resolve_path_inner(abbreviated, true, named_dirs, dir_stack)
 }
 
@@ -1271,5 +1292,41 @@ mod tests {
             }
             other => panic!("expected Resolved, got {:?}", other),
         }
+    }
+
+    // --- Tests for reset_budget / shared budget ---
+
+    /// After `reset_budget()`, a fresh MAX_FS_OPS budget is available.
+    /// Verify by exhausting the budget, then resetting and confirming that
+    /// `list_dir` can return entries again.
+    #[test]
+    fn reset_budget_restores_full_allowance() {
+        let td = tempfile::tempdir().unwrap();
+        // Create enough entries to be visible.
+        std::fs::write(td.path().join("alpha"), "").unwrap();
+        std::fs::write(td.path().join("beta"), "").unwrap();
+
+        // Exhaust the budget completely.
+        FS_OPS_REMAINING.with(|c| c.set(0));
+        let entries = list_dir(td.path(), false);
+        assert!(entries.is_empty(), "expected empty list when budget = 0, got {:?}", entries);
+
+        // After reset, list_dir should see entries again.
+        reset_budget();
+        let entries = list_dir(td.path(), false);
+        assert!(!entries.is_empty(), "expected entries after reset_budget");
+    }
+
+    /// Calling `reset_budget()` followed by many `resolve_path` calls (each on
+    /// a non-existent path) must not panic — the budget drains to zero but the
+    /// functions return `Unchanged` gracefully.
+    #[test]
+    fn many_resolve_path_calls_after_single_reset_do_not_panic() {
+        reset_budget();
+        for _ in 0..64 {
+            // Resolve paths that touch the real FS (CWD) but return quickly.
+            let _ = resolve_path("/nonexistent_zshios_test_path", &HashMap::new(), &[]);
+        }
+        // Must reach here without panic.
     }
 }

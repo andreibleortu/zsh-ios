@@ -165,6 +165,11 @@ pub fn resolve_line(
     cwd: Option<&str>,
     context_hint: ContextHint,
 ) -> ResolveResult {
+    // Reset the shared FS-ops budget for this invocation so all resolve_path
+    // calls within a single resolve_line share one pool of MAX_FS_OPS reads
+    // rather than each word getting a fresh allowance.
+    crate::path_resolve::reset_budget();
+
     // Leading `!`: the user wants zsh's history-expansion / literal-run
     // semantics. Never touch the buffer — return it verbatim so the shell
     // runs exactly what was typed.

@@ -183,6 +183,10 @@ pub fn is_generic_output(output: &str) -> bool {
 pub fn complete(input: &str, trie: &CommandTrie, pins: &Pins, context_hint: super::engine::ContextHint) -> String {
     use super::engine::ContextHint;
 
+    // Reset the shared FS-ops budget for this invocation so all resolve_path
+    // / complete_filesystem calls within a single complete() share one pool.
+    crate::path_resolve::reset_budget();
+
     // Leading `!` is a hands-off marker (see `starts_with_bang`). Produce no
     // completions so the shell's native completion (or history expansion)
     // gets a clean look.
