@@ -33,6 +33,14 @@ typeset -g _zsh_ios_ghost_last_highlight=""
 # BUFFER in the scrollback after the command runs.
 typeset -g _zsh_ios_ghost_suspended=0
 
+# Esc-to-dismiss passthrough state.
+# When the user presses Esc while ghost text is visible, we clear POSTDISPLAY
+# and enter passthrough mode: the next Enter runs BUFFER as-is without any
+# zsh-ios processing. Any buffer edit cancels passthrough mode.
+typeset -g _zsh_ios_esc_passthrough=0
+# BUFFER value at the moment Esc was pressed — used to detect edits.
+typeset -g _zsh_ios_last_esc_buffer=""
+
 # Picker keystroke source. Defaults to /dev/tty because ZLE widgets don't
 # have stdin attached to the terminal. Tests set $_ZSH_IOS_TEST_INPUT_FD to
 # an already-open file descriptor containing the simulated keystrokes.
@@ -292,6 +300,19 @@ _zsh_ios_quote_args() {
 
 # --- ZLE Widget: Enter key (resolve + execute) ---
 _zsh_ios_accept_line() {
+    # Esc-passthrough: user pressed Esc to dismiss ghost text and committed to
+    # running exactly what is in BUFFER — skip all zsh-ios processing.
+    if (( _zsh_ios_esc_passthrough )); then
+        _zsh_ios_esc_passthrough=0
+        _zsh_ios_last_esc_buffer=""
+        POSTDISPLAY=""
+        region_highlight=("${(@)region_highlight:#* * $_zsh_ios_ghost_style}")
+        _zsh_ios_ghost_last_highlight=""
+        _zsh_ios_ghost_last_buffer=""
+        zle .accept-line
+        return
+    fi
+
     # Suspend the ghost widget for the duration of this accept-line;
     # any line-pre-redraw hook that fires during BUFFER mutation /
     # finalization must leave POSTDISPLAY + region_highlight alone.
@@ -1707,6 +1728,25 @@ _zsh_ios_ghost_preview_widget() {
     # POSTDISPLAY or region_highlight — the widget will finalize them.
     (( _zsh_ios_ghost_suspended )) && return 0
 
+    # Esc-passthrough: if the user pressed Esc to dismiss ghost text, keep
+    # POSTDISPLAY clear. If the buffer has changed since Esc was pressed
+    # (the user is editing again), cancel passthrough mode and resume normally.
+    if (( _zsh_ios_esc_passthrough )); then
+        if [[ "$BUFFER" != "$_zsh_ios_last_esc_buffer" ]]; then
+            # User edited the buffer — cancel passthrough, resume ghost.
+            _zsh_ios_esc_passthrough=0
+            _zsh_ios_last_esc_buffer=""
+        else
+            # Buffer unchanged since Esc — keep POSTDISPLAY cleared and return.
+            if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
+                region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
+                _zsh_ios_ghost_last_highlight=""
+            fi
+            POSTDISPLAY=""
+            return 0
+        fi
+    fi
+
     # Skip during input bursts — paste, auto-type, or very fast typing.
     # $PENDING is zsh's count of bytes already read from the terminal but
     # not yet processed by ZLE. When it's nonzero we're behind on input,
@@ -1775,15 +1815,53 @@ _zsh_ios_ghost_line_init() {
     _zsh_ios_ghost_last_buffer=""
     _zsh_ios_ghost_last_postdisplay=""
     _zsh_ios_ghost_last_highlight=""
+    _zsh_ios_esc_passthrough=0
+    _zsh_ios_last_esc_buffer=""
 }
 add-zle-hook-widget line-init _zsh_ios_ghost_line_init 2>/dev/null
+
+# --- ZLE Widget: Esc key (dismiss ghost text + enter passthrough mode) ---
+# Pressing Esc when ghost text is visible clears it and sets passthrough mode
+# so the next Enter runs BUFFER exactly as typed.  When there is no ghost text
+# to dismiss, Esc passes through to the default behavior for the current keymap
+# (send-break in emacs, vi-cmd-mode in viins).
+_zsh_ios_escape_widget() {
+    if [[ -n "$POSTDISPLAY" ]]; then
+        # Ghost text is showing — dismiss it and enter passthrough mode.
+        POSTDISPLAY=""
+        if [[ -n "$_zsh_ios_ghost_last_highlight" ]]; then
+            region_highlight=("${(@)region_highlight:#$_zsh_ios_ghost_last_highlight}")
+            _zsh_ios_ghost_last_highlight=""
+        fi
+        _zsh_ios_ghost_last_postdisplay=""
+        _zsh_ios_esc_passthrough=1
+        _zsh_ios_last_esc_buffer="$BUFFER"
+    else
+        # No ghost text — fall through to the keymap's native Esc behavior.
+        # In emacs mode that's typically send-break; in viins it's vi-cmd-mode.
+        case "$KEYMAP" in
+            viins|vi)
+                zle vi-cmd-mode 2>/dev/null || true
+                ;;
+            *)
+                zle send-break 2>/dev/null || true
+                ;;
+        esac
+    fi
+}
 
 # --- Register widgets ---
 zle -N _zsh_ios_accept_line
 zle -N _zsh_ios_expand_or_complete
 zle -N _zsh_ios_help
+zle -N _zsh_ios_escape_widget
 
 # --- Bind keys ---
 bindkey '^M' _zsh_ios_accept_line          # Enter
 bindkey '^I' _zsh_ios_expand_or_complete   # Tab
 bindkey '?' _zsh_ios_help                  # ?
+# Esc: bind only in emacs and viins keymaps so vi command mode (`vicmd`) is
+# unaffected.  Multi-char escape sequences (arrow keys: ^[[A etc.) start with
+# ^[[ which is a longer prefix match and will NOT trigger this single-^[ binding.
+bindkey -M emacs '^[' _zsh_ios_escape_widget
+bindkey -M viins '^[' _zsh_ios_escape_widget
