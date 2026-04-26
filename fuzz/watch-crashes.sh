@@ -3,6 +3,7 @@
 # Usage: ./fuzz/watch-crashes.sh
 #
 # Ctrl-C stops all fuzzers and exits cleanly.
+# Fuzzers that exit after finding a crash are restarted automatically.
 # Prints an alert with reproduce + minimize commands when a new artifact
 # appears.  Also prints a live exec/s summary from each fuzzer every minute.
 
@@ -35,13 +36,18 @@ LOGS=(
   /tmp/fuzz_trie_serde.log
 )
 
-FUZZ_PIDS=()
+# PID indexed by target index (same order as TARGETS/LOGS arrays).
+declare -a FUZZ_PIDS
+for i in "${!TARGETS[@]}"; do FUZZ_PIDS[$i]=0; done
+
+STOPPING=0
 
 cleanup() {
+    STOPPING=1
     echo
     echo "Stopping fuzzers..."
     for pid in "${FUZZ_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        [[ "$pid" -gt 0 ]] && kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
     echo "Done."
@@ -69,19 +75,24 @@ fi
 export LSAN_OPTIONS="${LSAN_OPTIONS:-detect_leaks=0}"
 export RUST_BACKTRACE=1
 
-echo "Starting fuzzers from $BIN_DIR ..."
-for i in "${!TARGETS[@]}"; do
-    target="${TARGETS[$i]}"
-    log="${LOGS[$i]}"
+start_fuzzer() {
+    local i="$1"
+    local target="${TARGETS[$i]}"
+    local log="${LOGS[$i]}"
     mkdir -p "$ARTIFACTS_DIR/$target" "$CORPUS_DIR/$target"
-    : > "$log"
     "$BIN_DIR/$target" \
         -artifact_prefix="$ARTIFACTS_DIR/$target/" \
         -max_len=4096 -timeout=5 \
         "$CORPUS_DIR/$target" \
-        > "$log" 2>&1 &
-    FUZZ_PIDS+=($!)
-    echo "  started $target (pid $!, log $log)"
+        >> "$log" 2>&1 &
+    FUZZ_PIDS[$i]=$!
+}
+
+echo "Starting fuzzers from $BIN_DIR ..."
+for i in "${!TARGETS[@]}"; do
+    : > "${LOGS[$i]}"          # truncate log on fresh start
+    start_fuzzer "$i"
+    echo "  started ${TARGETS[$i]} (pid ${FUZZ_PIDS[$i]}, log ${LOGS[$i]})"
 done
 echo
 
@@ -93,12 +104,17 @@ print_status() {
     for i in "${!TARGETS[@]}"; do
         target="${TARGETS[$i]}"
         log="${LOGS[$i]}"
+        pid="${FUZZ_PIDS[$i]}"
         [[ -f "$log" ]] || continue
         execs=$(grep -oP '#\K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         speed=$(grep -oP 'exec/s: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
         cov=$(grep -oP 'cov: \K[0-9]+' "$log" 2>/dev/null | tail -1 || true)
-        printf "  %-28s execs=%-12s exec/s=%-8s cov=%s\n" \
-            "$target" "${execs:--}" "${speed:--}" "${cov:--}"
+        status="running"
+        if [[ "$pid" -gt 0 ]] && ! kill -0 "$pid" 2>/dev/null; then
+            status="stopped"
+        fi
+        printf "  %-28s %-9s execs=%-12s exec/s=%-8s cov=%s\n" \
+            "$target" "$status" "${execs:--}" "${speed:--}" "${cov:--}"
     done
 }
 
@@ -108,7 +124,17 @@ tick=0
 
 while true; do
     sleep 5
+    [[ "$STOPPING" -eq 1 ]] && break
     tick=$((tick + 1))
+
+    # Restart any fuzzer that has exited (libFuzzer stops on first crash).
+    for i in "${!TARGETS[@]}"; do
+        pid="${FUZZ_PIDS[$i]}"
+        if [[ "$pid" -gt 0 ]] && ! kill -0 "$pid" 2>/dev/null; then
+            start_fuzzer "$i"
+            echo "  restarted ${TARGETS[$i]} (pid ${FUZZ_PIDS[$i]})"
+        fi
+    done
 
     # Check for new crash/timeout/leak artifacts.
     while IFS= read -r f; do

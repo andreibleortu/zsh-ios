@@ -1,6 +1,16 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// Maximum number of directory reads allowed per resolve_path / resolve_path_dirs_only
+// call.  Prevents O(n^k) blowup when wildcards match many entries at multiple
+// levels (e.g. `*` in /proc/ + /proc/<pid>/root symlinks looping back to /).
+const MAX_FS_OPS: usize = 48;
+
+thread_local! {
+    static FS_OPS_REMAINING: Cell<usize> = const { Cell::new(MAX_FS_OPS) };
+}
 
 #[derive(Debug)]
 pub enum PathResult {
@@ -82,6 +92,7 @@ pub fn resolve_path(
     named_dirs: &HashMap<String, String>,
     dir_stack: &[String],
 ) -> PathResult {
+    FS_OPS_REMAINING.with(|c| c.set(MAX_FS_OPS));
     resolve_path_inner(abbreviated, false, named_dirs, dir_stack)
 }
 
@@ -91,6 +102,7 @@ pub fn resolve_path_dirs_only(
     named_dirs: &HashMap<String, String>,
     dir_stack: &[String],
 ) -> PathResult {
+    FS_OPS_REMAINING.with(|c| c.set(MAX_FS_OPS));
     resolve_path_inner(abbreviated, true, named_dirs, dir_stack)
 }
 
@@ -227,6 +239,18 @@ fn resolve_components(
                     return ComponentsResult::Unchanged(resolved_parts);
                 }
 
+                // Cap candidates before deep_filter: deep_filter does one list_dir
+                // per candidate, so passing all 200+ /proc entries would do hundreds
+                // of syscalls per fork level (and /proc/<pid>/root symlinks loop back
+                // to / making this multiply across levels).  We only ever show at most
+                // MAX_FORKS results to the user anyway.
+                const MAX_FORKS: usize = 16;
+                let candidates = if candidates.len() > MAX_FORKS {
+                    candidates.into_iter().take(MAX_FORKS).collect::<Vec<_>>()
+                } else {
+                    candidates
+                };
+
                 // Find which candidates have children matching the next component
                 let winners = deep_filter(&current_dir, &candidates, remaining, dirs_only);
 
@@ -245,9 +269,6 @@ fn resolve_components(
                 }
 
                 // Multiple candidates survive -- fork resolution for each.
-                // Hard-cap to avoid O(n^k) blowup when wildcards match many
-                // entries at each level (e.g. `*1` in /proc/ matches 200+ dirs).
-                const MAX_FORKS: usize = 16;
                 let winners = if winners.len() > MAX_FORKS {
                     winners.into_iter().take(MAX_FORKS).collect::<Vec<_>>()
                 } else {
@@ -536,6 +557,11 @@ fn deep_filter(
 }
 
 fn list_dir(dir: &Path, dirs_only: bool) -> Vec<String> {
+    let remaining = FS_OPS_REMAINING.with(|c| c.get());
+    if remaining == 0 {
+        return vec![];
+    }
+    FS_OPS_REMAINING.with(|c| c.set(remaining - 1));
     match fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
