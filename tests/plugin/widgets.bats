@@ -182,6 +182,7 @@ print -r -- "STASH=$_zsh_ios_last_tab_buffer"
     run zsh_run '
 # ZSH_IOS_CONFIG_DIR was captured at source time; override it here.
 ZSH_IOS_CONFIG_DIR="'"$XDG_CONFIG_HOME"'/zsh-ios"
+_zsh_ios_disabled_file="$ZSH_IOS_CONFIG_DIR/disabled"
 BUFFER="gi st"
 _zsh_ios_accept_line
 print -r -- "ZLE=${_zle_calls[*]}"
@@ -190,4 +191,96 @@ print -r -- "ZLE=${_zle_calls[*]}"
     [[ "$output" == *"ZLE=accept-line"* ]]
     [[ ! -s "$ZSH_IOS_STUB_LOG" ]]
     rm -rf "$XDG_CONFIG_HOME" "$ZSH_IOS_STUB_LOG"
+}
+
+# ─── Dynamic toggle: same session ───────────────────────────────────────────
+# The disabled marker file is checked on every widget invocation, so toggling
+# (creating or removing the file) must take effect immediately — without
+# restarting the shell.
+
+@test "toggle: plugin works normally when no disabled marker" {
+    export ZSH_IOS_STUB_RESOLVE_EXIT=0
+    export ZSH_IOS_STUB_RESOLVE_OUT='git status'
+
+    run zsh_run '
+BUFFER="gi st"
+_zsh_ios_accept_line
+print -r -- "BUFFER=$BUFFER"
+print -r -- "ZLE=${_zle_calls[*]}"
+'
+    [[ "$status" -eq 0 ]]
+    # Widget resolved the abbreviation — BUFFER now holds the expanded form.
+    [[ "$output" == *"BUFFER=git status"* ]]
+    # accept-line was called (indicating the widget ran through to execution).
+    [[ "$output" == *"ZLE=accept-line"* ]]
+}
+
+@test "toggle: creating disabled marker stops widget mid-session (no restart)" {
+    export ZSH_IOS_STUB_RESOLVE_EXIT=0
+    export ZSH_IOS_STUB_RESOLVE_OUT='git status'
+
+    # Build a dedicated config dir we own so we can create/remove the marker.
+    local cfg_dir="$BATS_TMPDIR/zio_toggle_mid_$$"
+    mkdir -p "$cfg_dir"
+
+    run zsh_run '
+# Point the plugin at our test config dir (simulating a fresh session env).
+ZSH_IOS_CONFIG_DIR="'"$cfg_dir"'"
+_zsh_ios_disabled_file="$ZSH_IOS_CONFIG_DIR/disabled"
+
+# ── Step 1: no marker yet → widget should resolve ──
+BUFFER="gi st"
+_zle_calls=()
+_zsh_ios_accept_line
+print -r -- "STEP1_BUFFER=$BUFFER"
+
+# ── Step 2: create marker (simulating `zsh-ios toggle`) ──
+touch "$ZSH_IOS_CONFIG_DIR/disabled"
+
+BUFFER="gi st"
+_zle_calls=()
+_zsh_ios_accept_line
+print -r -- "STEP2_BUFFER=$BUFFER"
+'
+    [[ "$status" -eq 0 ]]
+    # Step 1: enabled — abbreviation was resolved.
+    [[ "$output" == *"STEP1_BUFFER=git status"* ]]
+    # Step 2: disabled — BUFFER unchanged (passthrough to native accept-line).
+    [[ "$output" == *"STEP2_BUFFER=gi st"* ]]
+    rm -rf "$cfg_dir"
+}
+
+@test "toggle: removing disabled marker re-enables plugin mid-session (no restart)" {
+    export ZSH_IOS_STUB_RESOLVE_EXIT=0
+    export ZSH_IOS_STUB_RESOLVE_OUT='git status'
+
+    local cfg_dir="$BATS_TMPDIR/zio_toggle_reenable_$$"
+    mkdir -p "$cfg_dir"
+    # Start with the marker present (plugin disabled).
+    touch "$cfg_dir/disabled"
+
+    run zsh_run '
+ZSH_IOS_CONFIG_DIR="'"$cfg_dir"'"
+_zsh_ios_disabled_file="$ZSH_IOS_CONFIG_DIR/disabled"
+
+# ── Step 1: marker present → widget should fall through unchanged ──
+BUFFER="gi st"
+_zle_calls=()
+_zsh_ios_accept_line
+print -r -- "STEP1_BUFFER=$BUFFER"
+
+# ── Step 2: remove marker (simulating second `zsh-ios toggle`) ──
+rm -f "$ZSH_IOS_CONFIG_DIR/disabled"
+
+BUFFER="gi st"
+_zle_calls=()
+_zsh_ios_accept_line
+print -r -- "STEP2_BUFFER=$BUFFER"
+'
+    [[ "$status" -eq 0 ]]
+    # Step 1: disabled — BUFFER unchanged (passthrough to native accept-line).
+    [[ "$output" == *"STEP1_BUFFER=gi st"* ]]
+    # Step 2: re-enabled — abbreviation resolved.
+    [[ "$output" == *"STEP2_BUFFER=git status"* ]]
+    rm -rf "$cfg_dir"
 }

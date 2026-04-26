@@ -196,9 +196,15 @@ _zsh_ios_safe_eval() {
     eval "$1"
 }
 
+# Pre-computed path to the disabled marker file so _zsh_ios_is_disabled()
+# only performs a single [[ -f ]] syscall per invocation (no string concat).
+typeset -g _zsh_ios_disabled_file="$ZSH_IOS_CONFIG_DIR/disabled"
+
 # --- Check if disabled (file-based toggle via `zsh-ios toggle`) ---
+# Called dynamically at every widget invocation so that `zsh-ios toggle`
+# takes effect in the running session immediately — no shell restart needed.
 _zsh_ios_is_disabled() {
-    [[ -f "$ZSH_IOS_CONFIG_DIR/disabled" ]]
+    [[ -f "$_zsh_ios_disabled_file" ]]
 }
 
 # --- Infer shell context from the buffer ---
